@@ -5,6 +5,7 @@ from decimal import Decimal, ROUND_FLOOR
 import gzip
 import hashlib
 import json
+import re
 from pathlib import Path
 import tempfile
 from shutil import disk_usage
@@ -54,16 +55,21 @@ async def download_archive(settings,day,client):
         replay_complete = bool(state and state["state"] == "complete")
         original_sha = state["sha256"] if replay_complete else None
         if replay_complete:
-            # A pre-migration "complete" archive may lack SHA-bound membership.
-            # If membership exists, do not download again. The separate
-            # versioned candle recheck reads durable B price bins.
+            # Completed archives must retain their immutable original SHA.
+            if not isinstance(original_sha,str) or not re.fullmatch(
+                    r"[0-9a-f]{64}",original_sha):
+                raise DataIntegrityError("Completed archive missing original SHA")
             membership = conn.execute(
                 """SELECT 1 FROM archive_source_price_bins
                    WHERE symbol=%s AND instrument=%s
-                     AND archive_day=%s AND archive_sha256=%s
-                   LIMIT 1""",
-                (symbol, settings.category, day, original_sha)).fetchone()
-            if membership:
+                     AND archive_day=%s AND archive_sha256=%s LIMIT 1""",
+                (symbol,settings.category,day,original_sha)).fetchone()
+            receipt = conn.execute(
+                """SELECT 1 FROM archive_stage_receipts
+                   WHERE symbol=%s AND instrument=%s
+                     AND archive_day=%s AND archive_sha256=%s LIMIT 1""",
+                (symbol,settings.category,day,original_sha)).fetchone()
+            if membership and receipt:
                 return "cached"
         else:
             conn.execute("""INSERT INTO ingestion_job(source,symbol,day,state,attempts)
@@ -284,7 +290,7 @@ def plan_archive_days(start, end, cursor, retries, *, limit=24):
 
 
 def plan_archive_work(start, end, fresh_cursor, retries, recheck_cursor,
-                      pending, *, fresh_limit=24, recheck_limit=8):
+                      pending, *, rehydrate=(), fresh_limit=24, recheck_limit=8):
     """One bounded cycle; old retries NEVER advance the fresh UTC cursor.
 
     A second rotating cursor revisits earlier official-candle comparisons.
@@ -300,6 +306,8 @@ def plan_archive_work(start, end, fresh_cursor, retries, recheck_cursor,
             tasks.append((mode, day))
             seen.add(day)
 
+    for day in list(rehydrate)[:4]:
+        add("rehydrate", day)
     for day in retries[:8]:
         add("retry", day)
     for offset in range(min(fresh_limit, (end-fresh_cursor).days)):
@@ -347,6 +355,26 @@ def archive_cycle_plan(settings):
                     AND updated_at < clock_timestamp()-interval '24 hours'))
             ORDER BY updated_at,day LIMIT 8""",
             (settings.symbol, start, end)).fetchall()
+        recover = conn.execute("""SELECT j.day FROM ingestion_job j
+            WHERE j.source='trades_archive' AND j.symbol=%s
+              AND j.state='complete' AND j.day >= %s AND j.day < %s
+              AND j.sha256 ~ '^[0-9a-f]{64}$'
+              AND (
+                NOT EXISTS (SELECT 1 FROM archive_stage_receipts s
+                  WHERE s.symbol=j.symbol AND s.instrument=%s
+                    AND s.archive_day=j.day AND s.archive_sha256=j.sha256)
+                OR NOT EXISTS (SELECT 1 FROM archive_source_price_bins b
+                  WHERE b.symbol=j.symbol AND b.instrument=%s
+                    AND b.archive_day=j.day AND b.archive_sha256=j.sha256))
+              AND NOT EXISTS (SELECT 1 FROM ingestion_cursor r
+                WHERE r.source='trades_archive_rehydrate'
+                  AND r.symbol=j.symbol AND r.instrument=%s
+                  AND r.interval=to_char(j.day,'YYYY-MM-DD')
+                  AND (r.status='blocked_original_sha'
+                       OR r.last_success > clock_timestamp()-interval '24 hours'))
+            ORDER BY j.day LIMIT 4""",
+            (settings.symbol,start,end,settings.category,
+             settings.category,settings.category)).fetchall()
         pending = conn.execute("""SELECT interval FROM ingestion_cursor
             WHERE source='trades_archive_day_recheck' AND symbol=%s
               AND instrument=%s AND interval >= %s AND interval < %s
@@ -358,7 +386,8 @@ def archive_cycle_plan(settings):
     return plan_archive_work(
         start, end, cursors.get("trades_archive_scan"),
         [r["day"] for r in retry], cursors.get("trades_archive_recheck_scan"),
-        [datetime.fromisoformat(r["interval"]).date() for r in pending])
+        [datetime.fromisoformat(r["interval"]).date() for r in pending],
+        rehydrate=[r["day"] for r in recover])
 
 
 def advance_archive_cursor(settings, day, *, mode="fresh"):
@@ -407,6 +436,35 @@ def record_archive_recheck(settings, day, comparison):
     return ok
 
 
+def record_archive_rehydration(settings, day, state, error=None):
+    """Durably record same-SHA recovery without rewriting source identity."""
+    with connection(settings) as conn:
+        original = conn.execute("""SELECT state,sha256 FROM ingestion_job
+            WHERE source='trades_archive' AND symbol=%s AND day=%s""",
+            (settings.symbol,day)).fetchone()
+        if (not original or original["state"] != "complete"
+                or not isinstance(original["sha256"],str)
+                or not re.fullmatch(r"[0-9a-f]{64}",original["sha256"])):
+            raise DataIntegrityError("Missing immutable original SHA")
+        status = ("recovered_same_sha" if state in ("complete","cached") else
+                  "blocked_original_sha" if error is not None and
+                  "Previously completed archive SHA256 changed" in str(error)
+                  else "pending")
+        conn.execute("""INSERT INTO ingestion_cursor
+            (source,symbol,instrument,interval,last_success,status,meta)
+            VALUES('trades_archive_rehydrate',%s,%s,%s,
+                   clock_timestamp(),%s,%s::jsonb)
+            ON CONFLICT(source,symbol,instrument,interval) DO UPDATE SET
+            last_success=clock_timestamp(),status=excluded.status,
+            meta=excluded.meta""",
+            (settings.symbol,settings.category,day.isoformat(),status,
+             json.dumps({"contract":"archive_same_sha_rehydration_v1",
+                         "original_sha256":original["sha256"],
+                         "outcome":status,"reason":str(error)[:160] if error else "",
+                         "exchange_complete":False,"ml_eligible":False})))
+    return status
+
+
 def recheck_archive_with_receipt(settings, day):
     """Never let a failed comparison create a positive archive witness."""
     try:
@@ -450,7 +508,8 @@ async def backfill_archives(settings):
     """Bounded restartable cycle, with durable prior-day comparison backlog."""
     tasks = archive_cycle_plan(settings)
     result = {"attempted":0,"failed":0,"unavailable":0,"completed":0,
-              "recheck_pending":0,"exchange_complete":False,"ml_eligible":False}
+              "recheck_pending":0,"rehydrate_pending":0,
+              "exchange_complete":False,"ml_eligible":False}
     async with httpx.AsyncClient(follow_redirects=False) as client:
         for mode, day in tasks:
             result["attempted"] += 1
@@ -460,6 +519,7 @@ async def backfill_archives(settings):
                 advance_archive_cursor(settings, day, mode="recheck")
                 continue
             state = "failed"
+            final_error = None
             for attempt in range(5):
                 try:
                     state = await download_archive(settings,day,client)
@@ -473,11 +533,15 @@ async def backfill_archives(settings):
                     if isinstance(exc,httpx.HTTPStatusError):
                         permanent = exc.response.status_code in (400,401,403,410)
                     if permanent or attempt == 4:
+                        final_error = exc
                         # Durable failure ledger is required before any progress.
                         quarantine_archive_day(settings,day,exc,permanent)
                         print(f"Archive quarantined {day}: {exc}",flush=True)
                         break
                     await asyncio.sleep(min(90,2**attempt*3))
+            if mode == "rehydrate":
+                if record_archive_rehydration(settings,day,state,final_error) != "recovered_same_sha":
+                    result["rehydrate_pending"] += 1
             if state in ("cached","complete"):
                 result["completed"] += 1
                 if not recheck_archive_with_receipt(settings, day):
@@ -509,6 +573,24 @@ async def backfill_archives(settings):
                   AND c.status='volume_only_reconciled')""",
             (settings.symbol,settings.archive_start,end,settings.category)
             ).fetchone()["n"]
+        rehydrate_backlog = conn.execute("""SELECT count(*) AS n
+            FROM ingestion_cursor WHERE source='trades_archive_rehydrate'
+              AND symbol=%s AND instrument=%s
+              AND status IN ('pending','blocked_original_sha')""",
+            (settings.symbol,settings.category)).fetchone()["n"]
+        missing_stage = conn.execute("""SELECT count(*) AS n
+            FROM ingestion_job j WHERE j.source='trades_archive'
+              AND j.symbol=%s AND j.state='complete'
+              AND j.day >= %s AND j.day < %s
+              AND (j.sha256 IS NULL
+                OR NOT EXISTS (SELECT 1 FROM archive_stage_receipts s
+                   WHERE s.symbol=j.symbol AND s.instrument=%s
+                     AND s.archive_day=j.day AND s.archive_sha256=j.sha256)
+                OR NOT EXISTS (SELECT 1 FROM archive_source_price_bins b
+                   WHERE b.symbol=j.symbol AND b.instrument=%s
+                     AND b.archive_day=j.day AND b.archive_sha256=j.sha256))""",
+            (settings.symbol,settings.archive_start,end,settings.category,
+             settings.category)).fetchone()["n"]
         current = conn.execute("""SELECT cursor_ts FROM ingestion_cursor
             WHERE source='trades_archive_scan' AND symbol=%s
               AND instrument=%s AND interval=''""",
@@ -517,9 +599,44 @@ async def backfill_archives(settings):
                      and current["cursor_ts"].date() >= end)
     missing = max(0,(end-settings.archive_start).days-seen)
     result.update({"unresolved_days":unresolved,"unvalidated_days":unvalidated,
-                   "unattempted_days":missing})
+                   "unattempted_days":missing,
+                   "sha_membership_missing_days":missing_stage,
+                   "rehydration_backlog":rehydrate_backlog})
     result["status"] = ("cycle_completed" if caught_up and not unresolved
-                        and not missing and not unvalidated
+                        and not missing and not unvalidated and not missing_stage
                         and not result["recheck_pending"] else "partial")
     print("Archive bounded cycle:",result,flush=True)
     return result
+
+async def run_archive_catchup(settings, *, max_cycles=8, budget_seconds=1800):
+    """Bounded sequential catch-up without relaxing per-cycle/source checks.
+
+    Each existing archive cycle loads at most 24 new days and 4 same-SHA
+    rehydrations. A daily supervisor launch can catch up faster while disk,
+    source SHA, network rate and fail-closed receipts remain authoritative.
+    """
+    if type(max_cycles) is not int or not 1 <= max_cycles <= 8:
+        raise ValueError("Unsafe archive catch-up cycle count")
+    if type(budget_seconds) not in (int,float) or not 30 <= budget_seconds <= 1800:
+        raise ValueError("Unsafe archive catch-up time budget")
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = None
+    for i in range(max_cycles):
+        remaining = budget_seconds-(loop.time()-started)
+        if remaining < 30:
+            break
+        try:
+            async with asyncio.timeout(remaining):
+                result = await backfill_archives(settings)
+        except TimeoutError:
+            print("Archive catch-up time budget exhausted; partial",flush=True)
+            break
+        if ((result["unattempted_days"] == 0
+             and result["sha_membership_missing_days"] == 0)
+                or result["attempted"] == 0):
+            break
+        if i+1 < max_cycles and budget_seconds-(loop.time()-started) > 30:
+            await asyncio.sleep(3)
+    return result or {"status":"partial","exchange_complete":False,
+                      "ml_eligible":False,"catchup_incomplete":True}

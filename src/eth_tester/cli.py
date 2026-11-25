@@ -26,8 +26,8 @@ def main():
         from .history import backfill_rest
         asyncio.run(backfill_rest(settings))
     elif args.command=="archives":
-        from .archives import backfill_archives
-        asyncio.run(backfill_archives(settings))
+        from .archives import run_archive_catchup
+        asyncio.run(run_archive_catchup(settings))
     elif args.command=="live":
         from .live import run_live
         asyncio.run(run_live(settings))
