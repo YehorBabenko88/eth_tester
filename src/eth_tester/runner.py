@@ -39,6 +39,9 @@ def engine_tick(settings):
             enabled=conn.execute("SELECT enabled,paused FROM bot_control WHERE singleton=true").fetchone()
             if not enabled or not enabled["enabled"] or enabled["paused"]:
                 return "paused"
+            missing=conn.execute("SELECT 1 FROM data_gaps WHERE symbol=%s AND source='publicTrade' AND resolved_at IS NULL LIMIT 1",(settings.symbol,)).fetchone()
+            if missing:
+                return "blocked_unresolved_tick_gap"
             bars=conn.execute("""SELECT ts,open,high,low,close,volume FROM candles
               WHERE symbol=%s AND kind='trade' AND tf='1' AND closed
               AND ts<=%s ORDER BY ts DESC LIMIT 180""",
