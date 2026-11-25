@@ -1,13 +1,25 @@
-"""Post-decision structural labels on the full UTC closed-candle grid.
+"""Post-decision structural labels on exact UTC closed-candle grid.
 
-The decision timestamp is NEVER rounded or backdated. The bar overlapping
-that decision is excluded. This function never trusts PnL as a class label.
+Never alter the original decision timestamp, use the overlapping entry candle,
+interpret same-bar first-touch order, or cast exchange NUMERIC prices to float.
 """
-from math import isfinite
+from decimal import Decimal, InvalidOperation, localcontext
+
+
+def _price(value, name):
+    if isinstance(value, bool):
+        raise ValueError("invalid " + name)
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid " + name) from exc
+    if not number.is_finite() or number <= 0:
+        raise ValueError("invalid " + name)
+    return number
 
 
 def full_future_grid(decision_ms, *, bar_interval_ms, horizon_bars):
-    """Return first full bar start/end and horizon (UTC epoch milliseconds)."""
+    """Exclude even an exactly-on-boundary decision minute from label bars."""
     if (type(decision_ms) is not int or decision_ms <= 0
             or type(bar_interval_ms) is not int or bar_interval_ms <= 0
             or type(horizon_bars) is not int or not 1 <= horizon_bars <= 10000):
@@ -18,19 +30,12 @@ def full_future_grid(decision_ms, *, bar_interval_ms, horizon_bars):
 
 def label_level_outcome(side, level, closed_bars, *, decision_ms, horizon_ms,
                         as_of_ms, bar_interval_ms, barrier_bps=20):
-    """Classify breakout, bounce or uncertain from strictly future full bars.
-
-    Never include OHLC from a candle that was already in progress at entry.
-    Concurrent upper+lower touch in the same bar is ambiguous and stays uncertain.
-    A gap, late close, synthetic shifted grid or unknown high/low is rejected.
-    """
-    if (side not in ("support", "resistance") or isinstance(level, bool)
-            or not isfinite(float(level)) or float(level) <= 0):
+    """Classify strictly future full-bar outcomes with SQL NUMERIC-equivalent math."""
+    if side not in ("support", "resistance"):
         raise ValueError("invalid reference level")
-    if (type(horizon_ms) is not int or type(as_of_ms) is not int
-            or type(barrier_bps) not in (int, float) or isinstance(barrier_bps, bool)
-            or not isfinite(float(barrier_bps))
-            or not 0 < barrier_bps <= 1000):
+    price = _price(level, "reference level")
+    bps = _price(barrier_bps, "barrier bps")
+    if bps > 1000 or type(horizon_ms) is not int or type(as_of_ms) is not int:
         raise ValueError("invalid or unresolved horizon")
     bars = list(closed_bars)
     first_start, _, expected_horizon = full_future_grid(
@@ -38,8 +43,12 @@ def label_level_outcome(side, level, closed_bars, *, decision_ms, horizon_ms,
     if (not bars or horizon_ms != expected_horizon or
             not decision_ms < first_start or as_of_ms < horizon_ms):
         raise ValueError("unresolved or invalid horizon")
-    width = float(level) * barrier_bps / 10000
-    upper, lower = float(level) + width, float(level) - width
+    # PostgreSQL NUMERIC computes level*(1 +/- bps/10000), not float
+    # level + level*float(bps)/10000. Keep all numeric digits from the DB.
+    with localcontext() as ctx:
+        ctx.prec = max(80, len(price.as_tuple().digits) + len(bps.as_tuple().digits) + 32)
+        upper = price * (Decimal(1) + bps / Decimal(10000))
+        lower = price * (Decimal(1) - bps / Decimal(10000))
     outcome = None
     for index, bar in enumerate(bars):
         expected_start = first_start + index * bar_interval_ms
@@ -48,8 +57,8 @@ def label_level_outcome(side, level, closed_bars, *, decision_ms, horizon_ms,
                 or bar["closed_ms"] != expected_close
                 or ("start_ms" in bar and bar["start_ms"] != expected_start)):
             raise ValueError("unordered or out-of-horizon bar")
-        low, high = float(bar["low"]), float(bar["high"])
-        if not (isfinite(low) and isfinite(high) and 0 < low <= high):
+        low, high = _price(bar["low"], "bar low"), _price(bar["high"], "bar high")
+        if low > high:
             raise ValueError("invalid bar")
         if outcome is None:
             up, down = high >= upper, low <= lower

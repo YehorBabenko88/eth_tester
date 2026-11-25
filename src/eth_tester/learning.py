@@ -54,6 +54,15 @@ def train_causal_shadow(settings, as_of_ms, *, source="snapshots", tf="1",
                 "required": min_rows, "rejections": {"source_not_immutable": 1},
                 "approved": False}
     rows, rejected = load_causal_feature_examples(settings, as_of_ms, tf=tf)
+    # The extractor intentionally bounds pagination at 100k raw paper rows.
+    # An incomplete rolling slice is NOT a monotonic eligible population:
+    # training from it could both drop old observations and silently stop
+    # retraining forever when new rows replace old rows at the bound.
+    if rejected.get("scan_limit_reached"):
+        return {"status": "incomplete_verified_population_scan",
+                "usable": len(rows),
+                "required": max(min_rows, previous_count + min_new),
+                "rejections": rejected, "approved": False}
     if len(rows) < min_rows or not should_retrain(previous_count, len(rows), min_new):
         return {"status": "insufficient_new_verified_data", "usable": len(rows),
                 "required": max(min_rows, previous_count + min_new),

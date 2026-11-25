@@ -1,5 +1,7 @@
 """Fail-closed independent label-worker preconditions with fake read-only DB."""
 from datetime import datetime, timezone
+from hashlib import sha256
+import json
 from types import SimpleNamespace
 import pytest
 
@@ -30,12 +32,25 @@ def test_uncommitted_bounded_live_and_tampered_policy_rejected(tamper):
     with pytest.raises(ValueError): _reason_policy(reason)
 
 def _coverage_row(receipt,checked):
+    start,end=60000,240000
+    digest="a"*64
+    evidence_ref=sha256(json.dumps([
+        "ETHUSDT","linear","trade","1",start,end-60000,digest,receipt],
+        separators=(",", ":")).encode()).hexdigest()
     return {"source":"kline:trade","interval":"1","instrument":"linear",
-            "checksum":"a"*64,"status":"verified",
+            "checksum":digest,"status":"verified", "start_ts":datetime.fromtimestamp(start/1000,timezone.utc),
+            "end_ts":datetime.fromtimestamp(end/1000,timezone.utc),
+            "observed_rows":3,"expected_rows":3,
             "quality":"exchange_closed_grid_checked",
             "evidence":{"kind":"trade","tf":"1",
               "receipt_is_independently_recorded":True,
-              "closed_grid_complete":True,"source_receipt_ms":receipt},
+              "closed_grid_complete":True,"source_receipt_ms":receipt,
+              "source_receipt_kind":"postgres_clock_timestamp_after_http",
+              "source_verified_as_of_receipt":True,"source_event_start_ms":start,
+              "source_event_end_exclusive_ms":end,"requested_start_ms":start,
+              "requested_end_ms":end-60000,"row_count":3,
+              "rest_payload_sha256":digest,"evidence_ref":evidence_ref,
+              "proves_all_trade_ids":False},
             "checked_at":datetime.fromtimestamp(checked/1000,timezone.utc)}
 
 class FakeConn:
@@ -61,6 +76,9 @@ def test_witness_is_pinned_to_real_checked_receipt_and_no_gap():
     lambda r:r.update(checksum="broken"),
     lambda r:r["evidence"].update(source_receipt_ms=170000),
     lambda r:r["evidence"].update(source_receipt_ms=310000),
+    lambda r:r["evidence"].update(evidence_ref="0"*64),
+    lambda r:r["evidence"].update(rest_payload_sha256="0"*64),
+    lambda r:r["evidence"].update(row_count=2),
 ])
 def test_incomplete_or_future_historical_proof_rejected(tamper):
     proof=_coverage_row(240000,240000);tamper(proof)

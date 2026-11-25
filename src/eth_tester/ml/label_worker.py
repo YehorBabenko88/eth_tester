@@ -5,6 +5,8 @@ change, or reclassify `ingestion_coverage`; only an independently existing
 historic closed-candle receipt may authorize a new B-owned append-only label.
 """
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+
 from hashlib import sha256
 import json
 import re
@@ -48,10 +50,12 @@ def _reason_policy(reason):
     if reason.get("side") not in ("support", "resistance"):
         raise ValueError("no verified structural side")
     try:
-        level = float(reason["level"])
-    except (TypeError, ValueError, KeyError) as exc:
+        if isinstance(reason["level"], bool):
+            raise ValueError("invalid structural level")
+        level = Decimal(str(reason["level"]))
+    except (TypeError, ValueError, KeyError, InvalidOperation) as exc:
         raise ValueError("no precommitted structural level") from exc
-    if not 0 < level < float("inf"):
+    if not level.is_finite() or level <= 0:
         raise ValueError("invalid structural level")
     return policy, level
 
@@ -65,7 +69,7 @@ def _source_certificate(conn, *, symbol, instrument, decision_ms,
     """
     rows = conn.execute(
         """SELECT source,interval,instrument,start_ts,end_ts,checksum,quality,
-                  evidence,checked_at,status
+                  evidence,checked_at,status,observed_rows,expected_rows
            FROM ingestion_coverage WHERE source='kline:trade'
              AND symbol=%s AND instrument=%s AND interval='1'
              AND status='verified' AND quality='exchange_closed_grid_checked'
@@ -82,6 +86,9 @@ def _source_certificate(conn, *, symbol, instrument, decision_ms,
     if isinstance(evidence, str):
         evidence = json.loads(evidence)
     if (not isinstance(evidence, dict)
+            or evidence.get("paper_only") is True
+            or evidence.get("completeness_scope") in (
+                "observed_bounded", "bounded_local_observations_only")
             or evidence.get("kind") != "trade"
             or evidence.get("tf") != "1"
             or evidence.get("receipt_is_independently_recorded") is not True
@@ -89,6 +96,30 @@ def _source_certificate(conn, *, symbol, instrument, decision_ms,
             or evidence.get("fixture") is not None):
         raise ValueError("historical_receipt_not_independently_witnessed")
     digest = proof["checksum"]
+    # A's real REST reader commits a receipt-bound page digest, not simply
+    # caller-supplied quality flags. Recheck the exact window/row count and
+    # request/receipt hash from the independently sampled DB source clock.
+    first_ms, end_ms = milliseconds(proof["start_ts"]), milliseconds(proof["end_ts"])
+    count = (end_ms - first_ms) // _INTERVAL_MS
+    ref = sha256(json.dumps(
+        [symbol, instrument, "trade", "1", first_ms, end_ms - _INTERVAL_MS,
+         digest, evidence.get("source_receipt_ms")],
+        separators=(",", ":")).encode()).hexdigest()
+    if (end_ms <= first_ms or (end_ms-first_ms) % _INTERVAL_MS != 0
+            or count < 3 or evidence.get("source_receipt_kind") !=
+               "postgres_clock_timestamp_after_http"
+            or evidence.get("source_verified_as_of_receipt") is not True
+            or evidence.get("source_event_start_ms") != first_ms
+            or evidence.get("source_event_end_exclusive_ms") != end_ms
+            or evidence.get("requested_start_ms") != first_ms
+            or evidence.get("requested_end_ms") != end_ms-_INTERVAL_MS
+            or evidence.get("row_count") != count
+            or proof.get("observed_rows") != count
+            or proof.get("expected_rows") != count
+            or evidence.get("rest_payload_sha256") != digest
+            or evidence.get("evidence_ref") != ref
+            or evidence.get("proves_all_trade_ids") is not False):
+        raise ValueError("historical_rest_receipt_envelope_invalid")
     receipt = evidence.get("source_receipt_ms")
     checked = milliseconds(proof["checked_at"])
     if (not isinstance(digest, str) or not _HEX.fullmatch(digest)
@@ -186,6 +217,56 @@ def _label_one(conn, row, *, now_ms):
     return outcome
 
 
+# Only known B label-ledger assertion exceptions are safe to isolate per row.
+# Unknown SQL exceptions (connection loss, missing tables, privilege errors)
+# must propagate, roll back the whole cycle and trigger G's bounded backoff.
+_SQL_LABEL_REJECTIONS = {
+    "label must bind a closed paper entry and its original snapshot": "invalid_entry_binding",
+    "post-horizon label cannot bind an unverified or future snapshot": "uncertified_entry_snapshot",
+    "post-horizon label evidence is not yet available": "horizon_not_mature",
+    "label coverage has no pinned independent receipt": "missing_horizon_receipt",
+    "missing structural barrier evidence digest": "missing_barrier_digest",
+    "Observed-only live paper entry cannot supply historical ML label": "bounded_live_not_ml_eligible",
+    "Missing precommitted historical UTC future-bar label policy": "missing_precommitted_policy",
+    "Incomplete independently checked closed future-bar grid": "incomplete_grid_evidence",
+    "Missing complete first-future-bar evidence": "missing_grid_evidence",
+    "Label uses predecision, shifted, missing or late bar horizon": "invalid_future_grid",
+    "Label has no original structural level/side": "invalid_original_level",
+    "Unverified, shifted or corrupt full future OHLC bar": "invalid_future_ohlc",
+    "Missing verified full future candle grid": "incomplete_future_grid",
+    "Structural label outcome disagrees with stored future OHLC": "barrier_outcome_mismatch",
+}
+
+
+def _sql_label_rejection(exc):
+    if getattr(exc, "sqlstate", None) != "P0001":
+        return None
+    message = getattr(getattr(exc, "diag", None), "message_primary", None)
+    return _SQL_LABEL_REJECTIONS.get(message)
+
+
+def _rejection_category(exc):
+    if isinstance(exc, KeyError):
+        return "invalid_record"
+    message = str(exc)
+    categories = (
+        ("historical_candle_witness", "missing_or_ambiguous_historical_candle_witness"),
+        ("historical_receipt", "historical_receipt_not_independently_witnessed"),
+        ("horizon_source", "late_or_backdated_horizon_source"),
+        ("unresolved_candle_gap", "unresolved_candle_gap"),
+        ("precommitted", "no precommitted immutable label policy"),
+        ("bounded-live", "bounded-live paper evidence is ML ineligible"),
+        ("full_future", "full_future_candle_horizon_not_elapsed"),
+        ("horizon_not_elapsed", "full_future_candle_horizon_not_elapsed"),
+        ("future_bar", "future_bar_gap_or_wrong_source"),
+        ("independently_certified", "not_independently_certified_historical_snapshot"),
+    )
+    for marker, category in categories:
+        if marker in message:
+            return category
+    return "other_invalid_record"
+
+
 def run_label_cycle(settings, *, limit=100):
     """One bounded, restart-idempotent cycle; never contacts the exchange.
 
@@ -234,11 +315,23 @@ def run_label_cycle(settings, *, limit=100):
         for row in rows:
             scanned+=1
             try:
-                _label_one(conn,row,now_ms=now_ms)
+                # Already-in-progress outer transaction -> psycopg SAVEPOINT.
+                # Any trigger rejection rolls back *only this entry*, not the
+                # preceding validated labels or durable scan cursor.
+                with conn.transaction():
+                    _label_one(conn,row,now_ms=now_ms)
                 created+=1
-            except (ValueError,TypeError,KeyError,OverflowError) as exc:
-                reason=str(exc)[:120]
-                rejected[reason]=rejected.get(reason,0)+1
+            except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation) as exc:
+                category=_rejection_category(exc)
+                rejected[category]=rejected.get(category,0)+1
+            except Exception as exc:
+                # No broad SQL swallow: accept *only* known B trigger
+                # SQLSTATE=P0001 messages. Connectivity/serialization/DDL
+                # failures abort the cycle so G can retry safely.
+                category=_sql_label_rejection(exc)
+                if category is None:
+                    raise
+                rejected[category]=rejected.get(category,0)+1
         next_id = 0 if wrapped else rows[-1]["paper_trade_id"]
         conn.execute(
             """INSERT INTO analytics_cursor(
@@ -255,6 +348,7 @@ def run_label_cycle(settings, *, limit=100):
                          "bounded_live_ml_eligible":False},sort_keys=True)))
         return {"status":"labels_written" if created else "insufficient_verified_horizon",
                 "created":created,"scanned":scanned,"rejections":rejected,
+                "rejection_counts":rejected,
                 "next_after_id":next_id,"approved":False}
 
 
