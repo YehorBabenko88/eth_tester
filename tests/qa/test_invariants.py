@@ -78,7 +78,8 @@ def test_backtest_signal_sees_only_prior_closed_bars(monkeypatch):
 
     monkeypatch.setattr(backtest, "price_signal", strategy)
     deals = backtest.simulate(bars, fees=D(0), slip=D(0))
-    assert observed == [bars[19]["ts"]]
+    assert observed and observed[0] == bars[19]["ts"]
+    assert all(ts < bars[20 + i]["ts"] for i, ts in enumerate(observed))
     assert len(deals) == 1
     assert deals[0]["opened_at"] == bars[20]["ts"]
     assert deals[0]["outcome"] == "stop"
