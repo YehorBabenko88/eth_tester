@@ -54,21 +54,36 @@ def _assert_safe_existing_database(conn):
         raise RuntimeError(f"Unowned tables prevent migration: {sorted(unknown)}")
 
 def init_database(settings: Settings):
-    params=conninfo_to_dict(settings.database_url)
-    name=params.get('dbname','')
-    if not (name=='eth_tester' or name.startswith('eth_tester_')):
-        raise ValueError('Dedicated eth_tester database required')
-    admin_url=make_conninfo(settings.database_url,dbname='postgres')
-    with psycopg.connect(admin_url,autocommit=True,connect_timeout=10) as admin:
-        if not admin.execute('SELECT 1 FROM pg_database WHERE datname=%s',(name,)).fetchone():
-            admin.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(name)))
-    with connection(settings) as conn:
-        _assert_safe_existing_database(conn)
-        conn.execute(files("eth_tester").joinpath("schema.sql").read_text())
-        apply_migrations(conn)
-        ensure_current_partitions(conn)
-        conn.execute("INSERT INTO paper_account(id,equity,initial_equity) VALUES(1,%s,%s) ON CONFLICT DO NOTHING",
-                     (settings.initial_equity_usd, settings.initial_equity_usd))
+    params = conninfo_to_dict(settings.database_url)
+    name = params.get("dbname", "")
+    if not (name == "eth_tester" or name.startswith("eth_tester_")):
+        raise ValueError("Dedicated eth_tester database required")
+    admin_url = make_conninfo(settings.database_url, dbname="postgres")
+    lock_key = f"eth_tester:init:{name}"
+    # Cross-process database creation + schema bootstrap serialization.
+    # PostgreSQL CREATE DATABASE cannot run inside a transaction, so hold
+    # a session-level advisory lock on the postgres administration database.
+    with psycopg.connect(admin_url, autocommit=True, connect_timeout=10) as admin:
+        admin.execute("SELECT pg_advisory_lock(hashtext(%s))", (lock_key,))
+        try:
+            present = admin.execute(
+                "SELECT 1 FROM pg_database WHERE datname=%s", (name,)
+            ).fetchone()
+            if not present:
+                admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+            with connection(settings) as conn:
+                _assert_safe_existing_database(conn)
+                conn.execute(files("eth_tester").joinpath("schema.sql").read_text())
+                apply_migrations(conn)
+                ensure_current_partitions(conn)
+                conn.execute(
+                    """INSERT INTO paper_account(id,equity,initial_equity)
+                       VALUES(1,%s,%s) ON CONFLICT DO NOTHING""",
+                    (settings.initial_equity_usd, settings.initial_equity_usd),
+                )
+        finally:
+            admin.execute("SELECT pg_advisory_unlock(hashtext(%s))", (lock_key,))
+
 
 def cursor_ts(conn, source, symbol, interval):
     row = conn.execute("SELECT cursor_ts FROM ingestion_cursor WHERE source=%s AND symbol=%s AND instrument='linear' AND interval=%s",
