@@ -4,7 +4,6 @@ This preserves the existing trades(symbol, trade_id) global unique key, which
 must not be weakened by time partitioning. Feed each call one bounded batch.
 """
 import json
-from psycopg import sql
 
 COLUMNS = ("symbol", "ts", "trade_id", "price", "qty", "side",
            "notional", "source", "raw")
