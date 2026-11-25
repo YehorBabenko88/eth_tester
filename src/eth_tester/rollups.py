@@ -177,3 +177,26 @@ def aggregate_history(settings,max_days=0):
             print(f"footprint {row['day']} {tf}: {count} bins, "
                   f"{completed}/{total} ({100*completed/max(1,total):.1f}%)",flush=True)
     return completed
+
+
+def aggregate_pending(settings, max_days=4):
+    """Process only archive days whose 13-frame checksum ledger is incomplete."""
+    if max_days < 1:
+        raise ValueError("max_days must be positive")
+    with connection(settings) as conn:
+        days = conn.execute("""SELECT i.day,i.sha256 FROM ingestion_job i
+            WHERE i.source='trades_archive' AND i.symbol=%s
+              AND i.state='complete'
+              AND (SELECT count(*) FROM aggregation_job a
+                   WHERE a.symbol=i.symbol AND a.day=i.day
+                     AND a.archive_sha256=i.sha256) < %s
+            ORDER BY i.day LIMIT %s""",
+            (settings.symbol, len(TIMEFRAMES), max_days)).fetchall()
+    count = 0
+    for row in days:
+        if not row["sha256"]:
+            raise RuntimeError(f"Archive complete without checksum: {row['day']}")
+        for tf in TIMEFRAMES:
+            rollup_day(settings, row["day"], tf, row["sha256"])
+            count += 1
+    return count
