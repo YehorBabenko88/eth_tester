@@ -144,6 +144,61 @@ def test_monthly_partitions(postgres_lab):
         ).fetchone()["n"] == 1
 
 
+def test_recovery_is_explicit_and_non_destructive(postgres_lab):
+    from eth_tester.storage.recovery import recover_abandoned_ingestion
+
+    with connection(postgres_lab) as conn:
+        conn.execute(
+            """INSERT INTO ingestion_job(source,symbol,day,state,updated_at)
+               VALUES('test_resume','ETHUSDT','2026-11-19','running',
+                      now() - interval '1 day')
+               ON CONFLICT(source,symbol,day)
+               DO UPDATE SET state='running',updated_at=EXCLUDED.updated_at"""
+        )
+        with pytest.raises(RuntimeError, match="Stop all"):
+            recover_abandoned_ingestion(conn)
+        report = recover_abandoned_ingestion(
+            conn, workers_stopped=True, stale_minutes=10
+        )
+        assert report["requeued"] >= 1
+        assert conn.execute(
+            """SELECT state FROM ingestion_job
+               WHERE source='test_resume' AND symbol='ETHUSDT'
+               AND day='2026-11-19'"""
+        ).fetchone()["state"] == "pending"
+
+
+def test_bounded_cleanup_preserves_market_data(postgres_lab):
+    from eth_tester.retention import cleanup_diagnostics, storage_report
+
+    old_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    with connection(postgres_lab) as conn:
+        conn.execute(
+            """INSERT INTO feed_health(symbol,topic,ts,status)
+               VALUES('ETHUSDT','test-retention',%s,'test')""",
+            (old_time,),
+        )
+        conn.execute(
+            """INSERT INTO bot_events(ts,severity,event)
+               VALUES(%s,'info','test-retention')""",
+            (old_time,),
+        )
+    report = storage_report(postgres_lab)
+    assert report["bytes"] > 0
+    assert report["row_counts_estimated"] is True
+    assert "cluster_wal_bytes_generated" in report
+    removed = cleanup_diagnostics(
+        postgres_lab, health_days=90, event_days=180, max_rows_per_table=1,
+    )
+    assert removed["feed_health_deleted"] == 1
+    assert removed["bot_events_deleted"] == 1
+    assert removed["raw_market_data_deleted"] == 0
+    with connection(postgres_lab) as conn:
+        assert conn.execute(
+            "SELECT count(*) AS n FROM trades WHERE trade_id LIKE 'BPG-%'"
+        ).fetchone()["n"] == 2
+
+
 def test_verified_backup_restore_and_scoped_delete(postgres_lab, tmp_path):
     if not shutil.which("pg_dump") or not shutil.which("pg_restore"):
         pytest.skip("pg_dump and pg_restore are mandatory for backup integration")
