@@ -61,6 +61,7 @@ def test_store_candle_rejects_db_conflict():
 
 def test_collect_does_not_claim_unavailable_history(monkeypatch):
     import eth_tester.history_integrity as hi
+    import eth_tester.data_depth as depth
 
     conn = FakeConnection()
     checkpoints = []
@@ -69,6 +70,7 @@ def test_collect_does_not_claim_unavailable_history(monkeypatch):
         yield conn
 
     monkeypatch.setattr(hi, "connection", connect)
+    monkeypatch.setattr(depth, "connection", connect)
     monkeypatch.setattr(hi, "cursor_ts", lambda *_: None)
     monkeypatch.setattr(hi, "save_cursor", lambda *args, **kw:
                         checkpoints.append(kw["status"]))
@@ -81,13 +83,14 @@ def test_collect_does_not_claim_unavailable_history(monkeypatch):
         archive_start=datetime.now(UTC).date() - timedelta(days=2),
         symbol="ETHUSDT", category="linear")
     asyncio.run(collect_klines(settings, Client(), "trade", "D"))
-    assert checkpoints
-    assert all(state == "observed_partial" for state in checkpoints)
-    assert any("INSERT INTO data_gaps" in sql for sql, _ in conn.queries)
+    assert not checkpoints
+    assert any("INSERT INTO ingestion_coverage" in sql for sql, _ in conn.queries)
+    assert not any("INSERT INTO candles" in sql for sql, _ in conn.queries)
 
 
 def test_collect_stores_verified_closed_daily_bars(monkeypatch):
     import eth_tester.history_integrity as hi
+    import eth_tester.data_depth as depth
 
     conn = FakeConnection()
     checkpoints = []
@@ -97,6 +100,10 @@ def test_collect_stores_verified_closed_daily_bars(monkeypatch):
 
     monkeypatch.setattr(hi, "connection", connect)
     monkeypatch.setattr(hi, "cursor_ts", lambda *_: None)
+    async def first_day(settings, client, kind, tf):
+        return int(datetime.combine(settings.archive_start, datetime.min.time(), UTC)
+                   .timestamp() * 1000)
+    monkeypatch.setattr(depth, "discover_candle_depth", first_day)
     monkeypatch.setattr(hi, "save_cursor", lambda *args, **kw:
                         checkpoints.append(kw["status"]))
 
