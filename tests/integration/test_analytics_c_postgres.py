@@ -66,28 +66,80 @@ def test_daily_levels_closed_confirmation_retest_and_resume(c_pg):
     assert row["status"]=="invalidated"
     assert row["invalidated_at"]==start+timedelta(days=7)
 
+def _seed_sha_archive_stage(settings, day, digest, rows):
+    """Actual B stage/COPY membership in a disposable PostgreSQL test DB.
+
+    Rows represent a small downloaded-archive test fixture, NOT an assertion
+    that the exchange published every trade or that ML is certified.
+    """
+    import json
+    from eth_tester.storage.bulk import merge_staged_trades
+    from eth_tester.storage.archive_receipts import persist_archive_stage_bins
+
+    with connection(settings) as conn:
+        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        with conn.cursor() as cursor:
+            with cursor.copy("""COPY eth_stage (
+                symbol,ts,trade_id,price,qty,side,notional,source,raw)
+                FROM STDIN""") as copy:
+                for identity, stamp, price, quantity, side in rows:
+                    price, quantity = Decimal(price), Decimal(quantity)
+                    copy.write_row((
+                        settings.symbol, stamp, identity, price, quantity,
+                        side, price*quantity, "archive",
+                        json.dumps({"trade_id": identity}),
+                    ))
+        merged = merge_staged_trades(conn, "eth_stage")
+        assert merged["input_rows"] == len(rows)
+        witness = persist_archive_stage_bins(
+            conn, settings.symbol, day, digest, len(rows),
+            instrument=settings.category)
+        assert witness["distinct_trade_ids"] == len(rows)
+        assert witness["exchange_complete"] is False
+        conn.execute("""INSERT INTO ingestion_job(
+            source,symbol,day,state,row_count,sha256)
+            VALUES('trades_archive',%s,%s,'complete',%s,%s)
+            ON CONFLICT(source,symbol,day) DO UPDATE SET
+              state='complete',row_count=EXCLUDED.row_count,
+              sha256=EXCLUDED.sha256,updated_at=clock_timestamp()""",
+            (settings.symbol, day, len(rows), digest))
+    return witness
+
+
 def test_weekly_rollup_daily_archive_correction(c_pg):
-    t=datetime(2026,1,1,tzinfo=UTC)
+    """Rebuild an archive-day correction without consulting global WS rows."""
+    t = datetime(2026, 1, 1, tzinfo=UTC)
+    _seed_sha_archive_stage(
+        c_pg, t.date(), "a"*64,
+        [("c1", t, 100, 2, "Buy")])
+    _seed_sha_archive_stage(
+        c_pg, (t+timedelta(days=1)).date(), "b"*64,
+        [("c2", t+timedelta(days=1), 100, 1, "Sell"),
+         ("c3", t+timedelta(days=1), 101, 3, "Buy")])
+    assert rollup_day(c_pg, t.date(), "W", "a"*64) == 1
+    assert rollup_day(c_pg, (t+timedelta(days=1)).date(), "W", "b"*64) == 2
     with connection(c_pg) as conn:
-        for n,dt,price,qty,side in [
-            ("c1",t,100,2,"Buy"),("c2",t+timedelta(days=1),100,1,"Sell"),
-            ("c3",t+timedelta(days=1),101,3,"Buy")]:
-            conn.execute("""INSERT INTO trades(symbol,ts,trade_id,price,
-                qty,side,notional,source)
-                VALUES('ETHUSDT',%s,%s,%s,%s,%s,%s,'qa')""",
-                (dt,n,price,qty,side,price*qty))
-    assert rollup_day(c_pg,date(2026,1,1),"W","s1")==1
-    assert rollup_day(c_pg,date(2026,1,2),"W","s2")==2
-    with connection(c_pg) as conn:
-        f=conn.execute("SELECT delta,volume,metadata FROM features WHERE tf='W'").fetchone()
-    assert (f["delta"],f["volume"])==(Decimal(4),Decimal(6))
+        f = conn.execute(
+            "SELECT delta,volume,metadata FROM features WHERE tf='W'"
+        ).fetchone()
+    assert (f["delta"], f["volume"]) == (Decimal(4), Decimal(6))
     assert f["metadata"]["val"] is not None
+    # The previous global c3 remains stored; the corrected gzip SHA omits
+    # that ID and must withdraw its price bin without erasing global history.
+    _seed_sha_archive_stage(
+        c_pg, (t+timedelta(days=1)).date(), "c"*64,
+        [("c2", t+timedelta(days=1), 100, 1, "Sell")])
+    assert rollup_day(c_pg, (t+timedelta(days=1)).date(), "W", "c"*64) == 1
     with connection(c_pg) as conn:
-        conn.execute("DELETE FROM trades WHERE trade_id='c3'")
-    assert rollup_day(c_pg,date(2026,1,2),"W","s2-replaced")==1
-    with connection(c_pg) as conn:
-        bins=conn.execute("SELECT price FROM footprint WHERE tf='W' ORDER BY price").fetchall()
-    assert [x["price"] for x in bins]==[Decimal(100)]
+        bins = conn.execute(
+            "SELECT price FROM footprint WHERE tf='W' ORDER BY price"
+        ).fetchall()
+        still_global = conn.execute(
+            "SELECT 1 FROM trades WHERE symbol='ETHUSDT' AND trade_id='c3'"
+        ).fetchone()
+    assert [item["price"] for item in bins] == [Decimal(100)]
+    assert still_global is not None
+
 
 
 def test_indicator_asof_and_trade_vwap(c_pg):
@@ -221,22 +273,28 @@ def test_round2_partial_coverage_never_materializes_certified_snapshot(c_pg):
 
 
 def test_round2_archive_live_overlap_preserves_rollup_and_all_frames(c_pg):
+    """WS-first archive members count, WS-only trades do not contaminate."""
     from eth_tester.analytics import build_footprint
     from eth_tester.analytics_core import FRAMES
 
     now = datetime.now(UTC).replace(second=0, microsecond=0)
     stamp = now - timedelta(minutes=2)
     with connection(c_pg) as conn:
-        for ident,price,qty,side in (
-                ("overlap-buy", 100, 2, "Buy"),
-                ("overlap-sell", 101, 1, "Sell")):
+        for identity, price, qty in (
+                ("overlap-buy", 100, 2),
+                ("ws-only-extra", 999, 8)):
             conn.execute("""INSERT INTO trades(
-                symbol,ts,trade_id,price,qty,side,notional,source)
-                VALUES('ETHUSDT',%s,%s,%s,%s,%s,%s,'qa_archive')""",
-                (stamp, ident, price, qty, side, price*qty))
+                symbol,ts,trade_id,price,qty,side,notional,source,raw)
+                VALUES('ETHUSDT',%s,%s,%s,%s,'Buy',%s,
+                       'websocket','{}'::jsonb)""",
+                (stamp, identity, price, qty, price*qty))
+    _seed_sha_archive_stage(
+        c_pg, stamp.date(), "d"*64,
+        [("overlap-buy", stamp, 100, 2, "Buy"),
+         ("overlap-sell", stamp, 101, 1, "Sell")])
     assert len(FRAMES) == 13
     for tf in FRAMES:
-        assert rollup_day(c_pg, stamp.date(), tf, "overlap-sha") == 2
+        assert rollup_day(c_pg, stamp.date(), tf, "d"*64) == 2
         with connection(c_pg) as conn:
             result = conn.execute("""SELECT sum(volume) AS total
                 FROM features WHERE symbol='ETHUSDT' AND tf=%s""",
@@ -244,9 +302,11 @@ def test_round2_archive_live_overlap_preserves_rollup_and_all_frames(c_pg):
         assert result["total"] == Decimal(3), (tf, result)
     assert build_footprint(c_pg, "1", hours=2) == 0
     with connection(c_pg) as conn:
-        result = conn.execute("""SELECT sum(buy_qty+sell_qty) AS total
-            FROM footprint WHERE symbol='ETHUSDT' AND tf='1'""").fetchone()
-    assert result["total"] == Decimal(3)
+        rows = conn.execute("""SELECT price,sum(buy_qty+sell_qty) AS qty
+            FROM footprint WHERE symbol='ETHUSDT' AND tf='1'
+            GROUP BY price ORDER BY price""").fetchall()
+    assert [(row["price"], row["qty"]) for row in rows] == [
+        (Decimal(100), Decimal(2)), (Decimal(101), Decimal(1))]
 
 
 
@@ -321,3 +381,198 @@ def test_round6_live_window_never_promotes_partial_archive_or_creates_ml_snapsho
     with connection(c_pg) as conn:
         assert conn.execute("""SELECT count(*) AS n FROM feature_snapshots
             WHERE symbol='ETHUSDT' AND is_causal""").fetchone()["n"] == 0
+
+
+def test_round7_missing_archive_stage_refuses_global_trades_without_mutation(c_pg):
+    """A completed gzip job alone is not SHA membership of the global tape."""
+    with connection(c_pg) as conn:
+        moment = datetime(2026, 3, 1, tzinfo=UTC)
+        conn.execute("""INSERT INTO trades(
+            symbol,ts,trade_id,price,qty,side,notional,source,raw)
+            VALUES('ETHUSDT',%s,'orphan-ws',100,5,'Buy',500,
+                   'websocket','{}'::jsonb)""", (moment,))
+        conn.execute("""INSERT INTO ingestion_job(
+            source,symbol,day,state,row_count,sha256)
+            VALUES('trades_archive','ETHUSDT',%s,'complete',1,%s)""",
+            (moment.date(), "e"*64))
+    with pytest.raises(ValueError, match="sha_pinned_archive_stage_receipt_missing"):
+        rollup_day(c_pg, moment.date(), "D", "e"*64)
+    with connection(c_pg) as conn:
+        assert conn.execute(
+            "SELECT count(*) AS n FROM footprint_daily").fetchone()["n"] == 0
+        assert conn.execute(
+            "SELECT count(*) AS n FROM aggregation_job").fetchone()["n"] == 0
+
+
+def test_round7_repair_old_global_trades_contamination_on_matching_job_sha(c_pg):
+    """Legacy completed jobs must be rechecked against actual archive bins."""
+    moment = datetime(2026, 3, 2, tzinfo=UTC)
+    digest = "f"*64
+    _seed_sha_archive_stage(
+        c_pg, moment.date(), digest,
+        [("real-member", moment+timedelta(minutes=1), 100, 2, "Buy")])
+    with connection(c_pg) as conn:
+        conn.execute("""INSERT INTO footprint_daily(
+            symbol,tf,day,bucket,price,buy_qty,sell_qty,trades)
+            VALUES('ETHUSDT','1',%s,%s,999,9,0,1)""",
+            (moment.date(), moment+timedelta(minutes=1)))
+        conn.execute("""INSERT INTO aggregation_job(
+            symbol,tf,day,archive_sha256,rows)
+            VALUES('ETHUSDT','1',%s,%s,1)""",
+            (moment.date(), digest))
+    assert rollup_day(c_pg, moment.date(), "1", digest) == 1
+    with connection(c_pg) as conn:
+        fixed = conn.execute("""SELECT price,buy_qty FROM footprint_daily
+            WHERE symbol='ETHUSDT' AND tf='1'""").fetchall()
+    assert fixed == [{"price": Decimal(100), "buy_qty": Decimal(2)}]
+    assert rollup_day(c_pg, moment.date(), "1", digest) == 0
+
+
+def test_round7_fast_c_actual_b_publisher_source_receipts_l2_and_oi(c_pg):
+    """C actual runtime caller + B immutable PG receipts, never a ML snapshot.
+
+    This is a controlled source-contract fixture, not an actual Bybit feed
+    capture or a claim that observed prints prove exchange completeness.
+    """
+    import json
+    from eth_tester.live_paper_window import publish_latest_bounded_live
+    from eth_tester.storage.live_evidence import (
+        record_trade_receipts, record_book_lineage,
+        record_oi_observation, require_bounded_paper_evidence,
+    )
+
+    session = "round7-source-session"
+    with connection(c_pg) as conn:
+        wall = conn.execute(
+            "SELECT clock_timestamp() AS now").fetchone()["now"]
+        bar_start = wall.replace(second=0, microsecond=0)-timedelta(minutes=1)
+        trade_event = bar_start + timedelta(seconds=59)
+        conn.execute("""INSERT INTO candles(
+            symbol,kind,tf,ts,open,high,low,close,volume,turnover,
+            closed,source)
+            VALUES('ETHUSDT','trade','1',%s,3000,3000,3000,3000,
+                   0.02,60,true,'bybit_v5')""", (bar_start,))
+        # Use A's actual closed-grid receipt writer in this disposable test.
+        # The quality witnesses ONLY a closed OHLCV candle, not all trade IDs.
+        from eth_tester.data_coverage import write_coverage
+        write_coverage(
+            conn, source="kline:trade", symbol="ETHUSDT", interval="1",
+            start_ms=int(bar_start.timestamp()*1000),
+            end_exclusive_ms=int(
+                (bar_start+timedelta(minutes=1)).timestamp()*1000),
+            status="verified", observed_rows=1, expected_rows=1,
+            checksum="a"*64, quality="exchange_closed_grid_checked",
+            evidence={"closed_bar_only": True, "ml_snapshot_eligible": False,
+                      "proves_all_trade_ids": False},
+            instrument="linear")
+        conn.execute("""INSERT INTO trades(
+            symbol,ts,trade_id,price,qty,side,notional,source,raw)
+            VALUES('ETHUSDT',%s,'R7-PUBLIC-1',3000,0.02,'Buy',60,
+                   'websocket',%s::jsonb)""",
+            (trade_event, json.dumps({"i": "R7-PUBLIC-1"})))
+        record_trade_receipts(conn, "ETHUSDT", session, ["R7-PUBLIC-1"])
+        conn.execute("""INSERT INTO feed_health(
+            symbol,topic,ts,status,detail)
+            VALUES('ETHUSDT','connection',clock_timestamp(),'connected',
+                   %s::jsonb)""",
+            (json.dumps({"session_id": session}),))
+    # Trade only: actual C fast pipeline MUST stay pending without L2.
+    before = publish_latest_bounded_live(c_pg)
+    assert before["status"] == "pending", before
+    assert before["reason"] == "fresh_replayed_l2_receipt_missing"
+
+    with connection(c_pg) as conn:
+        snapshot = conn.execute("""INSERT INTO book_events(
+            symbol,exchange_ts,recv_ts,update_id,sequence_no,
+            event_type,bids,asks,valid)
+            VALUES('ETHUSDT',clock_timestamp(),clock_timestamp(),
+                   10,10,'snapshot','[["2999","1"]]'::jsonb,
+                   '[["3001","1"]]'::jsonb,true) RETURNING id""").fetchone()["id"]
+        record_book_lineage(conn, "ETHUSDT", session, snapshot, snapshot)
+    # Fast path now actually replays the new B-receipted book event.
+    without_oi = publish_latest_bounded_live(c_pg)
+    assert without_oi["status"] == "pending", without_oi
+    assert without_oi["reason"] == "independent_recent_oi_receipt_missing"
+    with connection(c_pg) as conn:
+        wall = conn.execute(
+            "SELECT clock_timestamp() AS now").fetchone()["now"]
+        minute = wall.replace(second=0, microsecond=0)
+        observed_oi = minute-timedelta(minutes=minute.minute % 5)
+        conn.execute("""INSERT INTO open_interest(symbol,interval,ts,value)
+            VALUES('ETHUSDT','5min',%s,1000)""", (observed_oi,))
+        record_oi_observation(
+            conn, "ETHUSDT", "5min", observed_oi, "b"*64)
+    published = publish_latest_bounded_live(c_pg)
+    assert published["status"] == "published", published
+    assert published["paper_only"] is True
+    assert published["ml_eligible"] is False
+    assert published["l2_replayed"] >= 0
+    assert 0 <= published["publication_latency_ms"] <= 90000
+    assert len(published["snapshot_key"]) == 64
+    again = publish_latest_bounded_live(c_pg)
+    assert again["status"] == "published", again
+    assert again["snapshot_key"] == published["snapshot_key"]
+    with connection(c_pg) as conn:
+        proof = require_bounded_paper_evidence(
+            conn, symbol="ETHUSDT", bar_ts=bar_start,
+            evidence_key=published["snapshot_key"],
+            decision_at=conn.execute(
+                "SELECT clock_timestamp() AS now").fetchone()["now"])
+        assert proof["ml_eligible"] is False
+        assert proof["paper_only"] is True
+        assert proof["exchange_complete"] is False
+        from eth_tester.strategies.paper_live import read_live_evidence
+        decision = conn.execute(
+            "SELECT clock_timestamp() AS now").fetchone()["now"]
+        d_flow = read_live_evidence(
+            conn, "ETHUSDT", bar_start,
+            bar_start+timedelta(minutes=1), decision)
+        assert d_flow is not None
+        assert d_flow["snapshot_key"] == published["snapshot_key"]
+        assert d_flow["paper_only"] is True
+        assert d_flow["ml_eligible"] is False
+        assert conn.execute("""SELECT count(*) AS n FROM paper_live_evidence
+            WHERE symbol='ETHUSDT'""").fetchone()["n"] == 1
+        assert conn.execute("""SELECT count(*) AS n FROM feature_snapshots
+            WHERE symbol='ETHUSDT' AND is_causal""").fetchone()["n"] == 0
+
+    # A new stream interruption cannot make an old B row newly admissible.
+    with connection(c_pg) as conn:
+        conn.execute("""INSERT INTO data_gaps(
+            source,symbol,start_ts,end_ts,explanation)
+            VALUES('publicTrade','ETHUSDT',%s,%s,
+                   'controlled_test_disconnect')""",
+            (bar_start, bar_start+timedelta(minutes=1)))
+    with pytest.raises(ValueError, match="interruption|overlaps"):
+        publish_latest_bounded_live(c_pg)
+
+
+def test_round7_aggregate_pending_rechecks_already_complete_legacy_jobs(c_pg):
+    """The autonomous archive worker revisits OLD completed-but-wrong rollups."""
+    from eth_tester.rollups import aggregate_pending
+    from eth_tester.analytics_core import FRAMES
+    t = datetime(2026, 4, 3, tzinfo=UTC)
+    stamp = t+timedelta(minutes=1)
+    sha = "9"*64
+    _seed_sha_archive_stage(
+        c_pg, t.date(), sha, [("source-only", stamp, 100, 2, "Buy")])
+    with connection(c_pg) as conn:
+        # A global websocket trade not represented by this archive SHA.
+        conn.execute("""INSERT INTO trades(
+            symbol,ts,trade_id,price,qty,side,notional,source)
+            VALUES('ETHUSDT',%s,'ws-not-archived',999,9,
+                   'Buy',8991,'websocket')""", (stamp,))
+        for tf in FRAMES:
+            conn.execute("""INSERT INTO aggregation_job(
+                symbol,tf,day,archive_sha256,rows)
+                VALUES('ETHUSDT',%s,%s,%s,1)""", (tf, t.date(), sha))
+        # This preexisting completed one-minute rollup is WRONG.
+        conn.execute("""INSERT INTO footprint_daily(
+            symbol,tf,day,bucket,price,buy_qty,sell_qty,trades)
+            VALUES('ETHUSDT','1',%s,%s,999,9,0,1)""",
+            (t.date(), stamp))
+    assert aggregate_pending(c_pg, max_days=1) == len(FRAMES)
+    with connection(c_pg) as conn:
+        bins = conn.execute("""SELECT price,buy_qty FROM footprint_daily
+            WHERE symbol='ETHUSDT' AND tf='1' ORDER BY price""").fetchall()
+    assert bins == [{"price": Decimal(100), "buy_qty": Decimal(2)}]

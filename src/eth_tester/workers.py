@@ -8,7 +8,8 @@ from .book_analysis import replay_orderbook
 from .cvd_incremental import update_cvd
 from .indicator_incremental import indicator_worker_step
 from .snapshot_producer import certify_snapshot
-from .live_paper_window import inspect_latest_live_bar
+from .live_paper_window import (publish_latest_bounded_live,
+                                read_live_paper_status)
 from .database import connection
 from .rollups import aggregate_pending
 
@@ -16,19 +17,22 @@ LIVE_FRAMES = tuple(tf for tf in FRAMES if tf not in ("W", "M"))
 
 
 async def analytics_worker(settings):
-    cycle = 0
     async def run_fast_window():
-        # Independent 5s status sampler; no B witness, no admission, no ML.
+        # Independent 5s replay + B-only paper witness; never ML eligible.
         while True:
             try:
-                sample = await asyncio.to_thread(inspect_latest_live_bar, settings)
+                sample = await asyncio.to_thread(
+                    publish_latest_bounded_live, settings)
+                condition = ("ok" if sample.get("status") == "published" else
+                             "partial" if sample.get("status") in
+                             ("pending", "expired") else "degraded")
                 with connection(settings) as conn:
                     conn.execute("""INSERT INTO bot_heartbeat(component,status,detail)
-                        VALUES('live_paper_window','partial',%s::jsonb)
+                        VALUES('live_paper_window',%s,%s::jsonb)
                         ON CONFLICT(component) DO UPDATE SET
                         status=EXCLUDED.status,detail=EXCLUDED.detail,
                         updated_at=clock_timestamp()""",
-                        (json.dumps(sample),))
+                        (condition, json.dumps(sample),))
             except Exception as exc:
                 try:
                     with connection(settings) as conn:
@@ -65,10 +69,9 @@ async def _analytics_cycles(settings):
                 return None
 
         try:
-            # The fast 1m availability gate runs ahead of expensive 13-TF work.
-            # Until B publishes independently verified source witnesses this
-            # remains an explicit pending state, NEVER certified/ML eligible.
-            checked = await run("live_paper_window", inspect_latest_live_bar,
+            # Separate from the fast publisher: report the last actually
+            # DB-persisted paper-only state, never a guessed positive flag.
+            checked = await run("live_paper_status", read_live_paper_status,
                                 settings)
             if checked is not None:
                 live_paper = checked

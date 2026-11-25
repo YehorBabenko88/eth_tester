@@ -58,8 +58,12 @@ def snapshot_metrics(bids, asks, *, observed_at, as_of, max_age=timedelta(second
             "bid_qty": b, "ask_qty": a, "age_seconds": Decimal(str(age.total_seconds()))}
 
 
-def replay_orderbook(settings,batch=2000):
+def replay_orderbook(settings,batch=2000, *, max_batches=None):
+    """Replay raw L2; optional bounded mode preserves backlog for the next pass."""
+    if batch < 1 or (max_batches is not None and max_batches < 1):
+        raise ValueError("positive L2 batch and max_batches required")
     total=0
+    batches=0
     while True:
         with connection(settings) as conn:
             row=conn.execute("""SELECT last_event_id,bids,asks,last_update_id,valid
@@ -120,5 +124,6 @@ def replay_orderbook(settings,batch=2000):
                (settings.symbol,last,json.dumps(bids),json.dumps(asks),last_u,valid,
                 latest_received))
             total+=len(events)
-        if len(events)<batch:
+            batches+=1
+        if len(events)<batch or (max_batches is not None and batches>=max_batches):
             return total

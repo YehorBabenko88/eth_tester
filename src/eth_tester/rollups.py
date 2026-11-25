@@ -3,7 +3,6 @@
 Each day's contribution is stored separately so calendar-week/month price bins
 can be rebuilt without double-counting previously imported archive days.
 """
-from datetime import datetime, timedelta, timezone
 import json
 
 from .analytics_core import value_profile
@@ -15,15 +14,71 @@ MINUTES = {"1":1,"3":3,"5":5,"15":15,"30":30,"60":60,
 TIMEFRAMES = (*MINUTES, "W", "M")
 
 
-def bucket_expression(tf):
+def bucket_expression(tf, source_column="ts"):
+    if source_column not in ("ts", "minute_ts"):
+        raise ValueError("Unapproved archive timestamp column")
     if tf in MINUTES:
-        return f"date_bin(interval '{MINUTES[tf]} minutes',ts,'1970-01-01 00:00+00'::timestamptz)"
+        return f"date_bin(interval '{MINUTES[tf]} minutes',{source_column},'1970-01-01 00:00+00'::timestamptz)"
     if tf == "W":
-        return "date_trunc('week',ts)"
+        return f"date_trunc('week',{source_column})"
     if tf == "M":
-        return "date_trunc('month',ts)"
+        return f"date_trunc('month',{source_column})"
     raise ValueError("Unknown time frame")
 
+
+
+def _verify_archive_stage_source(conn, settings, day, digest):
+    """Require B immutable gzip SHA membership before editing rollup rows."""
+    job = conn.execute("""SELECT state,sha256 FROM ingestion_job
+        WHERE source='trades_archive' AND symbol=%s AND day=%s FOR SHARE""",
+        (settings.symbol, day)).fetchone()
+    if not job or job["state"] != "complete" or job["sha256"] != digest:
+        raise ValueError("archive_job_sha_missing_or_changed")
+    source = conn.execute("""SELECT original_rows,distinct_trade_ids,price_bins,
+            base_qty,quote_notional,exchange_complete
+        FROM archive_stage_receipts WHERE symbol=%s AND instrument=%s
+          AND archive_day=%s AND archive_sha256=%s FOR SHARE""",
+        (settings.symbol, settings.category, day, digest)).fetchone()
+    if source is None or source["exchange_complete"] is not False:
+        raise ValueError("sha_pinned_archive_stage_receipt_missing")
+    bins = conn.execute("""SELECT count(*) AS price_bins,
+            coalesce(sum(trade_count),0) AS prints,
+            coalesce(sum(base_qty),0) AS base_qty,
+            coalesce(sum(quote_notional),0) AS quote_notional
+        FROM archive_source_price_bins
+        WHERE symbol=%s AND instrument=%s AND archive_day=%s
+          AND archive_sha256=%s""",
+        (settings.symbol, settings.category, day, digest)).fetchone()
+    if (source["distinct_trade_ids"] != bins["prints"] or
+            source["price_bins"] != bins["price_bins"] or
+            source["base_qty"] != bins["base_qty"] or
+            source["quote_notional"] != bins["quote_notional"] or
+            bins["prints"] < 1):
+        raise ValueError("archive_source_price_bins_manifest_mismatch")
+    return source
+
+
+def _daily_bins_match(conn, settings, day, tf, digest, expression):
+    """Compare stored daily contribution with identical immutable SHA bins."""
+    result = conn.execute(f"""WITH expected AS (
+        SELECT {expression} AS bucket,price,
+          coalesce(sum(base_qty) FILTER(WHERE side='Buy'),0) AS buy_qty,
+          coalesce(sum(base_qty) FILTER(WHERE side='Sell'),0) AS sell_qty,
+          sum(trade_count)::bigint AS trades
+        FROM archive_source_price_bins
+        WHERE symbol=%s AND instrument=%s AND archive_day=%s
+          AND archive_sha256=%s GROUP BY 1,2),
+      present AS (
+        SELECT bucket,price,buy_qty,sell_qty,trades::bigint AS trades
+        FROM footprint_daily WHERE symbol=%s AND tf=%s AND day=%s),
+      difference AS (
+        (SELECT * FROM expected EXCEPT ALL SELECT * FROM present)
+        UNION ALL
+        (SELECT * FROM present EXCEPT ALL SELECT * FROM expected))
+      SELECT EXISTS(SELECT 1 FROM difference) AS differs""",
+      (settings.symbol, settings.category, day, digest,
+       settings.symbol, tf, day)).fetchone()
+    return not result["differs"]
 
 def rollup_day(settings, day, tf, digest):
     """Rebuild only buckets affected by a changed archive day.
@@ -32,16 +87,21 @@ def rollup_day(settings, day, tf, digest):
     Replacing one day must include *previously* touched buckets, including
     now-empty buckets, and must aggregate every contributing day for W/M.
     """
-    expression = bucket_expression(tf)
-    beginning = datetime.combine(day, datetime.min.time(), timezone.utc)
-    ending = beginning + timedelta(days=1)
+    expression = bucket_expression(tf, "minute_ts")
     with connection(settings) as conn:
         conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                      (f"{settings.symbol}:{tf}:cluster",))
+        _verify_archive_stage_source(conn, settings, day, digest)
         done = conn.execute("""SELECT 1 FROM aggregation_job WHERE symbol=%s
             AND tf=%s AND day=%s AND archive_sha256=%s""",
                             (settings.symbol, tf, day, digest)).fetchone()
-        if done:
+        if done and _daily_bins_match(
+                conn, settings, day, tf, digest, expression):
+            # Audited exact SHA membership: rotate historical days without
+            # rewriting their correct footprints or invalidating CVD.
+            conn.execute("""UPDATE aggregation_job SET completed_at=clock_timestamp()
+                WHERE symbol=%s AND tf=%s AND day=%s AND archive_sha256=%s""",
+                (settings.symbol, tf, day, digest))
             return 0
         old_buckets = conn.execute("""SELECT DISTINCT bucket FROM footprint_daily
             WHERE symbol=%s AND tf=%s AND day=%s""",
@@ -52,13 +112,15 @@ def rollup_day(settings, day, tf, digest):
         inserted = conn.execute(f"""INSERT INTO footprint_daily(
             symbol,tf,day,bucket,price,buy_qty,sell_qty,trades)
             SELECT %s,%s,%s,{expression} AS bucket,price,
-              coalesce(sum(qty) FILTER(WHERE side='Buy'),0),
-              coalesce(sum(qty) FILTER(WHERE side='Sell'),0),
-              count(*)
-            FROM trades
-            WHERE symbol=%s AND ts>=%s AND ts<%s
+              coalesce(sum(base_qty) FILTER(WHERE side='Buy'),0),
+              coalesce(sum(base_qty) FILTER(WHERE side='Sell'),0),
+              sum(trade_count)
+            FROM archive_source_price_bins
+            WHERE symbol=%s AND instrument=%s AND archive_day=%s
+              AND archive_sha256=%s
             GROUP BY bucket,price""",
-            (settings.symbol, tf, day, settings.symbol, beginning, ending))
+            (settings.symbol, tf, day, settings.symbol,
+             settings.category, day, digest))
         count = inserted.rowcount
         new_buckets = conn.execute("""SELECT DISTINCT bucket FROM footprint_daily
             WHERE symbol=%s AND tf=%s AND day=%s""",
@@ -186,18 +248,43 @@ def aggregate_history(settings,max_days=0):
 
 
 def aggregate_pending(settings, max_days=4):
-    """Process only archive days whose 13-frame checksum ledger is incomplete."""
+    """Repair and re-audit exact SHA archive price bins, one bounded slice.
+
+    Earlier aggregation jobs could have read all global trades. Rotate source
+    days by their last completed/audited clock, including formerly completed
+    ones, without pretending an unavailable SHA membership is verified.
+    """
     if max_days < 1:
         raise ValueError("max_days must be positive")
     with connection(settings) as conn:
+        missing = conn.execute("""SELECT count(*) AS n
+            FROM ingestion_job i WHERE i.source='trades_archive'
+              AND i.symbol=%s AND i.state='complete'
+              AND NOT EXISTS (SELECT 1 FROM archive_stage_receipts r
+                WHERE r.symbol=i.symbol AND r.instrument=%s
+                  AND r.archive_day=i.day AND r.archive_sha256=i.sha256)""",
+            (settings.symbol, settings.category)).fetchone()["n"]
         days = conn.execute("""SELECT i.day,i.sha256 FROM ingestion_job i
             WHERE i.source='trades_archive' AND i.symbol=%s
               AND i.state='complete'
-              AND (SELECT count(*) FROM aggregation_job a
-                   WHERE a.symbol=i.symbol AND a.day=i.day
-                     AND a.archive_sha256=i.sha256) < %s
-            ORDER BY i.day LIMIT %s""",
-            (settings.symbol, len(TIMEFRAMES), max_days)).fetchall()
+              AND EXISTS (SELECT 1 FROM archive_stage_receipts r
+                WHERE r.symbol=i.symbol AND r.instrument=%s
+                  AND r.archive_day=i.day AND r.archive_sha256=i.sha256)
+            ORDER BY (
+                SELECT count(*) FROM aggregation_job a
+                WHERE a.symbol=i.symbol AND a.day=i.day
+                  AND a.archive_sha256=i.sha256),
+              (SELECT coalesce(min(a.completed_at),
+                       'epoch'::timestamptz)
+                FROM aggregation_job a
+                WHERE a.symbol=i.symbol AND a.day=i.day
+                  AND a.archive_sha256=i.sha256),
+              i.day LIMIT %s""",
+            (settings.symbol, settings.category, max_days)).fetchall()
+    if missing:
+        print(f"archive_membership_missing_days={missing}; "
+              "replay original SHA through A/B stage before rollup",
+              flush=True)
     count = 0
     for row in days:
         if not row["sha256"]:

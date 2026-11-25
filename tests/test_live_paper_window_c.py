@@ -125,3 +125,136 @@ def test_live_window_never_writes_a_snapshot(monkeypatch):
     assert result["reason"] == "b_authoritative_source_witness_missing"
     assert result["ml_eligible"] is False
     assert all(stmt.lstrip().upper().startswith("SELECT") for stmt in conn.statements)
+
+
+def _mock_fast_publisher(monkeypatch, *, now, bar, has_book=True,
+                         has_oi=True, has_rest=True, sessions=1, b_reject=False):
+    """Source selectors are mocked; B alone supplies authoritative publication."""
+    from contextlib import nullcontext
+    class DB:
+        statements = []
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+        def transaction(self):
+            return nullcontext()
+        def execute(self, query, args=None):
+            self.statements.append(query)
+            if "pg_advisory_xact_lock" in query:
+                return type("Cursor", (), {"fetchone": lambda self: None})()
+            if "clock_timestamp() AS ts" in query:
+                row = {"ts": now}
+            elif "FROM candles" in query:
+                row = {"ts": bar}
+            elif "FROM ingestion_coverage" in query:
+                row = {"checked_at": now} if has_rest else None
+            elif "FROM paper_live_evidence" in query:
+                row = None
+            elif "FROM live_book_receipts" in query:
+                row = {"id": 17} if has_book else None
+            elif "FROM live_oi_receipts" in query:
+                row = {"id": 23} if has_oi else None
+            elif "FROM live_trade_receipts" in query:
+                rows = [{"session_id": "real-session", "prints": 1}]
+                if sessions == 0:
+                    rows = []
+                elif sessions == 2:
+                    rows.append({"session_id": "other", "prints": 1})
+                return type("Cursor", (), {"fetchall": lambda self: rows})()
+            else:
+                raise AssertionError("Unexpected SQL: " + query)
+            return type("Cursor", (), {
+                "fetchone": lambda self: row})()
+    db = DB()
+    recorded = []
+    monkeypatch.setattr("eth_tester.database.connection", lambda _: db)
+    monkeypatch.setattr("eth_tester.book_analysis.replay_orderbook",
+                        lambda settings, **kwargs: 3)
+    def issue(conn, symbol, start, session, book_id, oi_id):
+        recorded.append((symbol, start, session, book_id, oi_id))
+        if b_reject:
+            raise ValueError("Source receipt incomplete")
+        return "a"*64
+    monkeypatch.setattr(
+        "eth_tester.storage.live_evidence.publish_bounded_paper_evidence",
+        issue)
+    def confirm(conn, *, symbol, bar_ts, evidence_key, decision_at):
+        assert evidence_key == "a"*64
+        assert decision_at == now
+        return {"snapshot_key": evidence_key, "source_checksum": "b"*64,
+                "computed_at": now}
+    monkeypatch.setattr(
+        "eth_tester.storage.live_evidence.require_bounded_paper_evidence",
+        confirm)
+    return type("Settings", (), {
+        "symbol": "ETHUSDT", "category": "linear"})(), db, recorded
+
+
+def test_round7_fast_c_publisher_selects_real_b_ids_not_caller_flags(monkeypatch):
+    from eth_tester.live_paper_window import publish_latest_bounded_live
+    now = BAR + timedelta(minutes=1, seconds=10)
+    settings, db, recorded = _mock_fast_publisher(
+        monkeypatch, now=now, bar=BAR)
+    result = publish_latest_bounded_live(settings)
+    assert result["status"] == "published"
+    assert result["snapshot_key"] == "a"*64
+    assert result["source_checksum"] == "b"*64
+    assert result["ml_eligible"] is False
+    assert result["paper_only"] is True
+    assert result["publication_latency_ms"] == 10000
+    assert result["rest_close_receipt_latency_ms"] == 10000
+    assert recorded == [("ETHUSDT", BAR, "real-session", 17, 23)]
+    assert all("INSERT INTO feature_snapshots" not in query
+               for query in db.statements)
+
+
+@pytest.mark.parametrize("condition", ("rest", "book", "oi", "sessions", "expired"))
+def test_round7_fast_c_requires_all_real_sources_before_b_issuance(
+        monkeypatch, condition):
+    from eth_tester.live_paper_window import publish_latest_bounded_live
+    now = BAR+timedelta(minutes=1, seconds=20)
+    settings, _, recorded = _mock_fast_publisher(
+        monkeypatch, now=now if condition != "expired" else
+            BAR+timedelta(minutes=3),
+        bar=BAR, has_rest=condition != "rest",
+        has_book=condition != "book",
+        has_oi=condition != "oi",
+        sessions=2 if condition == "sessions" else 1)
+    result = publish_latest_bounded_live(settings)
+    assert result["status"] in ("pending", "expired")
+    assert result["ml_eligible"] is False
+    assert recorded == []
+
+
+def test_round7_b_writer_rejection_is_not_positive_publication(monkeypatch):
+    from eth_tester.live_paper_window import publish_latest_bounded_live
+    now = BAR+timedelta(minutes=1, seconds=11)
+    settings, _, issued = _mock_fast_publisher(
+        monkeypatch, now=now, bar=BAR, b_reject=True)
+    result = publish_latest_bounded_live(settings)
+    assert result["status"] == "pending"
+    assert result["reason"] == "b_source_validation_rejected"
+    assert len(issued) == 1
+    assert "snapshot_key" not in result
+
+
+def test_round7_stale_fast_heartbeat_cannot_claim_current_publication(monkeypatch):
+    from eth_tester.live_paper_window import read_live_paper_status
+    class DB:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+        def execute(self, *_):
+            return type("Cursor", (), {"fetchone": lambda _: {
+                "status": "ok",
+                "detail": {"status": "published", "reason": "old_sample"},
+                "updated_at": BAR,
+                "checked_at": BAR+timedelta(seconds=26),
+            }})()
+    monkeypatch.setattr("eth_tester.database.connection", lambda _: DB())
+    settings = type("S", (), {"symbol": "ETHUSDT"})()
+    result = read_live_paper_status(settings)
+    assert result["status"] == "pending"
+    assert result["reason"] == "fast_lane_heartbeat_stale"
