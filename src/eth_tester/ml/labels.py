@@ -1,46 +1,62 @@
-"""Deterministic barrier labels, resolved only after the precommitted horizon.
+"""Post-decision structural labels on the full UTC closed-candle grid.
 
-Future bars are used ONLY to create historical labels, never input features.
+The decision timestamp is NEVER rounded or backdated. The bar overlapping
+that decision is excluded. This function never trusts PnL as a class label.
 """
 from math import isfinite
 
 
+def full_future_grid(decision_ms, *, bar_interval_ms, horizon_bars):
+    """Return first full bar start/end and horizon (UTC epoch milliseconds)."""
+    if (type(decision_ms) is not int or decision_ms <= 0
+            or type(bar_interval_ms) is not int or bar_interval_ms <= 0
+            or type(horizon_bars) is not int or not 1 <= horizon_bars <= 10000):
+        raise ValueError("invalid post-decision grid policy")
+    start = (decision_ms // bar_interval_ms + 1) * bar_interval_ms
+    return start, start + bar_interval_ms, start + horizon_bars * bar_interval_ms
+
+
 def label_level_outcome(side, level, closed_bars, *, decision_ms, horizon_ms,
                         as_of_ms, bar_interval_ms, barrier_bps=20):
-    """Classify confirmed level test: breakout, bounce or uncertain.
+    """Classify breakout, bounce or uncertain from strictly future full bars.
 
-    Resistance: high crossing upper barrier -> breakout, low crossing lower
-    barrier -> bounce. Support: the directions are reversed. If both barriers
-    hit in one closed bar, outcome is uncertain (no intrabar path assumption).
-    Event is not eligible until horizon has elapsed in observed time.
+    Never include OHLC from a candle that was already in progress at entry.
+    Concurrent upper+lower touch in the same bar is ambiguous and stays uncertain.
+    A gap, late close, synthetic shifted grid or unknown high/low is rejected.
     """
-    if side not in ("support", "resistance") or not isfinite(level) or level <= 0:
+    if (side not in ("support", "resistance") or isinstance(level, bool)
+            or not isfinite(float(level)) or float(level) <= 0):
         raise ValueError("invalid reference level")
-    if (not isinstance(decision_ms, int) or not isinstance(horizon_ms, int)
-            or not isinstance(as_of_ms, int) or horizon_ms <= decision_ms
-            or as_of_ms < horizon_ms or barrier_bps <= 0 or barrier_bps > 1000
-            or not isinstance(bar_interval_ms, int) or bar_interval_ms <= 0
-            or (horizon_ms-decision_ms) % bar_interval_ms != 0):
-        raise ValueError("unresolved or invalid horizon")
-    step = level * barrier_bps / 10000
-    upper, lower = level + step, level - step
+    if (type(horizon_ms) is not int or type(as_of_ms) is not int
+            or type(barrier_bps) not in (int, float) or isinstance(barrier_bps, bool)
+            or not isfinite(float(barrier_bps))
+            or not 0 < barrier_bps <= 1000):
+        raise ValueError("invalid or unresolved horizon")
     bars = list(closed_bars)
-    if len(bars) != (horizon_ms-decision_ms)//bar_interval_ms:
-        raise ValueError("incomplete label horizon")
+    first_start, _, expected_horizon = full_future_grid(
+        decision_ms, bar_interval_ms=bar_interval_ms, horizon_bars=len(bars))
+    if (not bars or horizon_ms != expected_horizon or
+            not decision_ms < first_start or as_of_ms < horizon_ms):
+        raise ValueError("unresolved or invalid horizon")
+    width = float(level) * barrier_bps / 10000
+    upper, lower = float(level) + width, float(level) - width
     outcome = None
-    for index, bar in enumerate(bars, 1):
-        stamp = bar["closed_ms"]
-        if not isinstance(stamp, int) or stamp != decision_ms + index*bar_interval_ms:
+    for index, bar in enumerate(bars):
+        expected_start = first_start + index * bar_interval_ms
+        expected_close = expected_start + bar_interval_ms
+        if (type(bar.get("closed_ms")) is not int
+                or bar["closed_ms"] != expected_close
+                or ("start_ms" in bar and bar["start_ms"] != expected_start)):
             raise ValueError("unordered or out-of-horizon bar")
         low, high = float(bar["low"]), float(bar["high"])
-        if not all(isfinite(v) for v in (low, high)) or low > high or low <= 0:
+        if not (isfinite(low) and isfinite(high) and 0 < low <= high):
             raise ValueError("invalid bar")
-        crossed_up, crossed_down = high >= upper, low <= lower
         if outcome is None:
-            if crossed_up and crossed_down:
+            up, down = high >= upper, low <= lower
+            if up and down:
                 outcome = "uncertain"
-            elif crossed_up:
+            elif up:
                 outcome = "breakout" if side == "resistance" else "bounce"
-            elif crossed_down:
+            elif down:
                 outcome = "bounce" if side == "resistance" else "breakout"
     return outcome or "uncertain"

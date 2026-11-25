@@ -9,10 +9,14 @@ from ..database import connection
 from . import evaluate, fit, rollback_required, should_retrain, validate
 
 
-def store_shadow(settings, model, train, validation, shadow):
+def store_shadow(settings, model, train, validation, shadow, *, eligible_count=None):
     """Persist an append-only candidate; no approval without independent evidence."""
     if not (train and validation and shadow):
         raise ValueError("three disjoint samples required")
+    if eligible_count is not None and (
+            type(eligible_count) is not int or eligible_count < (
+                len(train) + len(validation) + len(shadow))):
+        raise ValueError("invalid immutable eligible-count watermark")
     for partition in (train, validation, shadow):
         if len(validate(partition, max(r.exit_ms for r in partition))) != len(partition):
             raise ValueError("unresolved training evidence")
@@ -33,6 +37,9 @@ def store_shadow(settings, model, train, validation, shadow):
               "train_count": len(train),
               "train_to_ms": model.train_to_ms,
               "paper_only": True, "state": "shadow", "model_version": model.version}
+    if eligible_count is not None:
+        report["eligible_count"] = eligible_count
+        report["source_contract"] = "eth_feature_snapshot_v2"
     with connection(settings) as conn:
         conn.execute("SELECT pg_advisory_xact_lock(20991992)")
         existing = conn.execute(

@@ -69,7 +69,56 @@ def train_causal_shadow(settings, as_of_ms, *, source="snapshots", tf="1",
         return {"status": "insufficient_purged_splits", "usable": len(rows),
                 "required": min_rows, "rejections": rejected, "approved": False}
     model = fit(train)
-    candidate_id, metrics = store_shadow(settings, model, train, validation, shadow)
+    candidate_id, metrics = store_shadow(settings, model, train, validation, shadow,
+                                         eligible_count=len(rows))
     return {"status": "shadow_registered", "candidate_id": candidate_id,
             "version": model.version, "metrics": metrics, "usable": len(rows),
             "rejections": rejected, "approved": False}
+
+
+def run_causal_shadow_cycle(settings, *, min_new=100, min_rows=180,
+                            embargo_ms=60000):
+    """Single bounded, restart-idempotent shadow cycle; no orders or promotions.
+
+    The monotonic eligible-count watermark lives in our model_versions
+    validation payload; no new shared migration or elevated DDL is needed.
+    A distinct advisory lock serializes scheduler invocations while B's
+    canonical registry lock continues protecting model rows.
+    """
+    from .ml.contract import milliseconds
+    from .ml.training_cursor import prior_eligible_count
+
+    if (type(min_new) is not int or min_new < 1 or
+            type(min_rows) is not int or min_rows < 180 or
+            type(embargo_ms) is not int or embargo_ms < 0):
+        raise ValueError("invalid shadow retrain policy")
+    with connection(settings) as conn:
+        locked = conn.execute(
+            "SELECT pg_try_advisory_xact_lock(20991993) AS acquired"
+        ).fetchone()["acquired"]
+        if not locked:
+            return {"status": "already_running", "approved": False}
+        stamp = conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
+        as_of = milliseconds(stamp)
+        row = conn.execute(
+            """SELECT validation FROM model_versions
+               WHERE model_name='causal_softmax3' AND approved=false
+                 AND validation->>'source_contract'='eth_feature_snapshot_v2'
+                 AND validation ? 'eligible_count'
+               ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        previous_count = prior_eligible_count(row)
+        # The advisory transaction lock spans training and registration.
+        # store_shadow uses a *different* B registry lock, no self-deadlock.
+        try:
+            result = train_causal_shadow(
+                settings, as_of, tf="1", source="snapshots",
+                min_rows=min_rows, min_new=min_new,
+                previous_count=previous_count, embargo_ms=embargo_ms)
+        except (ValueError, TypeError, OverflowError) as exc:
+            return {"status": "invalid_verified_training_evidence",
+                    "reason": str(exc)[:160], "approved": False,
+                    "previous_eligible_count": previous_count,
+                    "as_of_ms": as_of}
+        return {**result, "previous_eligible_count": previous_count,
+                "as_of_ms": as_of, "approved": False}

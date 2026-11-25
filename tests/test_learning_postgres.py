@@ -179,3 +179,23 @@ def test_real_ledger_and_snapshot_updates_are_forbidden(learning_postgres):
                 conn.execute(
                     "UPDATE feature_snapshots SET quality='bad' "
                     "WHERE snapshot_key=%s", (one["snapshot_key"],))
+
+
+def test_round6_real_postgres_historical_label_worker_rejects_missing_proof(
+        learning_postgres):
+    """Negative integration: synthetic fixtures do not authorize real labels."""
+    from eth_tester.ml.label_worker import run_label_cycle
+
+    with connection(learning_postgres) as conn:
+        before = conn.execute(
+            "SELECT count(*) AS n FROM paper_ml_labels"
+        ).fetchone()["n"]
+    report = run_label_cycle(learning_postgres, limit=25)
+    with connection(learning_postgres) as conn:
+        after = conn.execute(
+            "SELECT count(*) AS n FROM paper_ml_labels"
+        ).fetchone()["n"]
+    assert report["approved"] is False
+    assert report["created"] == 0
+    assert after == before
+    assert report["status"] == "insufficient_verified_horizon"

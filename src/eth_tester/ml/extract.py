@@ -150,29 +150,55 @@ def load_causal_feature_examples(settings, as_of_ms, *, tf="1", limit=100000):
             or not isinstance(tf, str) or not tf
             or not isinstance(limit, int) or not 1 <= limit <= 1000000):
         raise ValueError("invalid causal extraction bound")
+    accepted = []
+    rejected = {}
+    examined = 0
+    page_size = min(limit, 1000)
+    cursor_ts = None
+    cursor_id = None
     with connection(settings) as conn:
         present = conn.execute(
             "SELECT to_regclass('public.paper_ml_labels') IS NOT NULL AS installed"
         ).fetchone()
         if not present["installed"]:
             return [], {"missing_post_horizon_label_ledger": 1}
-        rows = conn.execute(
-            """SELECT p.id AS paper_trade_id, p.reason,
-                 p.signal_ts AS decision_at,p.opened_at,p.closed_at,
-                 p.notional,p.gross_pnl,p.fee_paid AS fees,
-                 p.funding_paid AS funding,p.net_pnl,
-                 f.snapshot_key,f.bar_ts,f.available_at,f.observed_at,f.computed_at,
-                 f.source_checksum,f.quality AS snapshot_quality,f.is_causal,
-                 f.values_json,f.provenance,
-                 to_jsonb(l) AS label_ledger
-               FROM paper_trades p
-               LEFT JOIN feature_snapshots f
-                 ON f.snapshot_key=(p.reason->>'ml_snapshot_key')
-                 AND f.symbol=p.symbol AND f.tf=%s
-               LEFT JOIN paper_ml_labels l ON l.paper_trade_id=p.id
-               WHERE p.symbol=%s AND p.state='closed'
-                 AND p.opened_at IS NOT NULL
-                 AND p.closed_at<=to_timestamp(%s / 1000.0)
-               ORDER BY p.signal_ts,p.id LIMIT %s""",
-            (tf, settings.symbol, as_of_ms, limit)).fetchall()
-    return from_snapshot_records(rows, as_of_ms)
+        while examined < limit:
+            batch = min(page_size, limit - examined)
+            rows = conn.execute(
+                """SELECT p.id AS paper_trade_id, p.reason,
+                     p.signal_ts AS decision_at,p.opened_at,p.closed_at,
+                     p.notional,p.gross_pnl,p.fee_paid AS fees,
+                     p.funding_paid AS funding,p.net_pnl,
+                     f.snapshot_key,f.bar_ts,f.available_at,f.observed_at,
+                     f.computed_at,f.source_checksum,
+                     f.quality AS snapshot_quality,f.is_causal,
+                     f.values_json,f.provenance,
+                     to_jsonb(l) AS label_ledger
+                   FROM paper_trades p
+                   LEFT JOIN feature_snapshots f
+                     ON f.snapshot_key=(p.reason->>'ml_snapshot_key')
+                     AND f.symbol=p.symbol AND f.tf=%s
+                   LEFT JOIN paper_ml_labels l ON l.paper_trade_id=p.id
+                   WHERE p.symbol=%s AND p.state='closed'
+                     AND p.opened_at IS NOT NULL
+                     AND p.closed_at<=to_timestamp(%s / 1000.0)
+                     AND (%s::timestamptz IS NULL OR
+                          (p.signal_ts,p.id)<(%s::timestamptz,%s::bigint))
+                   ORDER BY p.signal_ts DESC,p.id DESC LIMIT %s""",
+                (tf, settings.symbol, as_of_ms,
+                 cursor_ts, cursor_ts, cursor_id, batch)).fetchall()
+            if not rows:
+                break
+            page, failures = from_snapshot_records(rows, as_of_ms)
+            accepted.extend(page)
+            for name, count in failures.items():
+                rejected[name] = rejected.get(name, 0) + count
+            examined += len(rows)
+            cursor_ts, cursor_id = rows[-1]["decision_at"], rows[-1]["paper_trade_id"]
+            if len(rows) < batch:
+                break
+    if examined >= limit:
+        # Never claim a complete population scan when bounded page limit hit.
+        rejected["scan_limit_reached"] = 1
+    return validate(accepted, as_of_ms), rejected
+
