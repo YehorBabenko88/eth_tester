@@ -197,6 +197,16 @@ def price_signal(closed_candles,fee_rate=D("0.00055"),slip_bps=D("2"),
                 if candidate is not None:
                     candidates.append((abs(price - candidate.level),
                                        candidate.reason["strategy"], candidate))
-        return min(candidates,key=lambda x:(x[0],x[1]))[2] if candidates else None
+        selected = min(candidates,key=lambda x:(x[0],x[1]))[2] if candidates else None
+        if selected is None:
+            return None
+        # Shadow research cannot alter the existing v3 signal, B source gate,
+        # single-paper-position ownership or historic F ML eligibility.
+        from .strategies.ensemble import evaluate_shadow_ensemble
+        shadow = evaluate_shadow_ensemble(
+            candles, taker_fee_rate=fee_rate, slippage_bps=slip_bps)
+        return Signal(selected.direction, selected.level, selected.stop,
+                      selected.take,
+                      {**selected.reason, "ensemble_shadow": shadow})
     except (InvalidOperation,ValueError,TypeError,KeyError):
         return None

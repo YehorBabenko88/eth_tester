@@ -145,4 +145,12 @@ def test_price_signal_includes_engine_hash_and_causal_confirmation():
     assert signal.reason["confirmed_available_at"] == (
         start + timedelta(minutes=7)).isoformat()
     assert signal.reason["requires_live_confirmation"] is True
+    shadow = signal.reason["ensemble_shadow"]
+    assert shadow["contract"] == "eth_strategy_ensemble_v1"
+    assert shadow["mode"] == "shadow_only"
+    assert shadow["paper_entry_authorized"] is False
+    assert shadow["ml_eligible"] is False
+    assert shadow["approved"] is False
+    assert shadow["expected_net_lower_bound"] is None
+    assert signal.reason["strategy_version"] == strategy_identity()
 
