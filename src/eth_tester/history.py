@@ -105,6 +105,40 @@ async def collect_oi(settings,client,interval):
             save_cursor(conn,"oi",settings.symbol,interval,dtms(end+1))
         pos=end+1
 
+async def collect_account_ratios(settings,client,period):
+    start=datetime.combine(settings.archive_start,datetime.min.time(),UTC)
+    with connection(settings) as conn:
+        previous=cursor_ts(conn,'account_ratio',settings.symbol,period)
+    pos=toms(previous or start)
+    now=toms(datetime.now(UTC))
+    while pos<now:
+        end=min(now-1,pos+7*86400000-1)
+        cursor=None
+        seen=set()
+        with connection(settings) as conn:
+            while True:
+                data=await client.get('account-ratio',category=settings.category,symbol=settings.symbol,
+                                      period=period,startTime=pos,endTime=end,limit=500,cursor=cursor)
+                for item in data.get('list',[]):
+                    stamp=int(item['timestamp'])
+                    if pos<=stamp<=end:
+                        conn.execute('''INSERT INTO ratios(symbol,period,ts,buy_ratio,sell_ratio,raw)
+                        VALUES(%s,%s,%s,%s,%s,%s::jsonb) ON CONFLICT(symbol,period,ts)
+                        DO UPDATE SET buy_ratio=EXCLUDED.buy_ratio,sell_ratio=EXCLUDED.sell_ratio''',
+                        (settings.symbol,period,dtms(stamp),Decimal(item['buyRatio']),
+                         Decimal(item['sellRatio']),json.dumps(item)))
+                next_cursor=data.get('nextPageCursor')
+                if not next_cursor:
+                    if len(data.get('list',[]))>=500:
+                        raise RuntimeError('Account-ratio page at limit without cursor')
+                    break
+                if next_cursor in seen:
+                    raise RuntimeError('Repeated account-ratio cursor')
+                seen.add(next_cursor)
+                cursor=next_cursor
+            save_cursor(conn,'account_ratio',settings.symbol,period,dtms(end+1))
+        pos=end+1
+
 async def backfill_rest(settings):
     async with MarketClient(settings.bybit_rest,settings.rest_rps) as client:
         instrument=await client.instrument(settings.symbol,settings.category)
@@ -131,5 +165,10 @@ async def backfill_rest(settings):
                 await collect_oi(settings,client,interval)
             except Exception as exc:
                 errors.append(("oi",interval,str(exc)))
+        for period in OI_INTERVALS:
+            try:
+                await collect_account_ratios(settings,client,period)
+            except Exception as exc:
+                errors.append(('account_ratio',period,str(exc)))
         if errors:
             raise RuntimeError(f"Incomplete backfill: {errors}")
