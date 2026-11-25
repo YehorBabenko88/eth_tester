@@ -1,56 +1,76 @@
-"""Time-causal pivot rejection: no future candle can influence entry."""
+"""Causal price candidates; live confirmation is mandatory in orderflow."""
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal as D, InvalidOperation
 from .analytics import confirmed_pivots
-from .paper import min_viable_target
+from .paper import estimate_trade, min_viable_target
+from .strategies import Parameters, pattern
 
 @dataclass(frozen=True)
 class Signal:
     direction: str
-    level: Decimal
-    stop: Decimal
-    take: Decimal
+    level: D
+    stop: D
+    take: D
     reason: dict
 
-def price_signal(closed_candles,fee_rate=Decimal("0.00055"),slip_bps=Decimal("2"),max_lookback=180):
-    if len(closed_candles)<12:
+def economics(direction, price, stop, take, fee, slip, params=Parameters()):
+    if not (0 < stop < price < take if direction == "long" else 0 < take < price < stop):
         return None
-    candles=closed_candles[-max_lookback:]
-    last=candles[-1]
-    price=Decimal(last["close"])
-    if price<=0:
+    reserve = D(params.funding_reserve)*1000
+    win = estimate_trade(direction,price,take,D(1000),fee,slip,reserve)["net"]
+    loss = -estimate_trade(direction,price,stop,D(1000),fee,slip,reserve)["net"]
+    if loss <= 0 or win < D(params.min_net)*1000 or win/loss < D(params.reward_risk):
         return None
-    pivots=confirmed_pivots(candles[:-1],2)
-    sample=candles[-12:]
-    atr=sum((Decimal(x["high"])-Decimal(x["low"]) for x in sample),Decimal(0))/len(sample)
-    if atr<=0:
+    return {"net_target_fraction":str(win/1000),"net_risk_fraction":str(loss/1000),
+            "net_reward_risk":str(win/loss),"funding_reserve_fraction":params.funding_reserve,
+            "break_even_win_rate":str(loss/(win+loss))}
+
+def price_signal(closed_candles,fee_rate=D("0.00055"),slip_bps=D("2"),max_lookback=180):
+    params=Parameters()
+    candles=list(closed_candles[-max_lookback:])
+    if len(candles)<12:
         return None
-    minimum=min_viable_target(Decimal(1000),fee_rate,slip_bps)
-    candidates=[]
-    for side,origin,level,confirmed in pivots:
-        if any((Decimal(c["close"])>level if side=="resistance" else Decimal(c["close"])<level)
-               for c in candles if confirmed<c["ts"]<last["ts"]):
-            continue
-        distance=abs(price-level)/level
-        if distance>Decimal("0.004"):
-            continue
-        accepted=((side=="support" and Decimal(last["low"])<=level
-            and price>level and price>Decimal(last["open"])) or
-            (side=="resistance" and Decimal(last["high"])>=level
-            and price<level and price<Decimal(last["open"])))
-        if not accepted:
-            continue
-        direction="long" if side=="support" else "short"
-        risk=max(atr,price*Decimal("0.0025"))
-        stop=(min(level,Decimal(last["low"]))-risk*Decimal("0.25") if direction=="long"
-              else max(level,Decimal(last["high"]))+risk*Decimal("0.25"))
-        distance_stop=abs(price-stop)
-        take=(price+max(distance_stop*2,price*minimum) if direction=="long"
-              else price-max(distance_stop*2,price*minimum))
-        if take<=0:
-            continue
-        reason={"strategy":"pivot_rejection_v1","origin":origin.isoformat(),
-                "confirmed":confirmed.isoformat(),"side":side,
-                "level":str(level),"atr":str(atr),"source":"closed_candles"}
-        candidates.append((distance,Signal(direction,level,stop,take,reason)))
-    return min(candidates,key=lambda x:x[0])[1] if candidates else None
+    try:
+        step=candles[1]["ts"]-candles[0]["ts"]
+        if step.total_seconds()<=0 or any(b["ts"]-a["ts"]!=step for a,b in zip(candles,candles[1:])):
+            return None
+        for b in candles:
+            o,h,l,c=(D(b[k]) for k in ("open","high","low","close"))
+            if not all(x.is_finite() for x in (o,h,l,c)) or not 0<l<=min(o,c)<=max(o,c)<=h:
+                return None
+        last=candles[-1]
+        price=D(last["close"])
+        atr=sum((max(D(b["high"])-D(b["low"]),abs(D(b["high"])-D(a["close"])),
+                     abs(D(b["low"])-D(a["close"]))) for a,b in zip(candles[-13:-1],candles[-12:])),D(0))/min(12,len(candles)-1)
+        if atr<=0 or atr/price>D("0.03"):
+            return None
+        candidates=[]
+        for side,origin,level,confirmed in confirmed_pivots(candles[:-1],2):
+            level=D(level)
+            if abs(price-level)/level>D(params.max_distance):
+                continue
+            history=[b for b in candles[:-1] if b["ts"]>confirmed]
+            crossed=[b for b in history if (D(b["close"])>level if side=="resistance" else D(b["close"])<level)]
+            broken=bool(crossed)
+            if broken and crossed[-1]["ts"]!=candles[-2]["ts"]:
+                continue
+            match=pattern(side,level,candles[-2],last,broken)
+            if not match:
+                continue
+            direction,name=match
+            sign=D(1) if direction=="long" else D(-1)
+            anchor=min(level,D(last["low"])) if sign>0 else max(level,D(last["high"]))
+            stop=anchor-sign*max(atr*D("0.5"),price*D("0.001"))
+            risk=abs(price-stop)
+            take=price+sign*max(risk*D(3),price*(min_viable_target(D(1000),fee_rate,slip_bps)+D(params.funding_reserve)+D(params.min_net)))
+            costs=economics(direction,price,stop,take,fee_rate,slip_bps,params)
+            if costs is None:
+                continue
+            reason={"strategy":name,"strategy_version":params.version,**params.identity(),
+                    "origin":origin.isoformat(),"confirmed":confirmed.isoformat(),
+                    "side":side,"level":str(level),"atr":str(atr),"reference_price":str(price),
+                    "source":"closed_candles","economics":costs,"requires_live_confirmation":True}
+            candidates.append((abs(price-level),name,Signal(direction,level,stop,take,reason)))
+        return min(candidates,key=lambda x:(x[0],x[1]))[2] if candidates else None
+    except (InvalidOperation,ValueError,TypeError,KeyError):
+        return None
