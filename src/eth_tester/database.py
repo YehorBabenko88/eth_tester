@@ -39,7 +39,7 @@ def _assert_safe_existing_database(conn):
         raise RuntimeError("Refusing to adopt unknown nonempty PostgreSQL database")
     resources = files("eth_tester")
     sources = [resources.joinpath("schema.sql")]
-    for name in ("0001_partitioned_archive.sql", "0002_quality_and_provenance.sql"):
+    for name in ("0001_partitioned_archive.sql", "0002_quality_and_provenance.sql", "0003_retention_indexes.sql", "0004_trade_identity_guard.sql"):
         sources.append(resources.joinpath("migrations").joinpath(name))
     known = set()
     for source in sources:
