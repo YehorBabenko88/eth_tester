@@ -55,7 +55,8 @@ def test_migrations_and_reinitialization_preserve_rows(postgres_lab):
         ).fetchall()
         assert [r["version"] for r in versions] == [
             "0001_partitioned_archive.sql", "0002_quality_and_provenance.sql",
-            "0003_retention_indexes.sql", "0004_trade_identity_guard.sql"
+            "0003_retention_indexes.sql", "0004_trade_identity_guard.sql",
+            "0005_paper_settlement_ledger.sql"
         ]
         conn.execute(
             """INSERT INTO funding(symbol,ts,rate) VALUES(%s,%s,%s)
