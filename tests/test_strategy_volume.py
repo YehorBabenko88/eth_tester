@@ -124,3 +124,13 @@ def test_volume_signal_rejects_unobserved_time_holes():
             candle(4, "99.9", "100.6", "100.2", "100.1"),
             candle(5, "99.9", "100.6", "100.2", "100.1")]
     assert volume_signal(bars, profile) is None
+
+def test_zero_volume_internal_zone_is_identified_without_made_up_trades():
+    trades = [{"ts": START, "price": p, "qty": qty}
+              for p, qty in ((100, 10), (101, 1), (103, 1), (104, 9))]
+    profile = build_profile(trades, START, END, D(1),
+                            coverage_verified=True, expected_trade_count=4)
+    assert [(z.low, z.high, z.quantity) for z in profile.low_volume_zones] == [
+        (D(101), D(103), D(2))]
+    assert [(z.low, z.high) for z in profile.high_volume_zones] == [
+        (D(100), D(100)), (D(104), D(104))]
