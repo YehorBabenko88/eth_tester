@@ -178,7 +178,7 @@ def volume_signal(closed_candles, profile, fee_rate=Decimal("0.00055"),
                 side, name = "short", kind + "_rejection"
             else:
                 continue
-            direction = Decimal(1) if side == "long" else Decimal(-1")
+            direction = Decimal(1) if side == "long" else Decimal(-1)
             # Current bar range and historical zone width determine stop.
             buffer = max(high - low, price * Decimal("0.002")) * Decimal("0.5")
             anchor = min(low, level) if side == "long" else max(high, level)
