@@ -7,11 +7,26 @@ from .database import connection
 from .paper import open_paper,close_paper
 from .strategy import price_signal
 from .orderflow import confirm_rejection
+from .simulation.crossing import resolve_first_crossing
 
 def estimated_funding(conn,settings,opened,observed,qty,entry,direction):
-    rows=conn.execute("""SELECT ts,rate FROM funding WHERE symbol=%s AND
-      ts>%s AND ts<=%s""",(settings.symbol,opened,observed)).fetchall()
-    return (1 if direction=="long" else -1)*sum((qty*entry*Decimal(x["rate"]) for x in rows),Decimal(0))
+    """Never synthesize funding from entry price: require event-time mark evidence.
+
+    Historical funding chronology may still be incomplete: a returned 'marked'
+    result is not proof all funding events were supplied.
+    """
+    rows=conn.execute("""SELECT f.ts,f.rate,
+      (SELECT m.mark_price FROM market_ticker_events m
+         WHERE m.symbol=f.symbol AND m.exchange_ts<=f.ts
+         AND m.exchange_ts>=f.ts-interval '1 second'
+         AND m.mark_price>0 ORDER BY m.exchange_ts DESC LIMIT 1) AS mark_price
+      FROM funding f WHERE f.symbol=%s AND f.ts>%s AND f.ts<=%s
+      ORDER BY f.ts""",(settings.symbol,opened,observed)).fetchall()
+    if not rows or any(row["mark_price"] is None for row in rows):
+        return Decimal(0),"unverified"
+    sign=Decimal(1) if direction=="long" else Decimal(-1)
+    return (sign*sum((Decimal(qty)*Decimal(row["mark_price"])*Decimal(row["rate"])
+                      for row in rows),Decimal(0)),"marked_not_completeness_proven")
 
 def engine_tick(settings):
     now=datetime.now(timezone.utc)
@@ -27,21 +42,33 @@ def engine_tick(settings):
         trade=conn.execute("SELECT * FROM paper_trades WHERE state='open' LIMIT 1").fetchone()
         if trade:
             stop,take=Decimal(trade["stop"]),Decimal(trade["take"])
-            hit=conn.execute("""SELECT ts,price FROM trades WHERE symbol=%s AND ts>=%s AND ts<=%s
-              AND (price<=%s OR price>=%s) ORDER BY ts,trade_id LIMIT 1""",
-              (settings.symbol,trade["opened_at"],recent["ts"],min(stop,take),max(stop,take))).fetchone()
-            if not hit:
+            gap=conn.execute("""SELECT 1 FROM data_gaps WHERE symbol=%s
+              AND source='publicTrade' AND resolved_at IS NULL
+              AND start_ts<=%s AND (end_ts IS NULL OR end_ts>=%s) LIMIT 1""",
+              (settings.symbol,recent["ts"],trade["opened_at"])).fetchone()
+            if gap:
+                return "blocked_unresolved_tick_gap"
+            lower,upper=min(stop,take),max(stop,take)
+            hit=conn.execute("""SELECT ts,
+              min(price) FILTER (WHERE price<=%s) AS low_cross,
+              max(price) FILTER (WHERE price>=%s) AS high_cross
+              FROM trades WHERE symbol=%s AND source='websocket'
+              AND ts>%s AND ts<=%s AND (price<=%s OR price>=%s)
+              GROUP BY ts ORDER BY ts LIMIT 1""",
+              (lower,upper,settings.symbol,trade["opened_at"],recent["ts"],
+               lower,upper)).fetchone()
+            crossing=resolve_first_crossing(hit,trade["direction"],stop,take)
+            if crossing is None:
                 return "monitoring_position"
-            recent=hit
-            price=Decimal(hit["price"])
-            if trade["direction"]=="long":
-                reason="stop" if price<=stop else "take" if price>=take else None
-            else:
-                reason="stop" if price>=stop else "take" if price<=take else None
-            if not reason:
-                return "monitoring_position"
-            funding=estimated_funding(conn,settings,trade["opened_at"],
-                                       recent["ts"],trade["qty"],trade["entry"],trade["direction"])
+            recent={"ts":crossing["ts"],"price":crossing["price"]}
+            reason=crossing["reason"]
+            if crossing["ambiguous_same_timestamp"]:
+                reason+="_same_timestamp_ambiguous_stop_first"
+            funding,funding_quality=estimated_funding(
+                conn,settings,trade["opened_at"],recent["ts"],
+                trade["qty"],trade["entry"],trade["direction"])
+            if funding_quality!="marked_not_completeness_proven":
+                reason+="_funding_unverified"
         else:
             enabled=conn.execute("SELECT enabled,paused FROM bot_control WHERE singleton=true").fetchone()
             if not enabled or not enabled["enabled"] or enabled["paused"]:
@@ -93,7 +120,7 @@ def engine_tick(settings):
         return "closed_"+str(identifier)
     try:
         identifier=open_paper(settings,signal.direction,recent["price"],
-                              signal.stop,signal.take,signal.reason)
+                              signal.stop,signal.take,signal.reason,observed_at=recent["ts"])
         try:
             from .charts import render_trade
             render_trade(settings,identifier)
