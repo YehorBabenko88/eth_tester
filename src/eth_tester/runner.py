@@ -72,10 +72,29 @@ def engine_tick(settings):
             if abs(Decimal(recent["price"])/Decimal(bars[-1]["close"])-1)>Decimal("0.005"):
                 return "signal_expired_price_gap"
     if trade:
-        return "closed_"+str(close_paper(settings,recent["price"],reason,funding))
+        identifier=close_paper(settings,recent["price"],reason,funding)
+        if identifier:
+            try:
+                from .charts import render_trade
+                render_trade(settings,identifier)
+            except Exception as exc:
+                with connection(settings) as conn:
+                    conn.execute("""INSERT INTO bot_events(severity,event,data)
+                        VALUES('warning','exit_chart_failed',%s::jsonb)""",
+                        (json.dumps({"trade":identifier,"error":str(exc)[:400]}),))
+        return "closed_"+str(identifier)
     try:
-        return "opened_"+str(open_paper(settings,signal.direction,recent["price"],
-                                        signal.stop,signal.take,signal.reason))
+        identifier=open_paper(settings,signal.direction,recent["price"],
+                              signal.stop,signal.take,signal.reason)
+        try:
+            from .charts import render_trade
+            render_trade(settings,identifier)
+        except Exception as exc:
+            with connection(settings) as conn:
+                conn.execute("""INSERT INTO bot_events(severity,event,data)
+                    VALUES('warning','entry_chart_failed',%s::jsonb)""",
+                    (json.dumps({"trade":identifier,"error":str(exc)[:400]}),))
+        return "opened_"+str(identifier)
     except (RuntimeError,ValueError) as exc:
         return "rejected_"+str(exc)
 
