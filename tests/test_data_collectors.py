@@ -181,8 +181,9 @@ def test_trade_parser_refuses_zero_price():
 def test_archive_reconcile_requires_all_1440_minutes():
     class Conn:
         def execute(self, sql, _params):
-            if "FROM candles" in sql:
-                return []
-            return []
+            class Rows:
+                def fetchall(self):
+                    return []
+            return Rows()
     assert reconcile_archive_day(Conn(), "ETHUSDT", date(2026, 1, 1)
                                  )["status"] == "incomplete_candles"
