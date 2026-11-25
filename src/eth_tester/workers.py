@@ -7,6 +7,7 @@ from .analytics_core import FRAMES
 from .book_analysis import replay_orderbook
 from .cvd_incremental import update_cvd
 from .indicator_incremental import indicator_worker_step
+from .snapshot_producer import certify_snapshot
 from .database import connection
 from .rollups import aggregate_pending
 
@@ -17,6 +18,7 @@ async def analytics_worker(settings):
     cycle = 0
     while True:
         failures = []
+        certification_pending = []
 
         async def run(name, function, *args):
             try:
@@ -41,6 +43,9 @@ async def analytics_worker(settings):
                 if cycle % 3 == 0:
                     await run(f"cvd:{tf}", update_cvd, settings, tf)
                     await run(f"indicators:{tf}", indicator_worker_step, settings, tf)
+                    proof = await run(f"snapshot:{tf}", certify_snapshot, settings, tf)
+                    if proof and proof.get("status") == "rejected":
+                        certification_pending.append({"tf": tf, "reason": proof["reason"]})
             status = "degraded" if failures else "ok"
             with connection(settings) as conn:
                 conn.execute("""INSERT INTO bot_heartbeat(component,status,detail)
@@ -49,7 +54,8 @@ async def analytics_worker(settings):
                       detail=EXCLUDED.detail,updated_at=now()""",
                     (status, json.dumps({"cycle": cycle,
                                          "errors": len(failures),
-                                         "completed": not failures})))
+                                         "completed": not failures,
+                                         "certification_pending": certification_pending})))
                 if failures:
                     conn.execute("""INSERT INTO bot_events(severity,event,data)
                         VALUES('error','analytics_failure',%s::jsonb)""",

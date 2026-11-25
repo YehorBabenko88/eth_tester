@@ -116,3 +116,149 @@ def test_indicator_asof_and_trade_vwap(c_pg):
     assert items[0]["metadata"]["causally_certified"] is False
     assert items[1]["metadata"]["atr"] is not None
     assert items[2]["metadata"]["realized_volatility"] is not None
+
+
+
+def test_round2_certified_snapshot_immutable_and_actual_materialization_time(c_pg):
+    """Synthetic archive proof; production A currently emits partial only."""
+    import json
+    from eth_tester.snapshot_producer import certify_snapshot, coverage_certificate
+
+    observed = datetime.now(UTC)
+    day_end = observed.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = day_end - timedelta(minutes=1)
+    day_start = day_end - timedelta(days=1)
+    digest = "a" * 64
+    evidence = {"gzip_crc_checked": True, "trade_identity_checked": True,
+                "volume_verified": True, "download_sha256": digest}
+    coverage = [{"start_ts": day_start, "end_ts": day_end, "status": "verified",
+                 "checksum": digest, "observed_rows": 3, "expected_rows": 3,
+                 "checked_at": observed, "evidence": evidence}]
+    jobs = {day_start.date(): {"state": "complete", "sha256": digest}}
+    checks = {(day_start.date(), digest):
+              {"total": 1, "matched": 1, "unique_minutes": 1,
+               "latest_checked": observed}}
+    source_sha, _ = coverage_certificate(
+        start, day_end, observed + timedelta(seconds=1), coverage, jobs, checks)
+    metadata = {
+        "asof_close": day_end.isoformat(),
+        "realized_volatility": "0.02", "cvd_scope": "verified_window",
+        "cvd_completeness": "verified", "cvd_source_sha256": source_sha,
+    }
+    latest_oi = observed - timedelta(minutes=2)
+    earlier_oi = latest_oi - timedelta(minutes=5)
+    with connection(c_pg) as conn:
+        conn.execute("""INSERT INTO ingestion_job(source,symbol,day,state,
+            row_count,sha256) VALUES('trades_archive','ETHUSDT',%s,'complete',3,%s)""",
+            (day_start.date(), digest))
+        conn.execute("""INSERT INTO ingestion_coverage(
+            source,symbol,instrument,interval,start_ts,end_ts,status,
+            observed_rows,expected_rows,checksum,quality,evidence,checked_at)
+            VALUES('trades_archive','ETHUSDT','linear','',%s,%s,
+                   'verified',3,3,%s,'synthetic_independent_proof',%s::jsonb,%s)""",
+            (day_start, day_end, digest, json.dumps(evidence), observed))
+        conn.execute("""INSERT INTO trade_candle_volume_checks(
+            symbol,instrument,minute_ts,archive_source,archive_sha256,
+            status,checked_at)
+            VALUES('ETHUSDT','linear',%s,'trades_archive',%s,'match',%s)""",
+            (start, digest, observed))
+        conn.execute("""INSERT INTO aggregation_job(
+            symbol,tf,day,archive_sha256,rows)
+            VALUES('ETHUSDT','1',%s,%s,1)""", (day_start.date(), digest))
+        conn.execute("""INSERT INTO candles(
+            symbol,kind,tf,ts,open,high,low,close,volume,source)
+            VALUES('ETHUSDT','trade','1',%s,100,101,99,100,3,'qa')""",
+            (start,))
+        conn.execute("""INSERT INTO footprint(
+            symbol,tf,bucket,price,buy_qty,sell_qty,
+            buy_notional,sell_notional,trades)
+            VALUES('ETHUSDT','1',%s,100,2,1,200,100,3)""", (start,))
+        conn.execute("""INSERT INTO features(
+            symbol,tf,ts,poc,delta,cvd,volume,tape_tps,metadata,quality)
+            VALUES('ETHUSDT','1',%s,100,1,5,3,0.05,%s::jsonb,
+                   'archive_rollup_partial')""", (start, json.dumps(metadata)))
+        conn.execute("""INSERT INTO levels(
+            symbol,tf,side,origin_ts,level_price,source,confirmed_at)
+            VALUES('ETHUSDT','1','resistance',%s,102,
+                   'causal_closed_pivot',%s)""",
+            (start - timedelta(minutes=4), start - timedelta(minutes=1)))
+        conn.execute("""INSERT INTO market_book_state(
+            symbol,last_event_id,bids,asks,last_update_id,valid,updated_at)
+            VALUES('ETHUSDT',1,%s::jsonb,%s::jsonb,1,true,%s)""",
+            (json.dumps({"99": "10"}), json.dumps({"101": "5"}), observed))
+        for stamp, value in ((latest_oi, 1010), (earlier_oi, 1000)):
+            conn.execute("""INSERT INTO open_interest(
+                symbol,interval,ts,value)
+                VALUES('ETHUSDT','5min',%s,%s)""", (stamp, value))
+    published = certify_snapshot(c_pg, "1")
+    assert published["status"] == "published", published
+    again = certify_snapshot(c_pg, "1")
+    assert again["status"] == "already_published", again
+    with connection(c_pg) as conn:
+        rows = conn.execute("""SELECT bar_ts,available_at,observed_at,computed_at,
+            quality,is_causal,source_checksum,values_json,provenance
+            FROM feature_snapshots WHERE symbol='ETHUSDT'""").fetchall()
+    assert len(rows) == 1
+    one = rows[0]
+    assert one["bar_ts"] == start
+    assert one["source_checksum"] == source_sha
+    assert one["quality"] == "complete" and one["is_causal"]
+    assert one["available_at"] == one["observed_at"] == one["computed_at"]
+    assert one["computed_at"] >= observed > day_end
+    assert one["values_json"]["oi"] == "10"
+    assert one["provenance"]["availability_convention"] == (
+        "DB_materialization_time_not_bar_close")
+    assert all(stamp >= int(observed.timestamp() * 1000)
+               for stamp in one["provenance"]["feature_available_ms"].values())
+    with pytest.raises(psycopg.errors.RaiseException):
+        with connection(c_pg) as conn:
+            conn.execute("""UPDATE feature_snapshots SET is_causal=false
+                WHERE source_checksum=%s""", (source_sha,))
+
+
+def test_round2_partial_coverage_never_materializes_certified_snapshot(c_pg):
+    from eth_tester.snapshot_producer import certify_snapshot
+
+    start = datetime.now(UTC).replace(second=0, microsecond=0)
+    start -= timedelta(minutes=3)
+    with connection(c_pg) as conn:
+        conn.execute("""INSERT INTO candles(
+            symbol,kind,tf,ts,open,high,low,close,volume,source)
+            VALUES('ETHUSDT','trade','1',%s,100,101,99,100,3,'qa')""",
+            (start,))
+        conn.execute("""INSERT INTO features(
+            symbol,tf,ts,poc,delta,cvd,volume,tape_tps)
+            VALUES('ETHUSDT','1',%s,100,1,1,3,0.05)""", (start,))
+    result = certify_snapshot(c_pg, "1")
+    assert result["status"] == "rejected"
+    with connection(c_pg) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM feature_snapshots").fetchone()["n"] == 0
+
+
+def test_round2_archive_live_overlap_preserves_rollup_and_all_frames(c_pg):
+    from eth_tester.analytics import build_footprint
+    from eth_tester.analytics_core import FRAMES
+
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    stamp = now - timedelta(minutes=2)
+    with connection(c_pg) as conn:
+        for ident,price,qty,side in (
+                ("overlap-buy", 100, 2, "Buy"),
+                ("overlap-sell", 101, 1, "Sell")):
+            conn.execute("""INSERT INTO trades(
+                symbol,ts,trade_id,price,qty,side,notional,source)
+                VALUES('ETHUSDT',%s,%s,%s,%s,%s,%s,'qa_archive')""",
+                (stamp, ident, price, qty, side, price*qty))
+    assert len(FRAMES) == 13
+    for tf in FRAMES:
+        assert rollup_day(c_pg, stamp.date(), tf, "overlap-sha") == 2
+        with connection(c_pg) as conn:
+            result = conn.execute("""SELECT sum(volume) AS total
+                FROM features WHERE symbol='ETHUSDT' AND tf=%s""",
+                (tf,)).fetchone()
+        assert result["total"] == Decimal(3), (tf, result)
+    assert build_footprint(c_pg, "1", hours=2) == 0
+    with connection(c_pg) as conn:
+        result = conn.execute("""SELECT sum(buy_qty+sell_qty) AS total
+            FROM footprint WHERE symbol='ETHUSDT' AND tf='1'""").fetchone()
+    assert result["total"] == Decimal(3)
