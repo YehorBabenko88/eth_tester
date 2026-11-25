@@ -94,7 +94,8 @@ class Model:
     def probabilities(self, values):
         if len(values) != len(FEATURE_NAMES) or not all(math.isfinite(float(x)) for x in values):
             raise ValueError("invalid inference features")
-        x = [1.0] + [(float(v) - m) / s for v, m, s in zip(values, self.mean, self.std)]
+        x = [1.0] + [max(-8.0, min(8.0, (float(v) - m) / s))
+                     for v, m, s in zip(values, self.mean, self.std)]
         return dict(zip(CLASSES, _softmax([sum(a*b for a, b in zip(w, x))
                                           for w in self.weights])))
 
@@ -124,6 +125,8 @@ def fit(train, *, steps=240, learning_rate=0.035):
     if steps < 1 or learning_rate <= 0:
         raise ValueError("invalid optimization")
     ordered = sorted(train, key=lambda r: (r.decision_ms, r.event_id))
+    if validate(ordered, max(r.exit_ms for r in ordered)) != ordered:
+        raise ValueError("invalid training data")
     n = len(ordered)
     means = [sum(r.values[i] for r in ordered) / n for i in range(len(FEATURE_NAMES))]
     stds = [max(1e-9, math.sqrt(sum((r.values[i] - means[i])**2 for r in ordered)/n))
@@ -146,8 +149,10 @@ def fit(train, *, steps=240, learning_rate=0.035):
     payoffs = tuple(sum(r.net_return for r in ordered if r.outcome == label) /
                     sum(r.outcome == label for r in ordered) for label in CLASSES)
     fingerprint = sha256(json.dumps(
-        [(r.event_id, r.decision_ms, r.exit_ms, r.values, r.available_ms,
-          r.outcome, r.gross_return, r.costs) for r in ordered],
+        {"observations": [(r.event_id, r.decision_ms, r.exit_ms,
+                           r.values, r.available_ms, r.outcome,
+                           r.gross_return, r.costs) for r in ordered],
+         "weights": weights, "steps": steps, "rate": learning_rate},
         separators=(",", ":")).encode()).hexdigest()[:16]
     return Model("softmax3-" + fingerprint, tuple(means), tuple(stds),
                  tuple(tuple(w) for w in weights), payoffs, max(r.exit_ms for r in ordered))
@@ -210,6 +215,10 @@ class Gates:
 
 def approve_candidate(candidate, champion, train, validation, shadow, gates=Gates()):
     """Fail closed. Paper *registry* approval only, never an exchange order."""
+    if (gates.min_train < 100 or gates.min_validation < 30 or gates.min_shadow < 30
+            or gates.min_trades < 20 or gates.max_brier > .55
+            or gates.max_drift > .2 or gates.min_improvement < 0):
+        return False, "weakened admission policy"
     if len(train) < gates.min_train or len(validation) < gates.min_validation or len(shadow) < gates.min_shadow:
         return False, "insufficient independent samples"
     if not max(r.exit_ms for r in train) < min(r.decision_ms for r in validation):
