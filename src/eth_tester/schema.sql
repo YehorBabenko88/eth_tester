@@ -174,3 +174,10 @@ CREATE TABLE IF NOT EXISTS orderbook_wall_events (
  UNIQUE(symbol,source_id,side,price)
 );
 CREATE INDEX IF NOT EXISTS wall_event_time ON orderbook_wall_events(symbol,ts DESC);
+
+CREATE TABLE IF NOT EXISTS market_book_state (
+ symbol text PRIMARY KEY,last_event_id bigint NOT NULL DEFAULT 0,
+ bids jsonb NOT NULL DEFAULT '{}'::jsonb, asks jsonb NOT NULL DEFAULT '{}'::jsonb,
+ last_update_id bigint,valid boolean NOT NULL DEFAULT false,
+ updated_at timestamptz NOT NULL DEFAULT now()
+);
