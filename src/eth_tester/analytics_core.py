@@ -125,10 +125,10 @@ def footprint(trades, *, imbalance_ratio=Decimal("3"), min_quantity=ZERO,
             row = levels[p]
             previous = levels.get(p - tick, {"sell": ZERO})
             following = levels.get(p + tick, {"buy": ZERO})
-            if row["buy"] >= threshold and row["buy"] > 0 and (
+            if (p - tick) in levels and row["buy"] >= threshold and row["buy"] > 0 and (
                     previous["sell"] == 0 or row["buy"] >= previous["sell"] * ratio):
                 flags["buy"].append(p)
-            if row["sell"] >= threshold and row["sell"] > 0 and (
+            if (p + tick) in levels and row["sell"] >= threshold and row["sell"] > 0 and (
                     following["buy"] == 0 or row["sell"] >= following["buy"] * ratio):
                 flags["sell"].append(p)
     stack = {}
