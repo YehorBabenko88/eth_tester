@@ -21,4 +21,4 @@ packages = ["src/eth_tester"]
 [tool.ruff]
 line-length = 100
 [tool.ruff.lint]
-select = ["E4","E7","E9","F","I","B"]
+select = ["E4","E7","E9","F"]
