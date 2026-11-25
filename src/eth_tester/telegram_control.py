@@ -4,6 +4,7 @@ Remote database deletion is fail-closed until Storage Guardian #2 approves a con
 """
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -179,9 +180,20 @@ def _read(settings, name):
                 """SELECT topic,status,ts FROM feed_health WHERE symbol=%s
                    ORDER BY ts DESC LIMIT 12""", (settings.symbol,)
             ).fetchall()
-            return "\n".join(
+            latest = conn.execute(
+                """SELECT ts FROM trades WHERE symbol=%s AND source='websocket'
+                   ORDER BY ts DESC LIMIT 1""", (settings.symbol,)
+            ).fetchone()
+            if latest and latest["ts"]:
+                age = (datetime.now(timezone.utc) - latest["ts"]).total_seconds()
+                freshness = "✅ поток сделок активен" if -2 <= age <= 45 else "⚠️ поток сделок устарел"
+                prefix = f"{freshness}; последняя сделка {latest['ts']}"
+            else:
+                prefix = "⚠️ нет подтверждённых WebSocket-сделок"
+            details = "\n".join(
                 f"{r['topic']}: {r['status']} ({r['ts']})" for r in rows
             ) or "Телеметрия WebSocket отсутствует"
+            return prefix + "\n" + details
         if name == "errors":
             rows = conn.execute(
                 """SELECT ts,severity,event FROM bot_events
