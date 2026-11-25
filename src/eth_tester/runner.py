@@ -80,7 +80,7 @@ def engine_tick(settings):
             if abs(Decimal(recent["price"])/Decimal(bars[-1]["close"])-1)>Decimal("0.005"):
                 return "signal_expired_price_gap"
     if trade:
-        identifier=close_paper(settings,recent["price"],reason,funding)
+        identifier=close_paper(settings,recent["price"],reason,funding,recent["ts"],trade["id"])
         if identifier:
             try:
                 from .charts import render_trade
