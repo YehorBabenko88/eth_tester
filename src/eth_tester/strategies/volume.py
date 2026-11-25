@@ -4,7 +4,7 @@ These are research candidates. The live engine must supply independently verifie
 trade-coverage provenance; a candle's total volume is not a price profile.
 """
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 
 
@@ -105,19 +105,26 @@ def build_profile(trades, start, end, tick_size, *, coverage_verified=False,
         return None
 
 
-def untouched_poc(profile, closed_bars, *, through):
-    """At least one complete bar after the profile, no POC touch through cutoff."""
-    if through <= profile.end:
+def untouched_poc(profile, closed_bars, *, through, bar_span=timedelta(minutes=1)):
+    """Naked only with gap-free, complete bars from profile end to cutoff."""
+    if through <= profile.end or bar_span.total_seconds() <= 0:
         return False
-    evaluated = [b for b in closed_bars if profile.end <= b["ts"] < through]
-    if not evaluated:
+    bars = list(closed_bars)
+    if not bars or (through - profile.end) % bar_span != timedelta(0):
         return False
-    for bar in evaluated:
-        if bar.get("closed", True) is not True:
-            return False
-        if number(bar["low"]) <= profile.poc <= number(bar["high"]):
-            return False
-    return True
+    expected = int((through - profile.end) / bar_span)
+    if len(bars) != expected:
+        return False
+    try:
+        for index, bar in enumerate(bars):
+            if (bar["ts"] != profile.end + index * bar_span
+                    or bar.get("closed", True) is not True):
+                return False
+            if number(bar["low"]) <= profile.poc <= number(bar["high"]):
+                return False
+        return True
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        return False
 
 
 def volume_signal(closed_candles, profile, fee_rate=Decimal("0.00055"),
@@ -176,7 +183,7 @@ def volume_signal(closed_candles, profile, fee_rate=Decimal("0.00055"),
             buffer = max(high - low, price * Decimal("0.002")) * Decimal("0.5")
             anchor = min(low, level) if side == "long" else max(high, level)
             stop = anchor - direction * buffer
-            take = price + direction * abs(price - stop) * Decimal("3")
+            take = price + direction * abs(price - stop) * Decimal("4")
             cost = economics(side, price, stop, take, fee_rate, slip_bps)
             if cost is None:
                 continue
