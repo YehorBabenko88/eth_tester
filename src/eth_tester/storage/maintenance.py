@@ -4,7 +4,7 @@ Never use the local filesystem's free bytes to certify a remote PostgreSQL
 server; no market-data rows or backups are deleted by this module.
 """
 from datetime import datetime, timezone
-from pathlib import Path
+import os
 import re
 import stat
 from shutil import disk_usage
@@ -70,42 +70,66 @@ def local_temp_preflight(path, *, minimum_free_gb=20):
 
 
 def cleanup_owned_temp(root, *, now=None, older_than_seconds=3600, max_files=100):
-    """Delete ONLY old staging .part files under a pre-marked owned directory.
+    """POSIX handle-pinned temp sweep; on Windows fail closed without native handles.
 
-    Does not follow symlinks, recurse, touch directories, or create its own
-    marker. A missing/invalid marker raises; operator controls temp ownership.
+    Descriptor-based directory identity stops a symlink substitution after
+    owner validation. Windows must use reparse-safe native handles and
+    must not fall back to path-based unlink.
     """
     if (type(older_than_seconds) is not int or older_than_seconds < 60 or
             type(max_files) is not int or not 1 <= max_files <= 1000):
-        raise ValueError("Bounded positive temp cleanup limits required")
-    path = Path(root)
-    if path.is_symlink() or not path.is_dir():
-        raise RuntimeError("Owned temp root must be a real directory")
-    marker = path / _MARKER
-    if (marker.is_symlink() or not marker.is_file() or
-            marker.read_text(encoding="utf-8") != _MARKER_TEXT):
-        raise RuntimeError("Exact ETH Tester temp ownership marker required")
+        raise ValueError('Bounded positive temp cleanup limits required')
+    if os.name != 'posix' or not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_DIRECTORY'):
+        raise RuntimeError('No verified atomic owner directory handle')
     instant = datetime.now(timezone.utc).timestamp() if now is None else now
     if isinstance(instant, bool) or not isinstance(instant, (int, float)):
-        raise ValueError("Invalid cleanup time")
-    deleted = 0
-    scanned = 0
-    for child in sorted(path.iterdir(), key=lambda p: p.name):
-        if deleted >= max_files:
-            break
-        if not _TEMP_PATTERN.fullmatch(child.name):
-            continue
-        scanned += 1
+        raise ValueError('Invalid cleanup time')
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | getattr(os, 'O_CLOEXEC', 0)
+    root_fd = os.open(root, flags)
+    try:
+        st = os.fstat(root_fd)
+        if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid()
+                or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            raise RuntimeError('Owned temp directory permissions not secure')
+        marker_fd = os.open(_MARKER, os.O_RDONLY | os.O_NOFOLLOW |
+                            getattr(os, 'O_CLOEXEC', 0), dir_fd=root_fd)
         try:
-            info = child.lstat()
-            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
-                    info.st_mtime > instant - older_than_seconds):
-                continue
-            child.unlink()
-            deleted += 1
-        except FileNotFoundError:
-            continue
-    return {"status": "ok", "deleted_owned_temp_files": deleted,
-            "matched_candidates_scanned": scanned,
-            "raw_market_data_deleted": 0, "backups_deleted": 0,
-            "bounded": deleted == max_files}
+            marker_st = os.fstat(marker_fd)
+            marker_bytes = os.read(marker_fd, len(_MARKER_TEXT.encode()) + 1)
+            if (not stat.S_ISREG(marker_st.st_mode) or marker_st.st_nlink != 1
+                    or marker_st.st_uid != st.st_uid
+                    or marker_bytes != _MARKER_TEXT.encode()):
+                raise RuntimeError('Exact owned-temp marker required')
+        finally:
+            os.close(marker_fd)
+        deleted = 0
+        scanned = 0
+        visited = 0
+        # scandir(fd) streams, unlike sorted(Path.iterdir()); no unbounded list.
+        with os.scandir(root_fd) as entries:
+            for item in entries:
+                visited += 1
+                if visited > 10000:
+                    raise RuntimeError('Owned temp scan budget exceeded')
+                if deleted >= max_files:
+                    break
+                name = item.name
+                if not _TEMP_PATTERN.fullmatch(name):
+                    continue
+                scanned += 1
+                try:
+                    info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                            or info.st_mtime > instant - older_than_seconds):
+                        continue
+                    os.unlink(name, dir_fd=root_fd)
+                    deleted += 1
+                except FileNotFoundError:
+                    continue
+        return {'status': 'ok', 'deleted_owned_temp_files': deleted,
+                'matched_candidates_scanned': scanned,
+                'raw_market_data_deleted': 0, 'backups_deleted': 0,
+                'bounded': deleted == max_files}
+    finally:
+        os.close(root_fd)
+

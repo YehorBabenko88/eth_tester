@@ -4,26 +4,25 @@ from . import check_ownership
 
 def recover_abandoned_ingestion(conn, *, workers_stopped=False, stale_minutes=180,
                                 max_jobs=500):
-    """Requeue only old owned jobs, after independent worker-stop confirmation.
+    """Requeue only old jobs after INDEPENDENT confirmation all workers stopped.
 
-    No archive/trade/candle/ML rows deleted or marked complete. A restarted
-    worker must reuse its transactionally idempotent COPY source SHA. This
-    routine cannot infer whether a remote process is still running: its caller
-    MUST verify worker quiescence before passing workers_stopped=True.
+    Never mark incomplete downloads complete. Jobs/rows recover transactionally.
     """
     if workers_stopped is not True:
         raise RuntimeError("Stop all ETH Tester ingestion workers before reconciliation")
     if (type(stale_minutes) is not int or stale_minutes < 5 or
             type(max_jobs) is not int or not 1 <= max_jobs <= 5000):
         raise ValueError("Recovery requires >=5 stale minutes and max 5000 jobs")
-    check_ownership(conn)
+    # Apply timeouts BEFORE any database ownership SELECT.
     conn.execute("SELECT set_config('lock_timeout',%s,true)", ("2500ms",))
     conn.execute("SELECT set_config('statement_timeout',%s,true)", ("20000ms",))
+    check_ownership(conn)
     acquired = conn.execute(
         "SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS locked",
         ("eth_tester:storage:recover",),
     ).fetchone()
-    locked = next(iter(acquired.values())) if isinstance(acquired, dict) else (acquired[0] if acquired else False)
+    locked = next(iter(acquired.values())) if isinstance(acquired, dict) else (
+        acquired[0] if acquired else False)
     if not locked:
         raise RuntimeError("Another storage recovery process is active")
     updated = conn.execute(

@@ -221,3 +221,50 @@ necessary for GO. tests/test_storage_round9.py models pure/fake-PG failures;
 tests/integration/test_storage_round9_pg.py uses only a fresh random
 eth_tester_b9_<UUID> disposable PostgreSQL test database, and has not yet
 been executed in this B environment. All data are paper-only and synthetic.
+
+## Round 11: source-state-safe retention and pinned-handle temporary cleanup
+
+**Live admission and 90-day housekeeping:** `feed_health.topic='connection'`
+is no longer automatically purged. A WS session may remain alive for over
+90 days with no new connection event; deleting its latest 'connected' row
+would cause B admission and Telegram health to lose the original session.
+The full connection/disconnection ledger remains until a separately verified,
+durable source-incident ledger and immutable retention policy exist.
+No cleanup action certifies completeness of exchange trade IDs or resolves
+`data_gaps`. The original protected `paper_trade_review_v1` and
+`data.retention='preserve'` exclusions remain in effect. Ordinary diagnostic
+events continue to be purged in bounded batches only.
+
+**DB locks and cleanup result:** lock and statement timeouts are installed
+before the ownership-marker query in both `cleanup_diagnostics` and
+`recover_abandoned_ingestion`. A successful `cleanup_diagnostics` response
+includes `status='ok'` (batch executed), `status_scope='batch_only'`,
+and `cleanup_complete=false`: SKIP LOCKED can leave previously locked
+eligible diagnostics and a 10k cap never establishes database emptiness.
+It must not be interpreted as long-term readiness or trading permission.
+
+**Filesystem race:** `storage.maintenance.cleanup_owned_temp` now operates
+against a pinned POSIX directory descriptor with `O_NOFOLLOW`, validates
+directory ownership and restrictive permissions and the exact single-link
+marker through the same descriptor, and uses descriptor-relative stat/unlink.
+The directory iterator is streaming and has a 10,000-entry scan budget,
+preserving the maximum 100 deletions per invocation by default. Symlinks,
+hardlinks, unexpected names, user backups, raw market data and research
+files are not intentionally deleted. A swapped root path after validation
+cannot redirect the cleanup to a different directory. **Windows fails
+closed** until an independently verified native reparse/ACL/file-ID
+implementation is available. On Windows leave
+`ETH_TESTER_OWNED_TEMP_DIR` UNSET; do not enable automatic filesystem
+sweep under LocalService.
+
+**Operational qualification:** `tests/test_storage_round11_safety.py`
+and `tests/test_storage_round11_retention.py` can execute in isolated
+Python with fake PostgreSQL transactions. They do not establish SQL runtime
+safety. `tests/integration/test_storage_round11_pg.py` requires real
+PostgreSQL 17/18 and `ETH_TEST_PG_DSN`; each test provisions and destroys
+ONLY a fresh uniquely named database. Exact 90+ day source continuity,
+blocked ownership SELECT and competing cleanup lease are regression
+assertions. Windows-native service, backup/restore, PostgreSQL disk
+pressure, Telegram delivery and 24-hour public-data soak remain NO_GO
+until separately exercised. Telegram persistent outbox design is not
+implemented or certified in Round11.
