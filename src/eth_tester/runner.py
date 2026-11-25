@@ -6,6 +6,7 @@ import json
 from .database import connection
 from .paper import open_paper,close_paper
 from .strategy import price_signal
+from .orderflow import confirm_rejection
 
 def estimated_funding(conn,settings,opened,observed,qty,entry):
     rows=conn.execute("""SELECT ts,rate FROM funding WHERE symbol=%s AND
@@ -56,12 +57,18 @@ def engine_tick(settings):
             if exists:
                 return "already_evaluated"
             signal=price_signal(bars,settings.taker_fee_rate,settings.slippage_bps)
+            flow_ok,flow=(confirm_rejection(conn,settings,signal,bars[-1])
+                          if signal else (False,{}))
+            if signal:
+                signal.reason['orderflow']=flow
             conn.execute("""INSERT INTO strategy_signals(symbol,tf,bar_ts,version,decision,reason)
               VALUES(%s,'1',%s,'pivot_rejection_v1',%s,%s::jsonb) ON CONFLICT DO NOTHING""",
-              (settings.symbol,last,"candidate" if signal else "no_signal",
+              (settings.symbol,last,("candidate" if flow_ok else "rejected_orderflow") if signal else "no_signal",
                json.dumps(signal.reason if signal else {})))
             if not signal:
                 return "no_signal"
+            if not flow_ok:
+                return "rejected_orderflow"
             if abs(Decimal(recent["price"])/Decimal(bars[-1]["close"])-1)>Decimal("0.005"):
                 return "signal_expired_price_gap"
     if trade:
