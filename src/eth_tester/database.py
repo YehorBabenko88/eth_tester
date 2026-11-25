@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import re
 from importlib.resources import files
 import psycopg
 from psycopg.rows import dict_row
@@ -12,7 +13,45 @@ from .storage.partitions import ensure_current_partitions
 def connection(settings: Settings):
     with psycopg.connect(settings.database_url, row_factory=dict_row, connect_timeout=10) as conn:
         conn.execute("SET TIME ZONE 'UTC'")
+        conn.execute("SET search_path TO public")
         yield conn
+
+
+def _assert_safe_existing_database(conn):
+    """Do not silently adopt an unrelated database merely based on its name."""
+    tables = {
+        row["tablename"] for row in conn.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname='public'"
+        )
+    }
+    if not tables:
+        return
+    if "eth_storage_identity" in tables:
+        owner = conn.execute(
+            "SELECT owner_tag FROM public.eth_storage_identity WHERE singleton=true"
+        ).fetchone()
+        if owner and owner["owner_tag"] == "eth_tester":
+            return
+        raise RuntimeError("Invalid ETH Tester database ownership marker")
+
+    baseline = {"trades", "ingestion_cursor", "paper_account"}
+    if not baseline.issubset(tables):
+        raise RuntimeError("Refusing to adopt unknown nonempty PostgreSQL database")
+    resources = files("eth_tester")
+    sources = [resources.joinpath("schema.sql")]
+    for name in ("0001_partitioned_archive.sql", "0002_quality_and_provenance.sql"):
+        sources.append(resources.joinpath("migrations").joinpath(name))
+    known = set()
+    for source in sources:
+        known.update(
+            re.findall(
+                r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([a-z][a-z0-9_]*)",
+                source.read_text(encoding="utf-8"), flags=re.IGNORECASE,
+            )
+        )
+    unknown = tables - known
+    if unknown:
+        raise RuntimeError(f"Unowned tables prevent migration: {sorted(unknown)}")
 
 def init_database(settings: Settings):
     params=conninfo_to_dict(settings.database_url)
@@ -24,6 +63,7 @@ def init_database(settings: Settings):
         if not admin.execute('SELECT 1 FROM pg_database WHERE datname=%s',(name,)).fetchone():
             admin.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(name)))
     with connection(settings) as conn:
+        _assert_safe_existing_database(conn)
         conn.execute(files("eth_tester").joinpath("schema.sql").read_text())
         apply_migrations(conn)
         ensure_current_partitions(conn)
