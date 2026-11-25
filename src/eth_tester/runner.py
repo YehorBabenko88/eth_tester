@@ -60,12 +60,22 @@ def _decision_payload(signal, identity, metadata):
 
 def _persist_paper_decision(conn, settings, bar_ts, version, decision, payload):
     # Retry ONLY the unresolved original proof request, never a closed decision.
-    conn.execute("""INSERT INTO strategy_signals(symbol,tf,bar_ts,version,decision,reason)
+    saved=conn.execute("""INSERT INTO strategy_signals(symbol,tf,bar_ts,version,decision,reason)
        VALUES(%s,'1',%s,%s,%s,%s::jsonb)
        ON CONFLICT(symbol,tf,bar_ts,version) DO UPDATE SET
          decision=EXCLUDED.decision,reason=EXCLUDED.reason
-       WHERE strategy_signals.decision='pending_missing_proof'""",
-       (settings.symbol,bar_ts,version,decision,json.dumps(payload,default=str)))
+       WHERE strategy_signals.decision='pending_missing_proof'
+       RETURNING decision,reason""",
+       (settings.symbol,bar_ts,version,decision,json.dumps(payload,default=str))
+       ).fetchone()
+    # Concurrent terminal writer must NOT leave an orphan paper entry.
+    if saved is None or saved["decision"]!=decision:
+        raise RuntimeError("atomic_signal_decision_conflict")
+    if decision=="opened" and (
+            not isinstance(saved["reason"],dict) or
+            saved["reason"].get("paper_trade_id")!=payload.get("paper_trade_id")):
+        raise RuntimeError("opened_paper_trade_identity_conflict")
+    return saved
 
 
 def engine_tick(settings):
@@ -121,11 +131,8 @@ def engine_tick(settings):
                 "SELECT enabled,paused FROM bot_control WHERE singleton=true").fetchone()
             if not enabled or not enabled["enabled"] or enabled["paused"]:
                 return "paused"
-            missing=conn.execute("""SELECT 1 FROM data_gaps WHERE symbol=%s
-               AND source='publicTrade' AND resolved_at IS NULL LIMIT 1""",
-               (settings.symbol,)).fetchone()
-            if missing:
-                return "blocked_unresolved_tick_gap"
+            # Preserve historical outage evidence without permanently
+            # blocking a future, independently observed clean bar.
             bars=conn.execute("""SELECT ts,open,high,low,close,volume FROM candles
               WHERE symbol=%s AND kind='trade' AND tf='1' AND closed
               AND ts<=%s ORDER BY ts DESC LIMIT 180""",
@@ -137,7 +144,17 @@ def engine_tick(settings):
                    for a,b in zip(bars,bars[1:])):
                 return "blocked_candle_gap"
             last=bars[-1]["ts"]
+            missing=conn.execute("""SELECT 1 FROM data_gaps
+              WHERE symbol=%s AND source IN ('publicTrade','orderbook')
+                AND start_ts < %s
+                AND coalesce(end_ts,resolved_at,'infinity'::timestamptz) >= %s
+              LIMIT 1""",(settings.symbol,now,last)).fetchone()
+            if missing:
+                return "blocked_unresolved_tick_gap"
             version,metadata=rule_identity()
+            # Serialize same symbol/tf/bar/version before the initial read.
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                         (f"paper_signal:{settings.symbol}:1:{last.isoformat()}:{version}",))
             exists=conn.execute("""SELECT decision FROM strategy_signals WHERE
                symbol=%s AND tf='1' AND bar_ts=%s AND version=%s""",
                (settings.symbol,last,version)).fetchone()
@@ -163,10 +180,17 @@ def engine_tick(settings):
                         conn,settings,signal,bars[-1],observed_at=now)
                     signal.reason["orderflow"]=flow
                     if not proof_ok:
-                        # No evidence is not a permanent strategy decision.
-                        # It may be retried only while the same bar is fresh.
-                        decision=_RETRYABLE_PROOF_DECISION
-                        payload["proof_pending_reason"]=flow.get("reason","unavailable")
+                        # Only D's explicit missing B publication is retryable.
+                        if (isinstance(flow,dict)
+                                and flow.get("reason")=="pending_bounded_live_evidence"
+                                and flow.get("retryable") is True):
+                            decision=_RETRYABLE_PROOF_DECISION
+                            payload["proof_pending_reason"]=flow["reason"]
+                        else:
+                            decision="rejected_orderflow"
+                            payload["proof_rejected_reason"]=(
+                                str(flow.get("reason","invalid_orderflow"))[:150]
+                                if isinstance(flow,dict) else "invalid_orderflow")
                     else:
                         # Use a server decision clock, never the trade print or
                         # retrospectively computed snapshot publication time.

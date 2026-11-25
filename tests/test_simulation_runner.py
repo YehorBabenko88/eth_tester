@@ -88,7 +88,10 @@ def test_no_signal_records_full_rules_identity(monkeypatch):
         def __enter__(self): return self
         def __exit__(self,*a): return None
         def execute(self,sql,params=None):
-            if 'INSERT INTO strategy_signals' in sql: saved.append(params)
+            if 'INSERT INTO strategy_signals' in sql:
+                saved.append(params)
+                import json
+                return Result({'decision':params[3],'reason':json.loads(params[4])})
             if 'feed_health' in sql: return Result({'status':'connected'})
             if 'ORDER BY ts DESC,trade_id DESC LIMIT 1' in sql:
                 return Result({'ts':now-timedelta(seconds=1),'price':D(100)})

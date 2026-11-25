@@ -88,6 +88,11 @@ def verify_live_paper_row(conn, *, symbol, reason, decision_at):
             or reason.get("paper_live_decision_ms") != _ms(decision)
             or any(k.startswith("ml_") for k in reason)):
         raise ValueError("Unverified original live paper decision")
+    # Shared prospective-source lock; A's disconnect/reconnect writer must
+    # acquire the SAME transaction lock before publishing feed/gap changes.
+    # Recheck all dynamic sources while this paper entry transaction holds it.
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                 (f"eth_paper_admission_source:{symbol}",))
     row = conn.execute("""SELECT snapshot_key,symbol,tf,bar_ts,source_checksum,
           observed_at,computed_at,expires_at,quality,paper_only,ml_eligible,evidence
           FROM paper_live_evidence WHERE snapshot_key=%s FOR SHARE""",
@@ -121,4 +126,40 @@ def verify_live_paper_row(conn, *, symbol, reason, decision_at):
     if (not isinstance(row["evidence"], dict)
             or row["evidence"].get("contract") != _CONTRACT):
         raise ValueError("Missing immutable B-issued source evidence envelope")
+    # The original proof was genuine when published, but source continuity
+    # can be lost AFTER publication. Recheck using a NEW server timestamp,
+    # not the earlier D decision time or the caller's JSON receipt clock.
+    current = utc(conn.execute(
+        "SELECT clock_timestamp() AS ts").fetchone()["ts"])
+    if not timedelta(0) <= current-decision <= timedelta(seconds=5):
+        raise ValueError("Stale or backdated live admission clock")
+    from ..storage.live_evidence import (
+        require_bounded_paper_evidence, _no_overlap,
+    )
+    checked=require_bounded_paper_evidence(
+        conn, symbol=symbol, bar_ts=bar,
+        evidence_key=key, decision_at=current)
+    if (not isinstance(checked,dict)
+            or checked.get("snapshot_key") != key
+            or checked.get("source_checksum") != checksum
+            or checked.get("contract") != _CONTRACT
+            or checked.get("quality") != _QUALITY
+            or checked.get("paper_only") is not True
+            or checked.get("ml_eligible") is not False
+            or checked.get("exchange_complete") is not False
+            or any(utc(checked.get(name)) != stamp for name,stamp in
+                   (("bar_ts",bar),("observed_at",observed),
+                    ("computed_at",computed),("expires_at",expires)))):
+        raise ValueError("B prospective proof recheck changed identity or flags")
+    # Defense in depth until all B/A operators share a reconnect/admission
+    # transaction-level lock. This rejects a disconnect/gap that occurred
+    # after publication, and never turns an old gap into a fake complete tape.
+    _no_overlap(conn,symbol,bar,current)
+    book=conn.execute("""SELECT valid,updated_at FROM market_book_state
+        WHERE symbol=%s FOR SHARE""",(symbol,)).fetchone()
+    if (book is None or book["valid"] is not True
+            or book["updated_at"] is None
+            or not timedelta(0) <= current-utc(book["updated_at"])
+                                       <= timedelta(seconds=10)):
+        raise ValueError("L2 book became invalid after source publication")
     return row

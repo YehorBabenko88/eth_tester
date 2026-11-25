@@ -101,12 +101,36 @@ class EvidenceDB:
         self.row = row
         self.query = None
         self.params = None
+        self.evidence_query = None
+        self.evidence_params = None
     def execute(self, query, params=None):
         self.query, self.params = query, params
+        if "FROM paper_live_evidence" in query:
+            self.evidence_query, self.evidence_params = query, params
+        if "clock_timestamp()" in query:
+            return RowResult({"ts":DECISION})
+        if "market_book_state" in query:
+            return RowResult({"valid":True,"updated_at":DECISION})
         return RowResult(self.row)
 
 
-def test_rechecks_exact_immutable_b_row_for_share():
+def test_rechecks_exact_immutable_b_row_for_share(monkeypatch):
+    from eth_tester.storage import live_evidence as b
+    # Unit fixture explicitly mocks B's original-source gate; NOT actual WS.
+    def original_source_gate(conn, *, symbol, bar_ts, evidence_key, decision_at):
+        assert symbol=="ETHUSDT" and evidence_key==KEY and bar_ts==BAR
+        return {
+            "snapshot_key":KEY,"source_checksum":HASH,
+            "contract":"eth_paper_live_evidence_v1",
+            "quality":"live_observed_bounded", "paper_only":True,
+            "ml_eligible":False,"exchange_complete":False,
+            "bar_ts":BAR,
+            "observed_at":END+timedelta(seconds=10),
+            "computed_at":END+timedelta(seconds=15),
+            "expires_at":END+timedelta(seconds=90),
+        }
+    monkeypatch.setattr(b,"require_bounded_paper_evidence",original_source_gate)
+    monkeypatch.setattr(b,"_no_overlap",lambda *args: None)
     context = bind_live_paper_reference(d_reason(), bar_ts=BAR, decision_at=DECISION)
     row = {
         "snapshot_key": KEY, "symbol": "ETHUSDT", "tf": "1",
@@ -122,7 +146,7 @@ def test_rechecks_exact_immutable_b_row_for_share():
     db = EvidenceDB(row)
     assert verify_live_paper_row(db, symbol="ETHUSDT", reason=context,
                                  decision_at=DECISION)["snapshot_key"] == KEY
-    assert "FOR SHARE" in db.query and db.params == (KEY,)
+    assert "FOR SHARE" in db.evidence_query and db.evidence_params == (KEY,)
     for field, bad in [
         ("symbol", "BTCUSDT"), ("tf", "5"),
         ("quality", "complete"), ("paper_only", False),
@@ -171,7 +195,7 @@ def test_missing_live_proof_can_retry_until_opened_but_not_replay(monkeypatch):
             if "INSERT INTO strategy_signals" in sql:
                 self.record = {"decision": params[3],
                                "reason": json.loads(params[4])}
-                return Result(None)
+                return Result(self.record)
             if "feed_health" in sql:
                 return Result({"status": "connected"})
             if "ORDER BY ts DESC,trade_id DESC LIMIT 1" in sql:
@@ -190,6 +214,8 @@ def test_missing_live_proof_can_retry_until_opened_but_not_replay(monkeypatch):
                 return Result(self.record)
             if "clock_timestamp()" in sql:
                 return Result({"ts": datetime.now(timezone.utc)})
+            if "pg_advisory_xact_lock(hashtext" in sql:
+                return Result(None)
             raise AssertionError(sql)
     db = DB()
     monkeypatch.setattr(runner, "connection", lambda settings: db)
@@ -205,7 +231,9 @@ def test_missing_live_proof_can_retry_until_opened_but_not_replay(monkeypatch):
     def confirm(conn, settings, signal, last, *, observed_at=None):
         reasons.append("check")
         if len(reasons) == 1:
-            return False, {"admissible": False, "reason": "missing_live_evidence"}
+            return False, {"admissible":False,
+                           "reason":"pending_bounded_live_evidence",
+                           "retryable":True}
         now = datetime.now(timezone.utc)
         return True, d_reason(bar=bar, observed=now, computed=now)[
             "orderflow"]
@@ -255,6 +283,9 @@ def test_old_bar_is_terminal_no_late_archive_reentry(monkeypatch):
             if "FROM strategy_signals" in sql: return Result(None)
             if "INSERT INTO strategy_signals" in sql:
                 assert params[3] == "expired_missing_proof"
+                return Result({"decision":params[3],
+                               "reason":json.loads(params[4])})
+            if "pg_advisory_xact_lock(hashtext" in sql:
                 return Result(None)
             raise AssertionError(sql)
     monkeypatch.setattr(runner, "connection", lambda _: DB())

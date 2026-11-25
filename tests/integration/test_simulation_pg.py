@@ -321,3 +321,79 @@ def test_round6_savepoint_rolls_back_bad_entry_without_orphan(simulated_pg):
         assert conn.execute("SELECT version FROM paper_position_state").fetchone()['version']==0
         row=conn.execute("SELECT decision FROM strategy_signals").fetchone()
         assert row['decision']=='rejected_paper_admission'
+
+
+def test_round8_two_connection_terminal_conflict_rolls_back_trade(simulated_pg):
+    """Connection B's terminal row wins after A's initial empty read.
+
+    A must NOT commit a paper trade, fill event or cursor version if the
+    competing final strategy_signals decision is already terminal. Real
+    disposable PG, no internet and no claimed market-source completeness.
+    """
+    from eth_tester.runner import _persist_paper_decision
+    stamp=start_time()
+    version=strategy_identity()
+    with pytest.raises(RuntimeError,match="atomic_signal_decision_conflict"):
+        with connection(simulated_pg) as competing:
+            assert competing.execute("""SELECT decision FROM strategy_signals
+                WHERE symbol=%s AND tf='1' AND bar_ts=%s AND version=%s""",
+                ("ETHUSDT",stamp,version)).fetchone() is None
+            # Another worker commits a terminal decision after the above read.
+            with connection(simulated_pg) as other:
+                other.execute("""INSERT INTO strategy_signals(
+                    symbol,tf,bar_ts,version,decision,reason)
+                    VALUES('ETHUSDT','1',%s,%s,'no_signal','{}'::jsonb)""",
+                    (stamp,version))
+            # This QA-only direct paper fixture verifies the transactional
+            # final signal guard; authentic live B proof is independently gated.
+            paper_id=open_paper(simulated_pg,"long",D(100),D(98),D(105),
+                                verified_reason(),observed_at=stamp,
+                                conn=competing)
+            _persist_paper_decision(competing,simulated_pg,stamp,version,
+                                     "opened",{"paper_trade_id":paper_id})
+    with connection(simulated_pg) as conn:
+        decision=conn.execute("SELECT decision FROM strategy_signals").fetchone()
+        assert decision["decision"]=="no_signal"
+        assert conn.execute("SELECT count(*) AS n FROM paper_trades").fetchone()["n"]==0
+        assert conn.execute("SELECT count(*) AS n FROM paper_order_events").fetchone()["n"]==0
+        state=conn.execute("SELECT version,paper_trade_id FROM paper_position_state").fetchone()
+        assert state["version"]==0 and state["paper_trade_id"] is None
+
+
+@pytest.mark.parametrize("overlaps_latest_window", [False, True])
+def test_round8_historical_gap_preserved_but_only_current_overlap_blocks(
+        simulated_pg, monkeypatch, overlaps_latest_window):
+    """Do not silently 'resolve' old WS outages; healthy future bars can run."""
+    from eth_tester import runner
+    now=datetime.now(timezone.utc)
+    last=now.replace(second=0,microsecond=0)-timedelta(minutes=1)
+    with connection(simulated_pg) as conn:
+        conn.execute("""INSERT INTO feed_health(symbol,topic,status)
+           VALUES('ETHUSDT','connection','connected')""")
+        conn.execute("""INSERT INTO trades(
+            symbol,ts,trade_id,price,qty,side,notional,source)
+            VALUES('ETHUSDT',%s,'e8-recent',100,1,'Buy',100,'websocket')""",
+            (now-timedelta(seconds=1),))
+        for i in range(35):
+            ts=last-timedelta(minutes=34-i)
+            conn.execute("""INSERT INTO candles(
+                symbol,kind,tf,ts,open,high,low,close,volume,turnover,
+                closed,source)
+                VALUES('ETHUSDT','trade','1',%s,100,101,99,100,
+                       1,100,true,'qa')""",(ts,))
+        gap_start=(last if overlaps_latest_window
+                   else now-timedelta(days=3))
+        gap_end=(now if overlaps_latest_window
+                 else now-timedelta(days=3,minutes=-1))
+        conn.execute("""INSERT INTO data_gaps(
+            source,symbol,start_ts,end_ts,explanation)
+            VALUES('publicTrade','ETHUSDT',%s,%s,'synthetic_qagap')""",
+            (gap_start,gap_end))
+    monkeypatch.setattr(runner,"price_signal",lambda *args,**kw:None)
+    expected=("blocked_unresolved_tick_gap" if overlaps_latest_window
+              else "no_signal")
+    assert runner.engine_tick(simulated_pg)==expected
+    with connection(simulated_pg) as conn:
+        gaps=conn.execute("""SELECT resolved_at FROM data_gaps
+            WHERE explanation='synthetic_qagap'""").fetchall()
+        assert len(gaps)==1 and gaps[0]["resolved_at"] is None
