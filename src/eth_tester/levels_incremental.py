@@ -37,6 +37,7 @@ def _restore(conn, settings, tf, flank, cursor, tolerance):
             broken_at,retested_at,invalidated_at
         FROM levels
         WHERE symbol=%s AND tf=%s AND confirmed_at IS NOT NULL
+          AND source='causal_closed_pivot'
           AND status IN ('unbroken','broken','retested')""",
         (settings.symbol, tf)).fetchall()
     for row in active:
@@ -62,7 +63,8 @@ def _store_event(conn, symbol, tf, level, event, provenance):
       VALUES(%s,%s,%s,%s,%s,%s,%s,'causal_closed_pivot',
              %s,%s,%s,%s,%s,%s::jsonb)
       ON CONFLICT(symbol,tf,side,origin_ts,level_price)
-      DO UPDATE SET status=EXCLUDED.status,broken_ts=EXCLUDED.broken_ts,
+      DO UPDATE SET status=EXCLUDED.status,source=EXCLUDED.source,
+        broken_ts=EXCLUDED.broken_ts,
         confirmed_at=EXCLUDED.confirmed_at,
         touched_at=coalesce(EXCLUDED.touched_at,levels.touched_at),
         broken_at=coalesce(EXCLUDED.broken_at,levels.broken_at),
