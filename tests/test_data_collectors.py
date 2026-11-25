@@ -220,3 +220,20 @@ def test_archive_conflict_fails_once_and_records_gap(monkeypatch):
     assert calls == ["attempt"]
     assert any("UPDATE ingestion_job" in q for q, _ in conn.queries)
     assert any("INSERT INTO ingestion_coverage" in q for q, _ in conn.queries)
+
+
+def test_archive_submillisecond_utc_identity_normalization():
+    row = {"timestamp": "1767225600.123999", "trdMatchID": "exact",
+           "price": "100", "size": "1", "side": "Sell"}
+    stamp, ident, price, qty, side = parse_trade(row)
+    assert stamp.microsecond == 123000
+    assert (ident, price, qty, side) == ("exact", Decimal(100), Decimal(1), "Sell")
+    row["timestamp"] = "1767225600123"
+    assert parse_trade(row)[0] == stamp
+
+
+def test_archive_invalid_nonfinite_rejected():
+    row = {"timestamp": "1767225600.123", "trdMatchID": "exact",
+           "price": "NaN", "size": "1", "side": "Sell"}
+    with pytest.raises(ValueError, match="non-finite"):
+        parse_trade(row)

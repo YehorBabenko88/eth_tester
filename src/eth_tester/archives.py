@@ -38,8 +38,10 @@ def parse_trade(row):
     stamp=(datetime.fromtimestamp(epoch_ms//1000,timezone.utc)
            +timedelta(milliseconds=epoch_ms%1000))
     p,q=Decimal(price),Decimal(qty)
-    if p<=0 or q<=0:
-        raise ValueError("Nonpositive trade price/size")
+    if not p.is_finite() or not q.is_finite() or p<=0 or q<=0:
+        raise ValueError("Nonpositive or non-finite trade price/size")
+    if not str(identifier).strip():
+        raise ValueError("Empty trade identity")
     return stamp,str(identifier),p,q,side.title()
 
 async def download_archive(settings,day,client):
@@ -101,26 +103,42 @@ async def download_archive(settings,day,client):
                 merged = merge_staged_trades(conn, "eth_stage")
                 if merged["input_rows"] != count:
                     raise DataIntegrityError("Archive COPY row count disagrees with stage")
-            day_start=datetime.combine(day,datetime.min.time(),timezone.utc)
-            write_coverage(
-                conn, source="trades_archive", symbol=symbol, interval="",
-                start_ms=int(day_start.timestamp()*1000),
-                end_exclusive_ms=int((day_start+timedelta(days=1)).timestamp()*1000),
-                status="partial", observed_rows=count, expected_rows=None,
-                checksum=checksum.hexdigest(),
-                quality="archive_bytes_rechecked_trade_completeness_unproven",
-                evidence={"url": url, "gzip_crc_checked": True,
-                          "download_sha256": checksum.hexdigest(),
-                          "compressed_bytes": size, "csv_rows": count,
-                          "volume_verified": False},
-                instrument=settings.category)
-            persist_minute_evidence(
-                conn, symbol, day, checksum.hexdigest(), settings.category)
+            certify_archive_day(
+                conn, settings, day, checksum.hexdigest(),
+                row_count=count, byte_count=size, url=url)
             conn.execute("""UPDATE ingestion_job SET state='complete',bytes_downloaded=%s,
               row_count=%s,sha256=%s,error=NULL,updated_at=now()
               WHERE source='trades_archive' AND symbol=%s AND day=%s""",
               (size,count,checksum.hexdigest(),symbol,day))
     return "complete"
+
+
+def certify_archive_day(conn, settings, day, checksum, *,
+                        row_count=None, byte_count=None, url=None):
+    """Write time-honest aggregate evidence without claiming individual tick coverage."""
+    report = persist_minute_evidence(
+        conn, settings.symbol, day, checksum, settings.category)
+    begin = datetime.combine(day, datetime.min.time(), timezone.utc)
+    state = report["status"]
+    write_coverage(
+        conn, source="trades_archive", symbol=settings.symbol, interval="",
+        start_ms=int(begin.timestamp()*1000),
+        end_exclusive_ms=int((begin+timedelta(days=1)).timestamp()*1000),
+        status="gap" if state=="volume_mismatch" else "partial",
+        observed_rows=row_count if row_count is not None else sum(
+            row["n"] for row in conn.execute(
+                """SELECT count(*) AS n FROM trades WHERE symbol=%s
+                   AND source='archive' AND ts >= %s AND ts < %s""",
+                (settings.symbol, begin, begin+timedelta(days=1))).fetchall()),
+        expected_rows=None, checksum=checksum,
+        quality=("volume_reconciled_not_trade_id_complete"
+                 if state=="verified" else "archive_volume_"+state),
+        evidence={"certificate": report["certificate"],
+                  "compression_bytes": byte_count, "origin": url,
+                  "can_certify_historical_asof": False},
+        instrument=settings.category)
+    return report
+
 
 def reconcile_archive_day(conn, symbol, day):
     """Verify archive tape against closed 1m BASE-volume candles for UTC day.
@@ -163,9 +181,9 @@ def resolve_archived_gaps(settings):
             downloaded = {row["day"]: row["sha256"] for row in jobs}
             if len(downloaded) != total:
                 continue
-            if all(persist_minute_evidence(
-                    conn, settings.symbol, start + timedelta(days=i),
-                    downloaded[start + timedelta(days=i)], settings.category
+            if all(certify_archive_day(
+                    conn, settings, start + timedelta(days=i),
+                    downloaded[start + timedelta(days=i)]
                     )["status"] == "verified" for i in range(total)):
                 conn.execute(
                     "UPDATE data_gaps SET resolved_at=now() WHERE id=%s", (gap["id"],))

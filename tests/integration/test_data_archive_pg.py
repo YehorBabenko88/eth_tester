@@ -153,3 +153,43 @@ def test_quality_evidence_missing_candle_never_match(data_settings):
         assert len(counts) == 1
         assert counts[0]["status"] == "incomplete"
         assert counts[0]["n"] == 1440
+
+
+def test_canonical_archive_timestamp_matches_live_utc_milliseconds():
+    from eth_tester.archives import parse_trade
+    row = {"timestamp": "1767225600.123999", "trdMatchID": "fixed",
+           "side": "Buy", "price": "100", "size": "1"}
+    stamp,*_ = parse_trade(row)
+    assert stamp == datetime.fromtimestamp(1767225600123 / 1000, UTC)
+
+
+def test_archive_evidence_certificate_observed_after_source(data_settings):
+    day = date(2026, 1, 2)
+    start = datetime.combine(day, datetime.min.time(), UTC)
+    with connection(data_settings) as conn:
+        for i in range(1440):
+            ts = start + timedelta(minutes=i)
+            conn.execute("""INSERT INTO candles
+                (symbol,kind,tf,ts,open,high,low,close,volume,turnover,source)
+                VALUES ('ETHUSDT','trade','1',%s,100,100,100,100,1,100,'qa')""",
+                (ts,))
+            conn.execute("""INSERT INTO trades
+                (symbol,ts,trade_id,price,qty,side,notional,source)
+                VALUES ('ETHUSDT',%s,%s,100,1,'Buy',100,'archive')""",
+                (ts, 'cert-'+str(i)))
+    before = datetime.now(UTC)
+    with connection(data_settings) as conn:
+        report = persist_minute_evidence(conn,"ETHUSDT",day,"c"*64)
+    assert report["status"] == "verified"
+    receipt = datetime.fromisoformat(report["certificate"]["observed_at"])
+    assert receipt >= before - timedelta(seconds=1)
+    assert report["certificate"]["archive_sha256"] == "c"*64
+    assert report["certificate"]["actual_base_volume"] == "1440"
+    assert report["certificate"]["expected_base_volume"] == "1440"
+    assert report["certificate"]["proves_all_trade_ids"] is False
+    with connection(data_settings) as conn:
+        row = conn.execute("""SELECT evidence,checked_at
+            FROM trade_candle_volume_checks WHERE symbol='ETHUSDT'
+              AND archive_sha256=%s LIMIT 1""", ("c"*64,)).fetchone()
+    assert row["evidence"]["observed_at"] == receipt.isoformat()
+    assert row["checked_at"] == receipt
