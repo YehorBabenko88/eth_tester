@@ -162,7 +162,8 @@ def _read(settings, name):
                    ORDER BY component LIMIT 30"""
             ).fetchall()
             lines = [f"{r['component']}: {r['status']} ({r['updated_at']})" for r in rows]
-            path = Path(os.environ.get("ETH_TESTER_RUNTIME_DIR", "runtime")) / "supervisor.json"
+            from .supervisor import runtime_path
+            path = runtime_path() / "supervisor.json"
             if path.is_file():
                 try:
                     state = json.loads(path.read_text(encoding="utf-8"))
