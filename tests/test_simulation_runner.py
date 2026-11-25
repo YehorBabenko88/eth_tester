@@ -5,6 +5,8 @@ import types
 from decimal import Decimal as D
 
 from test_simulation_execution import BASE
+from eth_tester.simulation.identity import rule_identity, require_new_strategy_identity
+from eth_tester.strategies import Parameters
 
 
 class Result:
@@ -60,3 +62,19 @@ def test_crossing_time_is_stop_first_under_ambiguous_trade_ids(monkeypatch):
     assert choice['price'] == D(97)
     assert choice['ambiguous_same_timestamp']
     assert choice['ts'] == BASE
+
+
+def test_engine_rule_identity_hash_changes_with_parameters(monkeypatch):
+    import eth_tester.simulation.identity as identity
+    version,meta=rule_identity()
+    assert version==Parameters().version+':'+meta['parameter_sha256'][:12]
+    reason={'strategy_version':Parameters().version,**meta}
+    assert require_new_strategy_identity(reason)==reason
+    class ChangedParams:
+        version='eth_rules_v3'
+        def identity(self):
+            return {'parameters': {'version':'eth_rules_v3'},
+                    'parameter_sha256':'a'*64}
+    monkeypatch.setattr(identity,'Parameters',ChangedParams)
+    changed,_=identity.rule_identity()
+    assert changed=='eth_rules_v3:'+('a'*12) and changed!=version

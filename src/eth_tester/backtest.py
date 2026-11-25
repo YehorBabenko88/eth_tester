@@ -11,6 +11,7 @@ from .simulation.execution import Costs
 from .simulation.ohlc import simulate_ohlc_fallback
 from .simulation.replay import FundingEvent, SignalEvent
 from .strategy import price_signal
+from .simulation.identity import rule_identity
 
 
 D = Decimal
@@ -86,7 +87,11 @@ def run_backtest(settings, tf='5'):
     summary = report['metrics']
     total = summary['net_pnl']
     coverage = 'ohlc_scenario_' + report['funding_coverage']
+    engine_version,engine_meta=rule_identity()
     config = {'notional': str(settings.initial_notional_usd),
+              'engine_identity': engine_version,
+              'parameters': engine_meta['parameters'],
+              'parameter_sha256': engine_meta['parameter_sha256'],
               'taker_fee': str(settings.taker_fee_rate),
               'slippage_bps': str(settings.slippage_bps),
               'spread_bps': '2', 'intrabar': 'stop_first',
@@ -97,7 +102,7 @@ def run_backtest(settings, tf='5'):
     with connection(settings) as conn:
         run = conn.execute("""INSERT INTO backtest_runs(symbol,strategy,tf,config,data_start,
           data_end,completeness,trades,pnl,stats)
-          VALUES(%s,'pivot_rejection_v1',%s,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb)
+          VALUES(%s,'price_signal_price_only_research',%s,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb)
           RETURNING id""",
           (settings.symbol, tf, json.dumps(config), bars[0]['ts'], bars[-1]['ts'],
            coverage, len(deals), total, json.dumps(stats, default=str))).fetchone()

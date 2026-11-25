@@ -32,6 +32,9 @@ def validate_transition(state, *, trade_id, at, action):
     elif action == 'close':
         if active is None or active != trade_id:
             raise RuntimeError('paper position identity/cursor mismatch')
+    elif action == 'close_legacy':
+        if active is not None or trade_id is None:
+            raise RuntimeError('legacy close requires missing durable position')
     else:
         raise ValueError('unknown paper state transition')
     return ts

@@ -8,6 +8,7 @@ from .paper import open_paper,close_paper
 from .strategy import price_signal
 from .orderflow import confirm_rejection
 from .simulation.crossing import resolve_first_crossing
+from .simulation.identity import rule_identity, require_new_strategy_identity
 
 def estimated_funding(conn,settings,opened,observed,qty,entry,direction,*,with_events=False):
     """Never synthesize funding from entry price: require event-time mark evidence.
@@ -88,22 +89,40 @@ def engine_tick(settings):
             if any(b["ts"]-a["ts"]!=timedelta(minutes=1) for a,b in zip(bars,bars[1:])):
                 return "blocked_candle_gap"
             last=bars[-1]["ts"]
+            engine_version,engine_metadata=rule_identity()
             exists=conn.execute("""SELECT 1 FROM strategy_signals WHERE
-              symbol=%s AND tf='1' AND bar_ts=%s AND version='pivot_rejection_v1'""",
-              (settings.symbol,last)).fetchone()
+              symbol=%s AND tf='1' AND bar_ts=%s AND version=%s""",
+              (settings.symbol,last,engine_version)).fetchone()
             if exists:
                 return "already_evaluated"
             signal=price_signal(bars,settings.taker_fee_rate,settings.slippage_bps)
-            flow_ok,flow=(confirm_rejection(conn,settings,signal,bars[-1])
-                          if signal else (False,{}))
+            invalid_identity=False
             if signal:
+                try:
+                    require_new_strategy_identity(signal.reason)
+                    flow_ok,flow=confirm_rejection(conn,settings,signal,bars[-1])
+                except ValueError:
+                    invalid_identity=True
+                    flow_ok,flow=False,{"reason":"invalid_strategy_identity","admissible":False}
                 signal.reason['orderflow']=flow
+            else:
+                flow_ok,flow=False,{}
+            payload=dict(signal.reason) if signal else {}
+            payload.update({
+                "engine_identity":engine_version,
+                "engine_parameters":engine_metadata["parameters"],
+                "engine_parameter_sha256":engine_metadata["parameter_sha256"],
+            })
+            decision=("no_signal" if signal is None else
+                      "rejected_strategy_identity" if invalid_identity else
+                      "candidate" if flow_ok else "rejected_orderflow")
             conn.execute("""INSERT INTO strategy_signals(symbol,tf,bar_ts,version,decision,reason)
-              VALUES(%s,'1',%s,'pivot_rejection_v1',%s,%s::jsonb) ON CONFLICT DO NOTHING""",
-              (settings.symbol,last,("candidate" if flow_ok else "rejected_orderflow") if signal else "no_signal",
-               json.dumps(signal.reason if signal else {})))
+              VALUES(%s,'1',%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING""",
+              (settings.symbol,last,engine_version,decision,json.dumps(payload)))
             if not signal:
                 return "no_signal"
+            if invalid_identity:
+                return "rejected_strategy_identity"
             if not flow_ok:
                 return "rejected_orderflow"
             if abs(Decimal(recent["price"])/Decimal(bars[-1]["close"])-1)>Decimal("0.005"):

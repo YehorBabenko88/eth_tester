@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 from .simulation.execution import number, utc
+from .simulation.identity import require_new_strategy_identity
 from .simulation.persistence import (advance_state, lock_state, mark_funding_event,
                                      observation_time, record_fill, validate_transition)
 import json
@@ -40,9 +41,9 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
     if abs(take/price-1)<min_viable_target(settings.initial_notional_usd,
                                            settings.taker_fee_rate,settings.slippage_bps):
         raise ValueError("Expected take does not cover costs")
-    context=dict(reason)
+    context=require_new_strategy_identity(reason)
     context['execution_quality']='trade_print_proxy_no_executable_book_proof'
-    strategy_version=str(context.get('strategy_version') or 'unversioned')[:100]
+    strategy_version=context['strategy_version']
     with connection(settings) as conn:
         conn.execute("SELECT pg_advisory_xact_lock(20991991)")
         position_state=lock_state(conn)
@@ -97,7 +98,20 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
             return None
         if event_at<utc(trade['opened_at']):
             raise ValueError('Exit precedes entry')
-        validate_transition(position_state,trade_id=trade['id'],at=event_at,action='close')
+        legacy_exit=False
+        if position_state['paper_trade_id'] is None:
+            # Old open positions predate migration 0005. Never fabricate entry.
+            entry_event=conn.execute("""SELECT 1 FROM paper_order_events
+              WHERE paper_trade_id=%s AND action IN ('entry','partial_entry')
+              LIMIT 1""",(trade['id'],)).fetchone()
+            if entry_event:
+                raise RuntimeError('Paper ledger position state mismatch')
+            validate_transition(position_state,trade_id=trade['id'],
+                                at=event_at,action='close_legacy')
+            legacy_exit=True
+        else:
+            validate_transition(position_state,trade_id=trade['id'],
+                                at=event_at,action='close')
         sign=Decimal(1) if trade["direction"]=="long" else Decimal(-1)
         fill=price*(1-sign*settings.slippage_bps/Decimal(10000))
         if fill<=0:
@@ -136,5 +150,6 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
                                provenance={'source':'market_ticker_events'})
         conn.execute("""UPDATE paper_account SET equity=equity+%s,
           realized_pnl=realized_pnl+%s WHERE id=1""",(net,net))
-        advance_state(conn,position_state,trade_id=trade['id'],at=event_at,action='close')
+        advance_state(conn,position_state,trade_id=trade['id'],at=event_at,
+                      action='close_legacy' if legacy_exit else 'close')
         return trade["id"]

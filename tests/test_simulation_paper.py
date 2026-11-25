@@ -8,6 +8,8 @@ from decimal import Decimal as D
 import pytest
 
 from test_simulation_execution import BASE
+from eth_tester.strategies import Parameters
+from eth_tester.simulation.identity import require_new_strategy_identity
 
 
 def paper_stub(monkeypatch):
@@ -55,7 +57,8 @@ def test_open_uses_actual_event_timestamp_and_version(monkeypatch):
         taker_fee_rate=D('0.00055'), slippage_bps=D(2),
         max_daily_drawdown=D('0.03'), risk_fraction=D('0.01'))
     trade_id = p.open_paper(settings, 'long', 100, 98, 105,
-                            {'strategy_version': 'eth_rules_v2'}, observed_at=BASE)
+                            {'strategy_version': Parameters().version,
+                             **Parameters().identity()}, observed_at=BASE)
     assert trade_id == 11
     insert = [params for sql, params in calls if 'INSERT INTO paper_trades' in sql][0]
     assert insert[2] == BASE and insert[3] == BASE
@@ -70,3 +73,17 @@ def test_close_rejects_nan_before_database(monkeypatch):
         p.close_paper(types.SimpleNamespace(), 'NaN')
     with pytest.raises(ValueError):
         p.close_paper(types.SimpleNamespace(), 100, observed_at=datetime(2026, 1, 1))
+
+
+def test_new_entry_requires_full_parameter_hash(monkeypatch):
+    paper = paper_stub(monkeypatch)
+    settings = types.SimpleNamespace(symbol='ETHUSDT',
+        initial_notional_usd=D(1000), taker_fee_rate=D('0.00055'),
+        slippage_bps=D(2))
+    with pytest.raises(ValueError, match='identity'):
+        paper.open_paper(settings,'long',100,98,105,{'qa': True},observed_at=BASE)
+    valid={'strategy_version':Parameters().version,**Parameters().identity()}
+    with pytest.raises(ValueError, match='identity'):
+        paper.open_paper(settings,'long',100,98,105,
+                         {**valid,'parameter_sha256':'0'*64},observed_at=BASE)
+    assert require_new_strategy_identity(valid)==valid

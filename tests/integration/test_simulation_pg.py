@@ -16,6 +16,7 @@ from eth_tester.config import Settings
 from eth_tester.database import connection, init_database
 from eth_tester.paper import close_paper, open_paper
 from eth_tester.simulation.persistence import record_fill
+from eth_tester.strategies import Parameters
 
 
 pytestmark = pytest.mark.postgres
@@ -40,13 +41,18 @@ def simulated_pg():
             admin.execute(sql.SQL('DROP DATABASE {} WITH (FORCE)').format(sql.Identifier(name)))
 
 
+def verified_reason(**extra):
+    return {'strategy_version': Parameters().version,
+            **Parameters().identity(), **extra}
+
+
 def start_time():
     return datetime.now(timezone.utc) - timedelta(minutes=2)
 
 
 def test_position_open_close_replay_and_cursor_version(simulated_pg):
     stamp = start_time()
-    reason = {'strategy_version': 'eth_rules_v2', 'pattern': 'qa'}
+    reason = verified_reason(pattern='qa')
     first = open_paper(simulated_pg, 'long', D(100), D(98), D(105),
                        reason, observed_at=stamp)
     with connection(simulated_pg) as conn:
@@ -78,7 +84,7 @@ def test_position_open_close_replay_and_cursor_version(simulated_pg):
 def test_event_conflict_rolls_back_without_advancing_cursor(simulated_pg):
     stamp = start_time()
     ident = open_paper(simulated_pg, 'short', 100, 102, 95,
-                       {'strategy_version': 'eth_rules_v2'}, observed_at=stamp)
+                       verified_reason(), observed_at=stamp)
     with connection(simulated_pg) as conn:
         state = conn.execute('SELECT version,processed_cursor FROM paper_position_state').fetchone()
         original = conn.execute('SELECT * FROM paper_order_events').fetchone()
@@ -97,7 +103,7 @@ def test_event_conflict_rolls_back_without_advancing_cursor(simulated_pg):
 def test_stale_settlement_rejected_and_open_unchanged(simulated_pg):
     stamp = start_time()
     ident = open_paper(simulated_pg, 'long', 100, 98, 105,
-                       {'strategy_version': 'eth_rules_v2'}, observed_at=stamp)
+                       verified_reason(), observed_at=stamp)
     with pytest.raises(ValueError):
         close_paper(simulated_pg, 105, 'take',
                     observed_at=stamp-timedelta(seconds=1), expected_id=ident)
@@ -111,7 +117,7 @@ def test_stale_settlement_rejected_and_open_unchanged(simulated_pg):
 def test_funding_mark_breakdown_is_atomic(simulated_pg):
     stamp = start_time()
     ident = open_paper(simulated_pg, 'long', 100, 98, 105,
-                       {'strategy_version': 'eth_rules_v2'}, observed_at=stamp)
+                       verified_reason(), observed_at=stamp)
     with connection(simulated_pg) as conn:
         qty = conn.execute('SELECT qty FROM paper_trades WHERE id=%s',
                            (ident,)).fetchone()['qty']
@@ -133,3 +139,26 @@ def test_funding_mark_breakdown_is_atomic(simulated_pg):
         assert row['amount'] == amount and row['mark_price'] == D(100)
         assert 'unverified' in row['quality']
         assert conn.execute('SELECT version FROM paper_position_state').fetchone()['version'] == 2
+
+
+def test_reject_unknown_new_strategy_but_close_legacy_open(simulated_pg):
+    stamp=start_time()
+    with pytest.raises(ValueError,match='identity'):
+        open_paper(simulated_pg,'long',100,98,105,{'qa':True},observed_at=stamp)
+    # Old open trade predates B migration 0005. Do not fabricate its entry.
+    with connection(simulated_pg) as conn:
+        old=conn.execute("""INSERT INTO paper_trades(
+          symbol,state,direction,signal_ts,opened_at,entry,qty,notional,
+          stop,take,reason,fee_paid,strategy_version)
+          VALUES('ETHUSDT','open','long',%s,%s,100,10,1000,98,105,
+                 '{"legacy":true}'::jsonb,0.55,'pivot_v1')
+          RETURNING id""",(stamp,stamp)).fetchone()['id']
+    assert close_paper(simulated_pg,105,'take',observed_at=stamp+timedelta(seconds=5),
+                       expected_id=old)==old
+    assert close_paper(simulated_pg,105,'duplicate',observed_at=stamp+timedelta(seconds=5),
+                       expected_id=old) is None
+    with connection(simulated_pg) as conn:
+        state=conn.execute("SELECT paper_trade_id,version FROM paper_position_state").fetchone()
+        events=conn.execute("SELECT action FROM paper_order_events WHERE paper_trade_id=%s",(old,)).fetchall()
+        assert state['paper_trade_id'] is None and state['version']==1
+        assert [r['action'] for r in events]==['exit']
