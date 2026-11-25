@@ -101,6 +101,7 @@ async def live_feed(settings):
     last_trade=last['ts'] if last else None
     pending_id=pending['id'] if pending else None
     while True:
+        connected_at=datetime.now(timezone.utc)
         try:
             async with websockets.connect(settings.bybit_ws,ping_interval=20,ping_timeout=15,
                                           max_size=8*1024*1024) as ws:
@@ -109,7 +110,6 @@ async def live_feed(settings):
                 book_ready=False
                 book_seq=None
                 book_update=None
-                connected_at=datetime.now(timezone.utc)
                 with connection(settings) as conn:
                     conn.execute("""INSERT INTO feed_health(symbol,topic,status)
                       VALUES(%s,'connection','connected')""",(settings.symbol,))
