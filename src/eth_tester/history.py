@@ -17,7 +17,7 @@ def dtms(ms):
 def toms(dt):
     return int(dt.timestamp()*1000)
 
-async def collect_klines(settings,client,kind,tf):
+async def _legacy_collect_klines(settings,client,kind,tf):
     span=INTERVAL_MS[tf]
     start=datetime.combine(settings.archive_start,datetime.min.time(),UTC)
     source=f"kline:{kind}"
@@ -176,3 +176,6 @@ async def backfill_rest(settings):
                 errors.append(('account_ratio',period,str(exc)))
         if errors:
             raise RuntimeError(f"Incomplete backfill: {errors}")
+
+# Use the strict, gap-aware collector for REST backfill and live reconciliation.
+from .history_integrity import collect_klines
