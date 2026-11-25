@@ -105,6 +105,20 @@ def indicator_worker_step(settings, tf="1", *, batch=500, period=14):
             else:
                 observed["trade_vwap"] = None
                 observed["trade_vwap_quality"] = "no_verified_trade_volume"
+            # The open-interest series is exchange-timestamped; without
+            # observed/received provenance this is NOT a certified as-of
+            # ML feature. Reject stale endpoint data rather than forward-fill.
+            oi = conn.execute("""SELECT ts,value FROM open_interest
+                WHERE symbol=%s AND interval='5min' AND ts<=%s
+                ORDER BY ts DESC LIMIT 2""",
+                (settings.symbol, available)).fetchall()
+            observed["oi_delta"] = None
+            observed["oi_source_quality"] = "unavailable"
+            if len(oi) == 2 and 0 <= (available - oi[0]["ts"]).total_seconds() <= 600:
+                observed["oi_delta"] = str(decimal(oi[0]["value"]) -
+                                           decimal(oi[1]["value"]))
+                observed["oi_source_quality"] = "exchange_time_only_unverified"
+                observed["oi_exchange_asof"] = oi[0]["ts"].isoformat()
             conn.execute("""INSERT INTO features(symbol,tf,ts,metadata,quality)
                 VALUES(%s,%s,%s,%s::jsonb,'indicator_partial')
                 ON CONFLICT(symbol,tf,ts) DO UPDATE SET
