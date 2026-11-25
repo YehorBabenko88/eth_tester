@@ -8,6 +8,16 @@ START = datetime(2026, 1, 1, tzinfo=timezone.utc)
 END = START + timedelta(minutes=1)
 
 
+def verified_provenance(count=3, checked_at=None):
+    return {"source": "trades_archive", "symbol": "ETHUSDT",
+            "instrument": "linear", "status": "verified", "quality": "complete",
+            "start_ts": START, "end_ts": END,
+            "observed_rows": count, "expected_rows": count,
+            "checksum": "a" * 64,
+            "checked_at": checked_at if checked_at is not None
+            else END + timedelta(seconds=5)}
+
+
 def samples():
     return [
         {"ts": START + timedelta(seconds=1), "price": "100", "qty": "5", "trade_id": "1"},
@@ -67,7 +77,8 @@ def test_naked_poc_uses_only_previous_closed_bars():
 
 def test_naked_poc_rejection_signal_and_no_signal():
     profile = build_profile(samples(), START, END, D(1),
-                            coverage_verified=True, expected_trade_count=3)
+                            coverage_verified=True, expected_trade_count=3,
+                            provenance=verified_provenance())
     bars = [candle(1, "100.1", "100.8", "100.5"),
             candle(2, "100.1", "100.9", "100.4"),
             candle(3, "100.1", "100.8", "100.5"),
@@ -100,7 +111,8 @@ def test_price_signal_can_consume_verified_profile_without_lookahead():
     from eth_tester.strategy import price_signal
 
     profile = build_profile(samples(), START, END, D(1),
-                            coverage_verified=True, expected_trade_count=3)
+                            coverage_verified=True, expected_trade_count=3,
+                            provenance=verified_provenance())
     before = [candle(index, "100.1", "100.8", "100.5")
               for index in range(-7, 1)]
     afterwards = [candle(1, "100.1", "100.8", "100.5"),
@@ -118,7 +130,8 @@ def test_price_signal_can_consume_verified_profile_without_lookahead():
 
 def test_volume_signal_rejects_unobserved_time_holes():
     profile = build_profile(samples(), START, END, D(1),
-                            coverage_verified=True, expected_trade_count=3)
+                            coverage_verified=True, expected_trade_count=3,
+                            provenance=verified_provenance())
     bars = [candle(1, "100.1", "100.8", "100.5"),
             candle(3, "100.1", "100.8", "100.5"),
             candle(4, "99.9", "100.6", "100.2", "100.1"),
@@ -147,3 +160,46 @@ def test_sparse_profile_value_area_finishes_inside_observed_bounds():
     very_wide = [dict(trades[0]), dict(trades[1], price="30000")]
     assert build_profile(very_wide, START, END, D(1),
                          coverage_verified=True, expected_trade_count=2) is None
+
+def test_only_database_attestation_can_authorize_paper_volume():
+    raw = build_profile(samples(), START, END, D(1), coverage_verified=True,
+                        expected_trade_count=3)
+    assert raw.coverage == "self_reported_unverified"
+    bars = [candle(1, "100.1", "100.8", "100.5"),
+            candle(2, "100.1", "100.9", "100.4"),
+            candle(3, "100.1", "100.8", "100.5"),
+            candle(4, "99.9", "100.6", "100.2", "100.1")]
+    assert volume_signal(bars, raw) is None
+    good = build_profile(samples(), START, END, D(1), coverage_verified=True,
+                         expected_trade_count=3, provenance=verified_provenance())
+    assert good.coverage == "externally_verified"
+    assert good.source_checksum == "a" * 64
+    assert volume_signal(bars, good) is not None
+    late = build_profile(samples(), START, END, D(1), coverage_verified=True,
+                         expected_trade_count=3,
+                         provenance=verified_provenance(
+                             checked_at=END + timedelta(hours=5)))
+    assert late is not None
+    assert volume_signal(bars, late) is None
+
+
+def test_tampered_archive_provenance_and_off_tick_prices_rejected():
+    for change in ({"status": "partial"}, {"quality": "partial_unverified"},
+                   {"checksum": "not-a-sha"}, {"instrument": "inverse"},
+                   {"observed_rows": 2}, {"end_ts": END + timedelta(seconds=1)},
+                   {"checked_at": START}):
+        source = {**verified_provenance(), **change}
+        assert build_profile(samples(), START, END, D(1),
+                             coverage_verified=True, expected_trade_count=3,
+                             provenance=source) is None
+    bad = samples()
+    bad[1] = dict(bad[1], price="101.5")
+    assert build_profile(bad, START, END, D(1),
+                         coverage_verified=True, expected_trade_count=3,
+                         provenance=verified_provenance()) is None
+    without_id = samples()
+    without_id[1] = {k: v for k, v in without_id[1].items() if k != "trade_id"}
+    assert build_profile(without_id, START, END, D(1),
+                         coverage_verified=True, expected_trade_count=3,
+                         provenance=verified_provenance()) is None
+

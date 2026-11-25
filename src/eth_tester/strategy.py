@@ -1,9 +1,10 @@
 """Causal price candidates; live confirmation is mandatory in orderflow."""
 from dataclasses import dataclass
+from datetime import timedelta
 from decimal import Decimal as D, InvalidOperation
 from .analytics import confirmed_pivots
 from .paper import estimate_trade, min_viable_target
-from .strategies import Parameters, pattern
+from .strategies import Parameters, pattern, strategy_identity
 
 @dataclass(frozen=True)
 class Signal:
@@ -131,13 +132,18 @@ def certified_expectancy(signal, certificate, *, decision_at, entry_price,
 
 
 def price_signal(closed_candles,fee_rate=D("0.00055"),slip_bps=D("2"),
-                 max_lookback=180,*,volume_profiles=()):
-    params=Parameters()
+                 max_lookback=180,*,volume_profiles=(),parameters=None):
+    params = Parameters() if parameters is None else parameters
+    if not isinstance(params, Parameters) or not isinstance(max_lookback, int):
+        return None
+    if max_lookback < 12:
+        return None
     candles=list(closed_candles[-max_lookback:])
     if len(candles)<12:
         return None
     try:
-        if any(b["ts"].tzinfo is None or b.get("closed", True) is not True
+        if any(b["ts"].tzinfo is None or b["ts"].utcoffset() != timedelta(0)
+               or b.get("closed", True) is not True
                for b in candles):
             return None
         step=candles[1]["ts"]-candles[0]["ts"]
@@ -175,8 +181,10 @@ def price_signal(closed_candles,fee_rate=D("0.00055"),slip_bps=D("2"),
             costs=economics(direction,price,stop,take,fee_rate,slip_bps,params)
             if costs is None:
                 continue
-            reason={"strategy":name,"strategy_version":params.version,**params.identity(),
+            reason={"strategy":name,"strategy_version":strategy_identity(params),
+                    "rules_version":params.version,**params.identity(),
                     "origin":origin.isoformat(),"confirmed":confirmed.isoformat(),
+                    "confirmed_available_at":(confirmed+step).isoformat(),
                     "side":side,"level":str(level),"atr":str(atr),"reference_price":str(price),
                     "source":"closed_candles","signal_bar_ts":last["ts"].isoformat(),
                     "bar_seconds":str(step.total_seconds()),"economics":costs,
@@ -185,7 +193,7 @@ def price_signal(closed_candles,fee_rate=D("0.00055"),slip_bps=D("2"),
         if volume_profiles:
             from .strategies.volume import volume_signal
             for profile in volume_profiles:
-                candidate = volume_signal(candles, profile, fee_rate, slip_bps)
+                candidate = volume_signal(candles, profile, fee_rate, slip_bps, parameters=params)
                 if candidate is not None:
                     candidates.append((abs(price - candidate.level),
                                        candidate.reason["strategy"], candidate))

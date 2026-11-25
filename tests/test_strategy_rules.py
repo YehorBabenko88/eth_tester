@@ -1,5 +1,5 @@
 from decimal import Decimal as D
-from eth_tester.strategies import Parameters, pattern
+from eth_tester.strategies import Parameters, pattern, strategy_identity
 from eth_tester.strategy import economics, price_signal
 
 def bar(o,h,low,c):
@@ -94,3 +94,55 @@ def test_certified_expectancy_checks_issuer_time_and_version():
     assert evaluate_cert({**certificate, "strategy_version": "other"}) is None
     assert evaluate_cert({**certificate, "probability_lower": 0.1}) is None
     assert evaluate_cert({**certificate, "observations": 2}) is None
+
+def test_all_eight_price_patterns_and_strict_no_match():
+    level = D(100)
+    cases = [
+        ("resistance", False, 99, 99, 102, 98, 101, ("long", "breakout")),
+        ("resistance", False, 99, 101, 102, 98, 99, ("short", "rejection")),
+        ("resistance", True, 101, 101, 103, 99, 102, ("long", "retest")),
+        ("resistance", True, 101, 101, 102, 98, 99, ("short", "false_breakout")),
+        ("support", False, 101, 101, 102, 98, 99, ("short", "breakout")),
+        ("support", False, 101, 99, 102, 98, 101, ("long", "rejection")),
+        ("support", True, 99, 99, 101, 97, 98, ("short", "retest")),
+        ("support", True, 99, 99, 102, 98, 101, ("long", "false_breakout")),
+    ]
+    for side, broken, previous, opening, high, low, close, expected in cases:
+        assert pattern(side, level, {"close": D(previous)},
+                       bar(opening, high, low, close), broken) == expected
+    assert pattern("invalid", level, {"close": D(99)},
+                   bar(99, 102, 98, 101), False) is None
+
+
+def test_strategy_identity_is_stable_and_parameter_sensitive():
+    params = Parameters()
+    engine = strategy_identity(params)
+    assert engine == params.engine_identity()
+    assert engine.startswith("eth_rules_v3:")
+    assert len(engine.split(":")[1]) == 12
+    assert engine != strategy_identity(Parameters(min_score=80))
+    assert params.identity()["parameter_sha256"].startswith(engine.split(":")[1])
+
+
+def test_price_signal_includes_engine_hash_and_causal_confirmation():
+    from datetime import datetime, timedelta, timezone
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    bars = []
+    for index in range(15):
+        opening, high, low, close = D(100), D("100.5"), D("99.8"), D(100)
+        if index == 4:
+            low = D("99.6")
+        if index == 14:
+            opening, high, low, close = (
+                D("99.7"), D("100.6"), D("99.5"), D("99.8"))
+        bars.append({"ts": start + timedelta(minutes=index), "open": opening,
+                     "high": high, "low": low, "close": close, "closed": True})
+    signal = price_signal(bars)
+    assert signal is not None
+    assert signal.reason["strategy"] == "rejection"
+    assert signal.reason["strategy_version"] == strategy_identity()
+    assert signal.reason["parameter_sha256"] == Parameters().identity()["parameter_sha256"]
+    assert signal.reason["confirmed_available_at"] == (
+        start + timedelta(minutes=7)).isoformat()
+    assert signal.reason["requires_live_confirmation"] is True
+

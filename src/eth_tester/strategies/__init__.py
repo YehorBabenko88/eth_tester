@@ -6,7 +6,7 @@ import json
 
 @dataclass(frozen=True)
 class Parameters:
-    version: str = "eth_rules_v2"
+    version: str = "eth_rules_v3"
     min_score: int = 70
     min_net: str = "0.002"
     funding_reserve: str = "0.001"
@@ -17,6 +17,18 @@ class Parameters:
         payload = asdict(self)
         return {"parameters": payload, "parameter_sha256": hashlib.sha256(
             json.dumps(payload, sort_keys=True).encode()).hexdigest()}
+
+    def engine_identity(self):
+        """Stable run identity used by E for both signals and no-signal rows."""
+        return self.version + ":" + self.identity()["parameter_sha256"][:12]
+
+
+def strategy_identity(parameters=None):
+    params = Parameters() if parameters is None else parameters
+    if not isinstance(params, Parameters):
+        raise ValueError("expected Strategy Parameters")
+    return params.engine_identity()
+
 
 def pattern(side, level, prior, bar, broken):
     """Return direction and pattern using only already closed bars."""

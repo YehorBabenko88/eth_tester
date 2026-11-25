@@ -99,6 +99,70 @@ def _mtf(conn, symbol, end, sign):
     return trends
 
 
+
+def _certified_snapshot(conn, symbol, start, end, observed_at):
+    """Require B's immutable C/F as-of feature snapshot before paper admission.
+
+    A complete snapshot must be computed and genuinely observed by decision
+    time, with per-feature availability and certified source coverage.
+    This intentionally denies trading while producers remain unverified.
+    """
+    from .ml import FEATURE_NAMES
+
+    row = conn.execute("""SELECT snapshot_key,bar_ts,available_at,observed_at,
+          computed_at,source,source_checksum,quality,is_causal,values_json,provenance
+          FROM feature_snapshots WHERE symbol=%s AND tf='1' AND bar_ts=%s
+          AND is_causal AND quality='complete' AND available_at<=%s
+          AND observed_at<=%s AND computed_at<=%s
+          ORDER BY available_at DESC,computed_at DESC,snapshot_key DESC LIMIT 1""",
+          (symbol, start, observed_at, observed_at, observed_at)).fetchone()
+    if not row:
+        return None
+    try:
+        timestamps = [row[key] for key in ("bar_ts", "available_at",
+                                          "observed_at", "computed_at")]
+        if any(value.tzinfo is None or value.utcoffset() != timedelta(0)
+               for value in timestamps):
+            return None
+        bar, available, received, computed = timestamps
+        checksum = row["source_checksum"]
+        provenance = row["provenance"]
+        values = row["values_json"]
+        if (bar != start or not end <= available <= received <= computed <= observed_at
+                or row["quality"] != "complete" or row["is_causal"] is not True
+                or not isinstance(row["source"], str) or not row["source"]
+                or not isinstance(row["snapshot_key"], str) or not row["snapshot_key"]
+                or not isinstance(checksum, str) or len(checksum) != 64
+                or any(c not in "0123456789abcdef" for c in checksum)
+                or not isinstance(provenance, dict)
+                or provenance.get("coverage_status") != "verified"
+                or not isinstance(values, dict)):
+            return None
+        times = provenance["feature_available_ms"]
+        checked_ms = provenance["source_checked_at_ms"]
+        if not isinstance(times, dict) or type(checked_ms) is not int:
+            return None
+        end_ms = int(end.timestamp() * 1000)
+        available_ms = int(available.timestamp() * 1000)
+        if not end_ms <= checked_ms <= available_ms:
+            return None
+        feature_availability = {}
+        for name in FEATURE_NAMES:
+            t = times[name]
+            if type(t) is not int or not 0 <= t <= available_ms:
+                return None
+            _decimal(values[name])
+            feature_availability[name] = t
+        return {"snapshot_key": row["snapshot_key"],
+                "source_checksum": checksum,
+                "available_at": available.isoformat(),
+                "computed_at": computed.isoformat(),
+                "coverage_checked_at_ms": checked_ms,
+                "feature_available_ms": feature_availability}
+    except (AttributeError, InvalidOperation, KeyError, TypeError,
+            ValueError, OverflowError):
+        return None
+
 def confirm_rejection(conn, settings, signal, bar, *, observed_at=None):
     """Return (admissible, JSON-compatible evidence) at the observed instant."""
     now = observed_at if observed_at is not None else datetime.now(timezone.utc)
@@ -201,6 +265,11 @@ def confirm_rejection(conn, settings, signal, bar, *, observed_at=None):
         accepted = (score >= Parameters().min_score and
                     checks["directional_flow_or_absorption"] and
                     checks["multitimeframe"] and costs is not None)
+        certified = None
+        if accepted:
+            certified = _certified_snapshot(conn, symbol, start, end, now)
+            if certified is None:
+                return reject("missing_verified_feature_snapshot")
         liquidation = conn.execute("""SELECT side,coalesce(sum(qty),0) AS qty
           FROM liquidation_events WHERE symbol=%s AND ts>=%s AND ts<%s
           GROUP BY side""", (symbol, start, end)).fetchall()
@@ -217,6 +286,7 @@ def confirm_rejection(conn, settings, signal, bar, *, observed_at=None):
             "liquidations_observed_unverified": {
                 item["side"]: str(item["qty"]) for item in liquidation},
             "economics_at_observed_entry": costs,
+            "immutable_feature_snapshot": certified,
             "baseline": "five_closed_1m_candles_volume_matched",
             "warning": ("Score is not a probability; book changes and liquidation "
                         "counts cannot prove absorption or fill attribution."),

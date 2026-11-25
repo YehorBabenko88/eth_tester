@@ -2,7 +2,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal as D
 from types import SimpleNamespace
 
-from eth_tester.orderflow import _matches_volume, _valid_oi, confirm_rejection
+from eth_tester.orderflow import _matches_volume, _valid_oi, confirm_rejection, _certified_snapshot
+from eth_tester.ml import FEATURE_NAMES
 from eth_tester.strategy import Signal
 
 
@@ -38,6 +39,23 @@ class FakeConn:
                      "updated_at": NOW - timedelta(seconds=1), "valid": True}
         self.recent = {"ts": NOW - timedelta(seconds=1), "price": D(102)}
         self.liquidations = [{"side": "Sell", "qty": D(2)}]
+        self.snapshot = {
+            "snapshot_key": "verified-1m-bar", "bar_ts": START,
+            "available_at": START + timedelta(minutes=1),
+            "observed_at": NOW - timedelta(seconds=8),
+            "computed_at": NOW - timedelta(seconds=5),
+            "source": "verified_causal_analytics", "source_checksum": "b" * 64,
+            "quality": "complete", "is_causal": True,
+            "values_json": {name: "1" for name in FEATURE_NAMES},
+            "provenance": {
+                "coverage_status": "verified",
+                "source_checked_at_ms": int((START + timedelta(minutes=1)).timestamp() * 1000),
+                "feature_available_ms": {
+                    name: int((START + timedelta(minutes=1)).timestamp() * 1000)
+                    for name in FEATURE_NAMES
+                },
+            },
+        }
 
     def execute(self, statement, args):
         if "GROUP BY price" in statement:
@@ -60,6 +78,8 @@ class FakeConn:
             return Result(self.recent)
         if "FROM liquidation_events" in statement:
             return Result(self.liquidations)
+        if "FROM feature_snapshots" in statement:
+            return Result(self.snapshot)
         raise AssertionError("Unexpected SQL: " + statement)
 
 
@@ -79,6 +99,7 @@ def test_positive_path_checks_all_required_gates():
     assert evidence["score"] == 100
     assert evidence["mtf"]["5"] and evidence["mtf"]["15"] and evidence["mtf"]["60"]
     assert evidence["baseline"] == "five_closed_1m_candles_volume_matched"
+    assert evidence["immutable_feature_snapshot"]["snapshot_key"] == "verified-1m-bar"
     assert evidence["liquidations_observed_unverified"]["Sell"] == "2"
     assert D(evidence["economics_at_observed_entry"]["net_reward_risk"]) >= 2
 
@@ -113,3 +134,30 @@ def test_book_rejects_negative_level_even_if_total_positive():
     conn = FakeConn()
     conn.book["asks"] = {"102": "0"}
     assert evaluate(conn)[1]["reason"] == "invalid_book_liquidity"
+
+def test_missing_or_late_snapshot_denies_strong_signal():
+    conn = FakeConn()
+    conn.snapshot = None
+    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    conn = FakeConn()
+    conn.snapshot["computed_at"] = NOW + timedelta(seconds=1)
+    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    conn = FakeConn()
+    conn.snapshot["provenance"]["coverage_status"] = "observed_partial"
+    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    conn = FakeConn()
+    conn.snapshot["provenance"]["feature_available_ms"]["oi"] += 60_000
+    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    conn = FakeConn()
+    conn.snapshot["source_checksum"] = ""
+    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+
+
+def test_causal_snapshot_requires_complete_feature_availability():
+    conn = FakeConn()
+    assert _certified_snapshot(conn, "ETHUSDT", START, START + timedelta(minutes=1),
+                               NOW)["snapshot_key"] == "verified-1m-bar"
+    conn.snapshot["values_json"].pop("volatility")
+    assert _certified_snapshot(conn, "ETHUSDT", START, START + timedelta(minutes=1),
+                               NOW) is None
+

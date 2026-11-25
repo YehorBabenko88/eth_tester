@@ -35,6 +35,8 @@ class VolumeProfile:
     total_quantity: Decimal
     trade_count: int
     coverage: str
+    available_at: datetime | None = None
+    source_checksum: str | None = None
 
     def zones(self, kind):
         """Contiguous tick zones inside the actually observed price range.
@@ -94,8 +96,40 @@ class VolumeProfile:
                             and qty < self.by_price.get(price + self.tick_size, Decimal(0))))
 
 
+def _coverage_attestation(record, start, end, observed_count):
+    """Validate B-owned ingestion_coverage evidence, not a caller's boolean.
+
+    The record must describe this exact interval and be recorded after it
+    closed; older backfills become available only at checked_at, never
+    retroactively at exchange event time.
+    """
+    if not isinstance(record, dict):
+        return None
+    try:
+        stamp = record["checked_at"]
+        checksum = record["checksum"]
+        if (record.get("source") != "trades_archive"
+                or record.get("symbol") != "ETHUSDT"
+                or record.get("instrument") != "linear"
+                or record.get("status") != "verified"
+                or record.get("quality") not in ("verified", "complete")
+                or record.get("start_ts") != start or record.get("end_ts") != end
+                or type(record.get("observed_rows")) is not int
+                or type(record.get("expected_rows")) is not int
+                or record["observed_rows"] != observed_count
+                or record["expected_rows"] != observed_count
+                or not isinstance(checksum, str) or len(checksum) != 64
+                or any(ch not in "0123456789abcdef" for ch in checksum)
+                or not isinstance(stamp, datetime) or stamp.tzinfo is None
+                or stamp.utcoffset() != timedelta(0) or stamp < end):
+            return None
+        return stamp, checksum
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def build_profile(trades, start, end, tick_size, *, coverage_verified=False,
-                  expected_trade_count=None):
+                  expected_trade_count=None, provenance=None):
     """Reject non-verified/partial windows; deterministic POC and contiguous 70% VA.
 
     The caller must prove coverage externally. A matching trade count alone
@@ -104,7 +138,8 @@ def build_profile(trades, start, end, tick_size, *, coverage_verified=False,
     if not coverage_verified or expected_trade_count is None:
         return None
     if (start.tzinfo is None or end.tzinfo is None or
-            start.utcoffset() != end.utcoffset() or start >= end):
+            start.utcoffset() != timedelta(0) or
+            end.utcoffset() != timedelta(0) or start >= end):
         return None
     try:
         tick = number(tick_size)
@@ -115,22 +150,30 @@ def build_profile(trades, start, end, tick_size, *, coverage_verified=False,
         count = 0
         for trade in trades:
             ts = trade["ts"]
-            if ts.tzinfo is None or not start <= ts < end:
+            if ts.tzinfo is None or ts.utcoffset() != timedelta(0) or not start <= ts < end:
                 return None
             price, qty = number(trade["price"]), number(trade["qty"])
             if price <= 0 or qty <= 0:
                 return None
             trade_id = trade.get("trade_id")
+            if provenance is not None and (not isinstance(trade_id, str) or not trade_id):
+                return None
             if trade_id is not None:
                 if trade_id in seen_ids:
                     return None
                 seen_ids.add(trade_id)
             bucket = (price / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+            if bucket != price:
+                return None
             bins[bucket] = bins.get(bucket, Decimal(0)) + qty
             count += 1
         if count != expected_trade_count or not bins:
             return None
         if (max(bins) - min(bins)) / tick > 20000:
+            return None
+        attestation = (_coverage_attestation(provenance, start, end, count)
+                       if provenance is not None else None)
+        if provenance is not None and attestation is None:
             return None
         total = sum(bins.values(), Decimal(0))
         poc = min(bins, key=lambda price: (-bins[price], price))
@@ -161,7 +204,10 @@ def build_profile(trades, start, end, tick_size, *, coverage_verified=False,
         if allocated < target:
             return None
         return VolumeProfile(start, end, tick, poc, left, right, bins, total,
-                             count, "externally_verified")
+                             count, "externally_verified" if attestation
+                             else "self_reported_unverified",
+                             attestation[0] if attestation else None,
+                             attestation[1] if attestation else None)
     except (InvalidOperation, TypeError, ValueError, KeyError, OverflowError):
         return None
 
@@ -189,7 +235,7 @@ def untouched_poc(profile, closed_bars, *, through, bar_span=timedelta(minutes=1
 
 
 def volume_signal(closed_candles, profile, fee_rate=Decimal("0.00055"),
-                  slip_bps=Decimal("2")):
+                  slip_bps=Decimal("2"), *, parameters=None):
     """Candidate from a prior, verified profile; no future trade or bar access.
 
     The caller must separately confirm flow, freshness, fees and risk at entry.
@@ -197,13 +243,17 @@ def volume_signal(closed_candles, profile, fee_rate=Decimal("0.00055"),
     from ..strategy import Signal, economics
     from . import Parameters
 
-    if profile is None or profile.coverage != "externally_verified":
+    if (profile is None or profile.coverage != "externally_verified"
+            or profile.available_at is None or not profile.source_checksum):
         return None
     candles = list(closed_candles)
     if len(candles) < 4:
         return None
     prior, last = candles[-2], candles[-1]
-    if prior["ts"] < profile.end or last["ts"] <= prior["ts"]:
+    if (prior["ts"] < profile.end or last["ts"] <= prior["ts"]
+            or last["ts"].tzinfo is None
+            or last["ts"].utcoffset() != timedelta(0)
+            or profile.available_at > last["ts"] + timedelta(minutes=1)):
         return None
     if any(b.get("closed", True) is not True for b in candles):
         return None
@@ -258,13 +308,19 @@ def volume_signal(closed_candles, profile, fee_rate=Decimal("0.00055"),
             cost = economics(side, price, stop, take, fee_rate, slip_bps)
             if cost is None:
                 continue
-            params = Parameters()
-            reason = {"strategy": name, "strategy_version": params.version,
+            params = Parameters() if parameters is None else parameters
+            if not isinstance(params, Parameters):
+                return None
+            reason = {"strategy": name, "strategy_version": params.engine_identity(),
+                      "rules_version": params.version,
                       **params.identity(), "level": str(level),
                       "profile_start": profile.start.isoformat(),
                       "profile_end": profile.end.isoformat(),
                       "profile_trade_count": profile.trade_count,
                       "profile_quality": profile.coverage,
+                      "profile_available_at": profile.available_at.isoformat(),
+                      "source_checksum": profile.source_checksum,
+                      "signal_bar_ts": last["ts"].isoformat(),
                       "value_area": [str(profile.value_area_low), str(profile.value_area_high)],
                       "economics": cost, "requires_live_confirmation": True,
                       "source": "verified_tick_volume"}
