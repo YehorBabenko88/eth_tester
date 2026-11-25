@@ -9,7 +9,8 @@ from ..database import connection
 from . import evaluate, fit, rollback_required, should_retrain, validate
 
 
-def store_shadow(settings, model, train, validation, shadow, *, eligible_count=None):
+def store_shadow(settings, model, train, validation, shadow, *,
+                 eligible_count=None, research_report=None):
     """Persist an append-only candidate; no approval without independent evidence."""
     if not (train and validation and shadow):
         raise ValueError("three disjoint samples required")
@@ -40,12 +41,43 @@ def store_shadow(settings, model, train, validation, shadow, *, eligible_count=N
     if eligible_count is not None:
         report["eligible_count"] = eligible_count
         report["source_contract"] = "eth_feature_snapshot_v2"
+    if research_report is not None:
+        # The final research verdict is deliberately NOT a promotion gate.
+        # Match the exact training model and immutable historical-v2 cohort.
+        from .research import CONTRACT, RESEARCH_VERSION
+        from re import fullmatch
+        if (not isinstance(research_report, dict)
+                or research_report.get("version") != RESEARCH_VERSION
+                or research_report.get("cohort") != CONTRACT
+                or research_report.get("model_version") != model.version
+                or research_report.get("promotion_eligible") is not False
+                or research_report.get("go") is not False
+                or not isinstance(research_report.get("fingerprint_sha256"), str)
+                or fullmatch(r"[0-9a-f]{64}", research_report["fingerprint_sha256"]) is None
+                or eligible_count is None):
+            raise ValueError("invalid or promotable historical research report")
+        report["research"] = research_report
+        report["research_go"] = False
     with connection(settings) as conn:
         conn.execute("SELECT pg_advisory_xact_lock(20991992)")
-        existing = conn.execute(
-            """SELECT id FROM model_versions WHERE model_name='causal_softmax3'
-               AND params->>'version'=%s ORDER BY id DESC LIMIT 1""",
-            (model.version,)).fetchone()
+        if research_report is not None:
+            # Same train weights may be re-evaluated when a NEW forward OOS
+            # cohort arrives. Preserve each immutable SHA-keyed experiment;
+            # otherwise the old version-only dedup would discard new evidence
+            # and prevent the eligible_count watermark from advancing.
+            existing = conn.execute(
+                """SELECT id FROM model_versions WHERE model_name='causal_softmax3'
+                   AND params->>'version'=%s AND approved=false
+                   AND validation->'research'->>'fingerprint_sha256'=%s
+                   ORDER BY id DESC LIMIT 1""",
+                (model.version, research_report["fingerprint_sha256"]),
+            ).fetchone()
+        else:
+            existing = conn.execute(
+                """SELECT id FROM model_versions WHERE model_name='causal_softmax3'
+                   AND params->>'version'=%s ORDER BY id DESC LIMIT 1""",
+                (model.version,),
+            ).fetchone()
         if existing:
             return existing["id"], report
         row = conn.execute(

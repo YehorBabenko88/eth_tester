@@ -77,9 +77,34 @@ def train_causal_shadow(settings, as_of_ms, *, source="snapshots", tf="1",
     if len(train) < 100 or len(validation) < 30 or len(shadow) < 30:
         return {"status": "insufficient_purged_splits", "usable": len(rows),
                 "required": min_rows, "rejections": rejected, "approved": False}
-    model = fit(train)
-    candidate_id, metrics = store_shadow(settings, model, train, validation, shadow,
-                                         eligible_count=len(rows))
+    # CPU budget: an oversized population cannot block a 24/7 dispatcher
+    # with a single unbounded optimizer pass. B must supply a genuinely
+    # monotonic durable research cursor/window before lifting this ceiling.
+    if len(train) > 20_000:
+        return {"status": "research_cpu_budget_exceeded",
+                "usable": len(rows), "required": min_rows,
+                "rejections": {"research_population_oversize": 1},
+                "approved": False}
+    try:
+        # Preflight all cohort timestamps, duplicates and finite values
+        # BEFORE the expensive CPU optimizer is allowed to run.
+        from .ml.research import historical_shadow_report, verify_history_partition
+        verify_history_partition(train, validation, shadow,
+                                 embargo_ms=max(60_000, embargo_ms))
+        model = fit(train)
+        research = historical_shadow_report(
+            train, validation, shadow, model,
+            embargo_ms=max(60_000, embargo_ms))
+    except (ValueError, TypeError, OverflowError, ZeroDivisionError):
+        # The source ledger remains intact and eligible. Missing classes,
+        # future/out-of-order evidence and unstable estimates fail closed.
+        return {"status": "research_evidence_blocked",
+                "usable": len(rows), "required": min_rows,
+                "rejections": {"research_contract_invalid": 1},
+                "approved": False}
+    candidate_id, metrics = store_shadow(
+        settings, model, train, validation, shadow,
+        eligible_count=len(rows), research_report=research)
     return {"status": "shadow_registered", "candidate_id": candidate_id,
             "version": model.version, "metrics": metrics, "usable": len(rows),
             "rejections": rejected, "approved": False}
@@ -124,9 +149,11 @@ def run_causal_shadow_cycle(settings, *, min_new=100, min_rows=180,
                 settings, as_of, tf="1", source="snapshots",
                 min_rows=min_rows, min_new=min_new,
                 previous_count=previous_count, embargo_ms=embargo_ms)
-        except (ValueError, TypeError, OverflowError) as exc:
+        except (ValueError, TypeError, OverflowError):
+            # Never put raw DB or source exception text into CLI/Telegram.
             return {"status": "invalid_verified_training_evidence",
-                    "reason": str(exc)[:160], "approved": False,
+                    "rejections": {"research_contract_invalid": 1},
+                    "approved": False,
                     "previous_eligible_count": previous_count,
                     "as_of_ms": as_of}
         return {**result, "previous_eligible_count": previous_count,
