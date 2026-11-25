@@ -69,3 +69,34 @@ This is not a guarantee of graceful shutdown when a service has no console.
 Database migration/bootstrap remains B-owned; Supervisor currently calls init_database
 on startup and therefore requires a separately approved least-privilege DB contract.
 Remote Telegram /delete remains disabled despite Storage's manifest APIs.
+
+
+## Round 4: read-only startup and guarded Windows ownership
+
+Normal python -m eth_tester.cli run calls Storage B's
+verify_existing_schema(settings) *before* launching any workers. It checks
+dedicated database ownership, migration checksums, and mandatory tables
+without DDL. Only the administrator explicitly runs python -m eth_tester.cli init.
+Missing/stale schema blocks startup. The service role needs CONNECT, USAGE
+on public schema, and SELECT on eth_storage_identity/eth_schema_migrations;
+never give the worker CREATE DATABASE/DDL/migration rights.
+
+The Windows installer is NOT approved for working computers until native
+disposable-VM acceptance. It now rejects foreign scheduled tasks, unknown
+pre-existing ProgramData/ETHTester runtime directories, broadly readable .env,
+broadly writable install components, or missing machine-level numeric
+ETH_TESTER_TG_USER_ID with Telegram configured. Read-only CLI and DB
+preflights precede registering the one LocalService startup task.
+
+The uninstaller checks the task's LocalService principal as well as manifest
+and command-line. DB, downloads, backups, source, secrets and runtime are
+preserved. Reinstallation after uninstall requires explicit operator inspection
+of the preserved runtime root; do not recursively delete it automatically.
+The installer can leave a partial runtime root after failure; inspect manually.
+
+Acceptance requires a disposable Windows VM: PowerShell AST parser,
+Task Scheduler XML, LocalService ACL/token evidence, reboot, worker crash,
+owned-child shutdown, graceful uninstall, and non-owned resource preservation.
+Tests/integration/test_control_pg.py exercises a disposable local PostgreSQL
+database and read-only role with migration-checksum corruption; no real trades
+or exchange connections occur. Telegram /delete remains disabled.

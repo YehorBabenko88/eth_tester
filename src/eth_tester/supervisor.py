@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-from .database import init_database
+from .database import verify_existing_schema
 
 LOGGER = logging.getLogger(__name__)
 PERMANENT = ("live", "analyse", "engine")
@@ -145,6 +145,14 @@ class Supervisor:
                 self._record(name, "stopped")
                 raise
             except Exception as exc:
+                # A status-write failure may happen after process creation.
+                # Stop that owned process before discarding the handle.
+                if proc is not None and proc.returncode is None:
+                    try:
+                        await self._terminate(name, proc)
+                    except Exception:
+                        LOGGER.exception("Unable to stop owned worker %s", name)
+                        raise
                 LOGGER.exception("Worker %s launch/monitor failure", name)
                 self._record(name, "error", error=type(exc).__name__)
                 await self.sleep(delay)
@@ -153,11 +161,14 @@ class Supervisor:
                 self.children.pop(name, None)
 
     async def run(self, settings):
-        init_database(settings)
+        # Storage B verifies ownership and migration hashes without DDL.
+        # The explicit CLI `init` is reserved for the administrator.
+        verification = verify_existing_schema(settings)
+        LOGGER.info("Verified existing ETH Tester schema: %s", verification)
         specs = [(cmd, None) for cmd in PERMANENT]
         specs.extend(PERIODIC.items())
         if settings.tg_bot_token and settings.tg_chat_id:
-            if os.environ.get("ETH_TESTER_TG_USER_ID", "").strip():
+            if os.environ.get("ETH_TESTER_TG_USER_ID", "").strip().isdecimal():
                 specs.append(("telegram", None))
             else:
                 LOGGER.error("Telegram disabled: ETH_TESTER_TG_USER_ID not configured")

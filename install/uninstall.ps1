@@ -13,6 +13,10 @@ if ($m.product -cne 'ETHTester' -or $m.version -ne 1 -or
     $m.task -cne 'ETHTester-Owned-Supervisor') {
     throw 'Ownership mismatch: refusing deletion'
 }
+if ($m.PSObject.Properties.Name -contains 'principal' -and
+    $m.principal -cne 'S-1-5-19') {
+    throw 'Manifest principal does not match owner'
+}
 $t = Get-ScheduledTask -TaskName $m.task -ErrorAction SilentlyContinue
 if ($t) {
     $actions = @($t.Actions)
@@ -20,6 +24,19 @@ if ($t) {
         $actions[0].Arguments -cne $m.arguments -or
         $actions[0].WorkingDirectory -cne $m.root) {
         throw 'Task action does not match manifest: refusing deletion'
+    }
+    # Matching task command-line is insufficient: verify LocalService principal.
+    try {
+        $actor = [string]$t.Principal.UserId
+        if ($actor -match '^S-[0-9]+-') {
+            $actorSid = [Security.Principal.SecurityIdentifier]::new($actor).Value
+        } else {
+            $actorSid = [Security.Principal.NTAccount]::new($actor).Translate(
+                [Security.Principal.SecurityIdentifier]).Value
+        }
+    } catch { throw 'Task principal does not match owner' }
+    if ($actorSid -cne 'S-1-5-19' -or $t.Principal.LogonType -ne 'ServiceAccount') {
+        throw 'Task principal does not match owner'
     }
     # Cooperative stop prevents leaving supervised child processes running.
     $runtime = Join-Path $env:ProgramData 'ETHTester\runtime'

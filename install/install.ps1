@@ -1,116 +1,117 @@
-# Register a task at Windows startup as restricted LocalService. Never delete DB.
+# ETH Tester G Control: single owned startup task, no automatic DB creation or data deletion.
+# Administrator provisions/migrates the dedicated DB using: python -m eth_tester.cli init
 [CmdletBinding()]
 param(
-  [string]$Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
-  [string]$Python = ''
+    [string]$Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
+    [string]$Python = ''
 )
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path -LiteralPath $Root).Path
 if (-not $Python) { $Python = Join-Path $Root '.venv\Scripts\python.exe' }
-if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw "Python missing: $Python" }
-if (-not (Test-Path -LiteralPath (Join-Path $Root '.env') -PathType Leaf)) {
-    throw 'Configure secure .env first'
-}
-if (-not (Test-Path -LiteralPath (Join-Path $Root 'src\eth_tester\supervisor.py'))) {
-    throw 'ETH Tester installation root invalid'
-}
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = New-Object Security.Principal.WindowsPrincipal($identity)
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'Administrator privileges required to register at startup'
-}
+$Python = (Resolve-Path -LiteralPath $Python -ErrorAction Stop).Path
+$envFile = Join-Path $Root '.env'
 $manifest = Join-Path $Root '.eth-tester-install.json'
 $taskName = 'ETHTester-Owned-Supervisor'
-if (Test-Path -LiteralPath $manifest) { throw 'Manifest already exists; uninstall first' }
+
+if (-not (Test-Path -LiteralPath $envFile -PathType Leaf)) {
+    throw 'Configure protected .env before installation'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $Root 'src\eth_tester\supervisor.py') -PathType Leaf)) {
+    throw 'ETH Tester installation root is invalid'
+}
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Administrator privileges required for startup registration'
+}
+if (Test-Path -LiteralPath $manifest) {
+    throw 'Ownership manifest already exists; refusing overwrite'
+}
 if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-    throw 'Task name occupied; refusing to overwrite чужой task'
+    throw 'Scheduled task name occupied; refusing overwrite'
 }
-# Explicit, narrowly scoped ACL must grant LocalService access. Never grant Everyone read.
-$access = (Get-Acl -LiteralPath (Join-Path $Root '.env')).Access
-$canRead = $false
-$broad = $false
-foreach ($ace in $access) {
-    if ($ace.AccessControlType -ne 'Allow' -or
-        (($ace.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadData) -eq 0)) {
-        continue
+
+# Locale-independent SIDs, fail closed if an ACL principal cannot be identified.
+function Get-AllowedReadSids([string]$Path) {
+    $sids = @()
+    foreach ($ace in (Get-Acl -LiteralPath $Path).Access) {
+        if ($ace.AccessControlType -ne 'Allow' -or
+            (($ace.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadData) -eq 0)) {
+            continue
+        }
+        try {
+            $sids += $ace.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]).Value
+        } catch { throw "Cannot validate ACL principal on $Path" }
     }
-    # Well-known SIDs are independent of localized Windows account names.
-    try { $sid = $ace.IdentityReference.Translate(
-        [System.Security.Principal.SecurityIdentifier]).Value
-    } catch { continue }
-    if ($sid -eq 'S-1-5-19') { $canRead = $true }
-    if (@('S-1-1-0','S-1-5-11','S-1-5-32-545') -contains $sid) { $broad = $true }
+    return $sids
 }
-if (-not $canRead) { throw 'Grant LOCAL SERVICE (S-1-5-19) explicit read ACL to .env' }
-if ($broad) { throw 'Insecure broad read ACL on .env; restrict it before installing' }
-# A writable interpreter or package root would allow privilege escalation as LOCAL SERVICE.
+$readers = @(Get-AllowedReadSids $envFile)
+if ($readers -notcontains 'S-1-5-19') {
+    throw 'Grant LocalService (S-1-5-19) explicit read permission to .env'
+}
+foreach ($sid in @('S-1-1-0','S-1-5-11','S-1-5-32-545')) {
+    if ($readers -contains $sid) { throw 'Broad read ACL on .env; installation refused' }
+}
 foreach ($target in @($Root, $Python)) {
     foreach ($ace in (Get-Acl -LiteralPath $target).Access) {
         if ($ace.AccessControlType -ne 'Allow' -or
             (($ace.FileSystemRights -band [Security.AccessControl.FileSystemRights]'Write,Modify,FullControl') -eq 0)) {
             continue
         }
-        try { $sid = $ace.IdentityReference.Translate(
-            [System.Security.Principal.SecurityIdentifier]).Value
-        } catch { throw "Cannot verify ACL on $target" }
+        try {
+            $sid = $ace.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]).Value
+        } catch { throw "Cannot validate ACL principal on $target" }
         if (@('S-1-1-0','S-1-5-11','S-1-5-32-545') -contains $sid) {
-            throw "Writable installation component by broad principal: $target"
+            throw "Broad writable installation component: $target"
         }
     }
 }
-# The Telegram sender identity must be inherited by the LocalService task at boot.
-$hasBotToken = [bool](Select-String -LiteralPath (Join-Path $Root '.env') -Pattern '^\s*TG_BOT_TOKEN\s*=\s*\S+' -Quiet)
+$hasBotToken = [bool](Select-String -LiteralPath $envFile -Pattern '^\s*TG_BOT_TOKEN\s*=\s*\S+' -Quiet)
 $ownerId = [Environment]::GetEnvironmentVariable('ETH_TESTER_TG_USER_ID', 'Machine')
-if ($hasBotToken -and ($ownerId -notmatch '^[0-9]+
-# Supervisor state is written outside the source/.env tree to a narrowly scoped runtime directory.
-$runtime = Join-Path $env:ProgramData 'ETHTester\runtime'
-New-Item -ItemType Directory -Path $runtime -Force | Out-Null
-$runtimeAcl = Get-Acl -LiteralPath $runtime
-$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-    'NT AUTHORITY\LOCAL SERVICE', 'Modify',
-    [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
-    [System.Security.AccessControl.PropagationFlags]::None,
-    [System.Security.AccessControl.AccessControlType]::Allow
-)
-$runtimeAcl.AddAccessRule($rule)
-Set-Acl -LiteralPath $runtime -AclObject $runtimeAcl
-$action = New-ScheduledTaskAction -Execute $Python -Argument '-m eth_tester.cli run' -WorkingDirectory $Root
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$owner = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\LOCAL SERVICE' -LogonType ServiceAccount -RunLevel Limited
-$opts = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $owner -Settings $opts | Out-Null
-try {
-    [ordered]@{
-        product='ETHTester'; version=1; task=$taskName; root=$Root; python=$Python
-        arguments='-m eth_tester.cli run'; created_utc=(Get-Date).ToUniversalTime().ToString('o')
-    } | ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding UTF8 -ErrorAction Stop
-} catch {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-    throw
+if ($hasBotToken -and $ownerId -notmatch '^[0-9]+$') {
+    throw 'Set machine-level ETH_TESTER_TG_USER_ID before installing Telegram worker'
 }
-Write-Host "Installed owned Windows startup task: $taskName"
-)) {
-    throw 'Set machine-level ETH_TESTER_TG_USER_ID to the numeric Telegram owner before installing'
-}
+
+# Read-only preflights. No child process or database DDL is started.
 Push-Location $Root
 try {
     & $Python -m eth_tester.cli --help *> $null
-    if ($LASTEXITCODE -ne 0) { throw 'Python environment missing ETH Tester dependencies' }
-} finally {
-    Pop-Location
+    if ($LASTEXITCODE -ne 0) { throw 'ETH Tester Python environment failed CLI import check' }
+    & $Python -c 'from eth_tester.config import Settings; from eth_tester.database import verify_existing_schema; verify_existing_schema(Settings())'
+    if ($LASTEXITCODE -ne 0) { throw 'ETH Tester database requires explicit administrator init/upgrade' }
+} finally { Pop-Location }
+
+# Never adopt, grant access to, or delete a pre-existing unowned ProgramData path.
+$runtimeRoot = Join-Path $env:ProgramData 'ETHTester'
+if (Test-Path -LiteralPath $runtimeRoot) {
+    throw 'Existing runtime root without ownership manifest; refuse adoption'
 }
-# Supervisor state is written outside the source/.env tree to a narrowly scoped runtime directory.
-$runtime = Join-Path $env:ProgramData 'ETHTester\runtime'
-New-Item -ItemType Directory -Path $runtime -Force | Out-Null
-$runtimeAcl = Get-Acl -LiteralPath $runtime
-$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-    'NT AUTHORITY\LOCAL SERVICE', 'Modify',
-    [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
-    [System.Security.AccessControl.PropagationFlags]::None,
-    [System.Security.AccessControl.AccessControlType]::Allow
-)
-$runtimeAcl.AddAccessRule($rule)
-Set-Acl -LiteralPath $runtime -AclObject $runtimeAcl
+New-Item -ItemType Directory -Path $runtimeRoot -ErrorAction Stop | Out-Null
+$runtimeAcl = Get-Acl -LiteralPath $runtimeRoot
+$runtimeAcl.SetAccessRuleProtection($true, $false)
+foreach ($oldRule in @($runtimeAcl.Access)) {
+    $runtimeAcl.RemoveAccessRuleSpecific($oldRule)
+}
+foreach ($grant in @(
+    @{ Sid='S-1-5-18'; Rights='FullControl' }, # SYSTEM
+    @{ Sid='S-1-5-32-544'; Rights='FullControl' }, # Administrators
+    @{ Sid='S-1-5-19'; Rights='Modify' } # LOCAL SERVICE
+)) {
+    $sid = [Security.Principal.SecurityIdentifier]::new($grant.Sid)
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+        $sid, [Security.AccessControl.FileSystemRights]$grant.Rights,
+        [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
+        [Security.AccessControl.PropagationFlags]::None,
+        [Security.AccessControl.AccessControlType]::Allow
+    )
+    $runtimeAcl.AddAccessRule($rule)
+}
+Set-Acl -LiteralPath $runtimeRoot -AclObject $runtimeAcl
+$runtime = Join-Path $runtimeRoot 'runtime'
+New-Item -ItemType Directory -Path $runtime -ErrorAction Stop | Out-Null
+
 $action = New-ScheduledTaskAction -Execute $Python -Argument '-m eth_tester.cli run' -WorkingDirectory $Root
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $owner = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\LOCAL SERVICE' -LogonType ServiceAccount -RunLevel Limited
@@ -119,10 +120,11 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Pr
 try {
     [ordered]@{
         product='ETHTester'; version=1; task=$taskName; root=$Root; python=$Python
-        arguments='-m eth_tester.cli run'; created_utc=(Get-Date).ToUniversalTime().ToString('o')
+        arguments='-m eth_tester.cli run'; principal='S-1-5-19'
+        created_utc=(Get-Date).ToUniversalTime().ToString('o')
     } | ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding UTF8 -ErrorAction Stop
 } catch {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
     throw
 }
-Write-Host "Installed owned Windows startup task: $taskName"
+Write-Host "Installed owned startup task: $taskName; database unchanged"
