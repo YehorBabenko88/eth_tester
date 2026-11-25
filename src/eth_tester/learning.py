@@ -63,3 +63,39 @@ def train_shadow(settings,minimum=100,epochs=20):
           (json.dumps({"features":FEATURES,"weights":weights}),
            json.dumps(stats))).fetchone()
     return result["id"],stats
+
+
+def train_causal_shadow(settings, as_of_ms, *, source="backtest",
+                        min_rows=180, min_new=100, previous_count=0,
+                        embargo_ms=0):
+    """Retrain only when enough independently labeled, point-in-time data exist.
+
+    Does not approve a model, enable the bot, or place trades. The two holdout
+    periods are reserved for validation and independent shadow evaluation.
+    """
+    from .ml import chronological, fit, should_retrain
+    from .ml.extract import load_backtest_examples, load_paper_examples
+    from .ml.lifecycle import store_shadow
+
+    if min_rows < 30 or embargo_ms < 0:
+        raise ValueError("invalid training policy")
+    if source == "backtest":
+        rows, rejected = load_backtest_examples(settings, as_of_ms)
+    elif source == "paper":
+        rows, rejected = load_paper_examples(settings, as_of_ms)
+    else:
+        raise ValueError("source must be backtest or paper")
+    if len(rows) < min_rows or not should_retrain(previous_count, len(rows), min_new):
+        return {"status": "insufficient_new_verified_data", "usable": len(rows),
+                "rejections": rejected, "approved": False}
+    start = rows[int(len(rows) * .6)].decision_ms
+    end = rows[int(len(rows) * .8)].decision_ms
+    train, validation, shadow = chronological(rows, start, end, embargo_ms)
+    if len(train) < 100 or len(validation) < 30 or len(shadow) < 30:
+        return {"status": "insufficient_purged_splits", "usable": len(rows),
+                "rejections": rejected, "approved": False}
+    model = fit(train)
+    candidate_id, metrics = store_shadow(settings, model, train, validation, shadow)
+    return {"status": "shadow_registered", "candidate_id": candidate_id,
+            "version": model.version, "metrics": metrics, "usable": len(rows),
+            "rejections": rejected, "approved": False}
