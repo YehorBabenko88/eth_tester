@@ -26,11 +26,15 @@ jobs:
       - run: python -m pytest -q -m "not postgres"
         if: always()
   postgres-integration:
-    name: real PostgreSQL 17 integration
+    name: real PostgreSQL ${{ matrix.postgres }} integration
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['17', '18']
     services:
       postgres:
-        image: postgres:17
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -49,3 +53,4 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest -q -m postgres tests/integration
+      - run: python -m pytest -q tests/test_storage_postgres.py
