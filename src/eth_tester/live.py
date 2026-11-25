@@ -3,6 +3,7 @@ from datetime import datetime,timezone
 from decimal import Decimal
 import json
 import random
+import time
 from hashlib import sha256
 from uuid import uuid4
 import websockets
@@ -36,6 +37,111 @@ def validate_book_sequence(previous_seq, previous_update, payload):
 
 def stamp_ms(value):
     return datetime.fromtimestamp(int(value)/1000,timezone.utc)
+
+
+_SOURCE_LOCK_PREFIX = "eth_paper_admission_source:"
+
+
+def lock_admission_source(conn, symbol):
+    """Serialize DB-visible WS outages with B/E same-transaction paper gate.
+
+    Acquire FIRST in a source status/gap transaction. Never hold across network,
+    file IO or asyncio sleep. This does not prove an OS-level disconnect was
+    recorded before its real time; only committed DB transitions are fenced.
+    """
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                 (_SOURCE_LOCK_PREFIX + symbol,))
+
+
+def reconcile_unclean_ws_start(conn, symbol, last_trade=None):
+    """Recover a crash while the last DB connection still said 'connected'.
+
+    A healthy restart cannot silently reuse a previous session as current
+    market connectivity. Persist an unresolved tick gap and a bounded L2 gap
+    before any new 'connected' row can become visible to paper admission.
+    Returns the current open publicTrade gap ID, if any.
+    """
+    lock_admission_source(conn, symbol)
+    previous = conn.execute(
+        """SELECT ts,status FROM feed_health WHERE symbol=%s
+           AND topic='connection' ORDER BY ts DESC LIMIT 1""",
+        (symbol,)).fetchone()
+    pending = conn.execute(
+        """SELECT id FROM data_gaps WHERE symbol=%s
+           AND source='publicTrade' AND end_ts IS NULL
+           AND resolved_at IS NULL ORDER BY id DESC LIMIT 1""",
+        (symbol,)).fetchone()
+    pending_id = pending["id"] if pending else None
+    if not previous or previous["status"] != "connected":
+        return pending_id
+    now = conn.execute(
+        "SELECT clock_timestamp() AS ts").fetchone()["ts"]
+    detail = {
+        "reason": "unclean_process_restart_or_missing_disconnect_receipt",
+        "source_quality": "gap", "ml_eligible": False,
+    }
+    conn.execute(
+        """INSERT INTO feed_health(symbol,topic,ts,status,detail)
+           VALUES(%s,'connection',clock_timestamp(),
+                  'disconnected',%s::jsonb)""",
+        (symbol, json.dumps(detail)))
+    if pending_id is None:
+        stamp = last_trade or previous["ts"]
+        gap = conn.execute(
+            """INSERT INTO data_gaps(source,symbol,start_ts,explanation)
+               VALUES('publicTrade',%s,%s,%s) RETURNING id""",
+            (symbol, stamp, "unclean websocket exit; trade IDs unknown")
+        ).fetchone()
+        pending_id = gap["id"]
+    last_book = conn.execute(
+        """SELECT max(recv_ts) AS ts FROM book_events WHERE symbol=%s""",
+        (symbol,)).fetchone()
+    if last_book and last_book["ts"] and last_book["ts"] < now:
+        record_gap(
+            conn, symbol, "orderbook",
+            int(last_book["ts"].timestamp()*1000),
+            int(now.timestamp()*1000),
+            "Unclean WS exit; lost L2 deltas cannot be reconstructed")
+    return pending_id
+
+
+async def await_ws_subscription(ws, topics, *, timeout_seconds=10):
+    """A TCP socket is not a verified Bybit market subscription."""
+    try:
+        raw = await asyncio.wait_for(ws.recv(), timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError("Bybit subscription ACK timed out") from exc
+    try:
+        acknowledgment = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise DataIntegrityError("Malformed Bybit subscription ACK") from exc
+    if (not isinstance(acknowledgment, dict)
+            or acknowledgment.get("op") != "subscribe"
+            or acknowledgment.get("success") is not True):
+        raise DataIntegrityError("Bybit subscription not acknowledged")
+    returned = acknowledgment.get("args")
+    if returned is not None and (
+            not isinstance(returned, list)
+            or set(returned) != set(topics)):
+        raise DataIntegrityError("Bybit subscription topics mismatch")
+    return acknowledgment
+
+
+async def next_ws_payload(ws, *, idle_seconds=30):
+    """Force reconnect on a half-open socket with no market event activity."""
+    try:
+        raw = await asyncio.wait_for(ws.recv(), timeout=idle_seconds)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(
+            f"WebSocket half-open or idle: {idle_seconds}s without market frames"
+        ) from exc
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise DataIntegrityError("Malformed WebSocket JSON") from exc
+    if not isinstance(payload, dict):
+        raise DataIntegrityError("Non-object Bybit websocket message")
+    return payload
 
 
 def _record_ws_trade_receipts(conn, symbol, session_id, trade_ids):
@@ -201,7 +307,54 @@ def ingest_ws(conn,symbol,payload,*,session_id=None):
                Decimal(row['v']),json.dumps(row)))
 
 
+def persist_ws_disconnect(conn, symbol, session_id, reason, *,
+                          pending_id=None, last_trade=None, connected_at=None,
+                          last_book_ts=None):
+    """One atomic disconnect status + publicTrade/L2 gap under E/B source fence."""
+    lock_admission_source(conn, symbol)
+    conn.execute(
+        """INSERT INTO feed_health(symbol,topic,ts,status,detail)
+           VALUES(%s,'connection',clock_timestamp(),'disconnected',%s::jsonb)""",
+        (symbol, json.dumps({
+            "reason": str(reason)[:400], "session_id": session_id,
+            "source_quality": "gap", "ml_eligible": False})))
+    if pending_id is None:
+        existing=conn.execute(
+            """SELECT id FROM data_gaps WHERE symbol=%s
+               AND source='publicTrade' AND end_ts IS NULL
+               AND resolved_at IS NULL ORDER BY id DESC LIMIT 1""",
+            (symbol,)).fetchone()
+        if existing:
+            pending_id=existing["id"]
+        else:
+            opened_at = last_trade or connected_at
+            if opened_at is None:
+                opened_at = conn.execute(
+                    "SELECT clock_timestamp() AS ts").fetchone()["ts"]
+            recorded = conn.execute(
+                """INSERT INTO data_gaps(source,symbol,start_ts,explanation)
+                   VALUES('publicTrade',%s,%s,'websocket interrupted')
+                   RETURNING id""",
+                (symbol, opened_at)).fetchone()
+            pending_id = recorded["id"]
+    if last_book_ts is not None:
+        ended = conn.execute(
+            "SELECT clock_timestamp() AS ts").fetchone()["ts"]
+        if ended > last_book_ts:
+            record_gap(
+                conn, symbol, "orderbook",
+                int(last_book_ts.timestamp()*1000),
+                int(ended.timestamp()*1000),
+                "WebSocket L2 delta loss; snapshot does not restore history")
+    return pending_id
+
+
 async def live_feed(settings):
+    """Observe actual public market data forever, fail closed across outages.
+
+    Source connection/gap mutations take the B/E paper-admission DB fence.
+    Network operations, websocket ACK and sleep NEVER hold database locks.
+    """
     if settings.book_depth not in (1,50,200,1000):
         raise ValueError("Unsupported orderbook depth")
     topics=[f"publicTrade.{settings.symbol}",
@@ -209,24 +362,29 @@ async def live_feed(settings):
             f"tickers.{settings.symbol}",f"allLiquidation.{settings.symbol}"]
     attempt=0
     with connection(settings) as conn:
-        last=conn.execute("SELECT ts FROM trades WHERE symbol=%s AND source='websocket' ORDER BY ts DESC LIMIT 1",(settings.symbol,)).fetchone()
-        pending=conn.execute("SELECT id FROM data_gaps WHERE symbol=%s AND source='publicTrade' AND end_ts IS NULL ORDER BY id DESC LIMIT 1",(settings.symbol,)).fetchone()
-    last_trade=last['ts'] if last else None
-    pending_id=pending['id'] if pending else None
+        last=conn.execute(
+            """SELECT ts FROM trades WHERE symbol=%s AND source='websocket'
+               ORDER BY ts DESC LIMIT 1""",
+            (settings.symbol,)).fetchone()
+        last_trade=last["ts"] if last else None
+        pending_id=reconcile_unclean_ws_start(
+            conn, settings.symbol, last_trade=last_trade)
     last_book_ts=None
     while True:
         connected_at=datetime.now(timezone.utc)
+        attempt_started=time.monotonic()
         session_id=uuid4().hex
         try:
-            async with websockets.connect(settings.bybit_ws,ping_interval=20,ping_timeout=15,
-                                          max_size=8*1024*1024) as ws:
+            async with websockets.connect(
+                    settings.bybit_ws, ping_interval=20, ping_timeout=15,
+                    open_timeout=10, close_timeout=5, max_size=8*1024*1024,
+                    max_queue=32) as ws:
                 await ws.send(json.dumps({"op":"subscribe","args":topics}))
-                attempt=0
-                book_ready=False
-                book_seq=None
-                book_update=None
-                book_snapshot_id=None
+                await await_ws_subscription(ws, topics)
+                # Only an actual acknowledged subscription is 'connected'.
                 with connection(settings) as conn:
+                    pending_id=reconcile_unclean_ws_start(
+                        conn, settings.symbol, last_trade=last_trade)
                     conn.execute("""INSERT INTO feed_health(
                       symbol,topic,ts,status,detail)
                       VALUES(%s,'connection',clock_timestamp(),
@@ -236,77 +394,116 @@ async def live_feed(settings):
                           "orderbook_depth":settings.book_depth,
                           "source_quality":"observed_partial",
                           "ml_eligible":False})))
-                async for raw in ws:
-                    payload=json.loads(raw)
+                book_ready=False
+                book_seq=None
+                book_update=None
+                book_snapshot_id=None
+                while True:
+                    payload=await next_ws_payload(ws)
                     if payload.get("op")=="subscribe" and not payload.get("success"):
-                        raise RuntimeError("WS subscription rejected")
+                        raise DataIntegrityError("WebSocket subscription revoked")
                     topic=payload.get("topic","")
                     if topic.startswith("orderbook."):
                         if payload.get("type")=="snapshot":
                             book_ready=True
                         elif not book_ready:
                             raise DataIntegrityError("Orderbook delta before snapshot")
-                        book_seq, book_update = validate_book_sequence(
+                        book_seq,book_update=validate_book_sequence(
                             book_seq, book_update, payload)
-                        last_book_ts = (stamp_ms(payload["ts"])
-                                        if payload.get("ts")
-                                        else datetime.now(timezone.utc))
-                    if topic.startswith(("publicTrade.","orderbook.","tickers.","allLiquidation.")):
+                        new_book_ts=(stamp_ms(payload["ts"])
+                                     if payload.get("ts")
+                                     else datetime.now(timezone.utc))
+                    else:
+                        new_book_ts=None
+                    if topic.startswith(("publicTrade.","orderbook.",
+                                         "tickers.","allLiquidation.")):
+                        new_pending_id=pending_id
+                        new_last_trade=last_trade
                         with connection(settings) as conn:
-                            event_id = ingest_ws(
-                                conn,settings.symbol,payload,session_id=session_id)
+                            # A source event can close an earlier *open-ended*
+                            # gap only as a bounded interval; it never sets
+                            # resolved_at or declares lost exchange IDs found.
+                            if topic.startswith("publicTrade.") and payload.get("data"):
+                                stamps=[stamp_ms(x["T"]) for x in payload["data"]]
+                                latest=max(stamps)
+                                unseen=[stamp for stamp in stamps
+                                        if last_trade is None or stamp > last_trade]
+                                if pending_id and unseen:
+                                    lock_admission_source(conn, settings.symbol)
+                                event_id=ingest_ws(
+                                    conn,settings.symbol,payload,session_id=session_id)
+                                if pending_id and unseen:
+                                    conn.execute(
+                                        """UPDATE data_gaps SET end_ts=%s
+                                           WHERE id=%s AND end_ts IS NULL
+                                             AND resolved_at IS NULL""",
+                                        (min(unseen),pending_id))
+                                    new_pending_id=None
+                                new_last_trade=(max(last_trade,latest)
+                                                if last_trade else latest)
+                            else:
+                                event_id=ingest_ws(
+                                    conn,settings.symbol,payload,session_id=session_id)
                             if topic.startswith("orderbook."):
-                                if payload.get("type") == "snapshot":
-                                    book_snapshot_id = event_id
+                                if payload.get("type")=="snapshot":
+                                    book_snapshot_id=event_id
                                 if event_id is None or book_snapshot_id is None:
                                     raise DataIntegrityError("L2 source event ID missing")
                                 _record_ws_book_lineage(
                                     conn,settings.symbol,session_id,
                                     book_snapshot_id,event_id)
-                            if topic.startswith('publicTrade.') and payload.get('data'):
-                                stamps=[stamp_ms(x['T']) for x in payload['data']]
-                                first=min(stamps)
-                                latest=max(stamps)
-                                unseen = [stamp for stamp in stamps
-                                          if last_trade is None or stamp > last_trade]
-                                if pending_id and unseen:
-                                    conn.execute(
-                                        'UPDATE data_gaps SET end_ts=%s WHERE id=%s AND end_ts IS NULL',
-                                        (min(unseen),pending_id))
-                                    pending_id=None
-                                last_trade=max(last_trade,latest) if last_trade else latest
-                raise ConnectionError("WebSocket stream closed without an exception")
+                        # Update in-memory checkpoint ONLY after SQL COMMIT.
+                        pending_id=new_pending_id
+                        last_trade=new_last_trade
+                        if new_book_ts is not None:
+                            last_book_ts=new_book_ts
+        except asyncio.CancelledError:
+            # Stop/shutdown is not an exchange data-completeness certificate.
+            # Persist the interrupted source before leaving whenever the DB
+            # is reachable; startup repair handles a power loss during this.
+            try:
+                with connection(settings) as conn:
+                    persist_ws_disconnect(
+                        conn, settings.symbol, session_id, "worker_cancelled",
+                        pending_id=pending_id, last_trade=last_trade,
+                        connected_at=connected_at,
+                        last_book_ts=last_book_ts)
+            except Exception as log_error:
+                print(f"Failed to persist shutdown gap: {log_error}",flush=True)
+            raise
         except Exception as exc:
             try:
                 with connection(settings) as conn:
-                    conn.execute("""INSERT INTO feed_health(
-                        symbol,topic,ts,status,detail)
-                        VALUES(%s,'connection',clock_timestamp(),
-                               'disconnected',%s::jsonb)""",
-                        (settings.symbol,json.dumps({
-                            "reason":str(exc)[:400],
-                            "session_id":session_id,
-                            "source_quality":"gap",
-                            "ml_eligible":False})))
-                    if pending_id is None:
-                        start_gap=last_trade or connected_at
-                        item=conn.execute("INSERT INTO data_gaps(source,symbol,start_ts,explanation) VALUES('publicTrade',%s,%s,'websocket interrupted') RETURNING id",
-                                          (settings.symbol,start_gap)).fetchone()
-                        pending_id=item['id']
-                    if last_book_ts is not None:
-                        outage_end=datetime.now(timezone.utc)
-                        if outage_end > last_book_ts:
-                            record_gap(
-                                conn, settings.symbol, "orderbook",
-                                int(last_book_ts.timestamp()*1000),
-                                int(outage_end.timestamp()*1000),
-                                "WebSocket L2 deltas lost; snapshot cannot restore "
-                                "intermediate add/cancel events")
-                        last_book_ts=None
+                    next_pending=persist_ws_disconnect(
+                        conn, settings.symbol, session_id, exc,
+                        pending_id=pending_id, last_trade=last_trade,
+                        connected_at=connected_at, last_book_ts=last_book_ts)
+                # Advance in-memory state ONLY after the disconnect transaction
+                # has successfully COMMITTED.
+                pending_id=next_pending
+                last_book_ts=None
             except Exception as log_error:
-                print(f'Failed to persist outage: {log_error}',flush=True)
+                print(f"Failed to persist outage: {log_error}",flush=True)
+                # A failed COMMIT must not fabricate an open gap ID or a
+                # connected receipt. Next successful connection rechecks the
+                # previous persisted state before marking its new session.
+                try:
+                    with connection(settings) as conn:
+                        lock_admission_source(conn,settings.symbol)
+                        pending=conn.execute(
+                            """SELECT id FROM data_gaps WHERE symbol=%s
+                               AND source='publicTrade' AND end_ts IS NULL
+                               AND resolved_at IS NULL
+                               ORDER BY id DESC LIMIT 1""",
+                            (settings.symbol,)).fetchone()
+                        pending_id=pending["id"] if pending else None
+                except Exception:
+                    pass
+            if time.monotonic()-attempt_started >= 60:
+                attempt=0
             attempt+=1
-            await asyncio.sleep(min(120,2**min(7,attempt))+random.uniform(0,2))
+            await asyncio.sleep(min(120,2**min(7,attempt))+
+                                random.uniform(0,2))
 
 
 async def reconcile_rest_cycle(settings, client):

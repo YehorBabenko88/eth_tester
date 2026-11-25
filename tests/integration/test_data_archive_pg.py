@@ -694,3 +694,74 @@ def test_old_complete_archive_404_cannot_erase_source_sha(data_settings):
         assert conn.execute("""SELECT count(*) AS n FROM
             archive_source_price_bins WHERE archive_day=%s""",
             (day,)).fetchone()["n"] == 0
+
+
+def test_round9_pg_unclean_process_restart_serializes_real_source_gap(data_settings):
+    """Two DB clients: A outage writer owns exact E/B admission lock.
+
+    Only disposable test DB, no exchange API or real orders. The pending gap is
+    deliberately unresolved and the original trade-ID timeline not fabricated.
+    """
+    from psycopg.rows import dict_row
+    from eth_tester.live import reconcile_unclean_ws_start
+
+    lock_key = "eth_paper_admission_source:ETHUSDT"
+    with connection(data_settings) as conn:
+        conn.execute("""INSERT INTO feed_health(symbol,topic,status,detail)
+            VALUES('ETHUSDT','connection','connected',
+                   '{"session_id":"crashed","ml_eligible":false}'::jsonb)""")
+    with connection(data_settings) as writer:
+        pending = reconcile_unclean_ws_start(writer, "ETHUSDT")
+        assert pending is not None
+        with psycopg.connect(
+                data_settings.database_url, row_factory=dict_row) as reader:
+            reader.execute("SET search_path TO public")
+            blocked = reader.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS acquired",
+                (lock_key,)).fetchone()
+            assert blocked["acquired"] is False
+            # Transaction snapshot under default READ COMMITTED cannot see the
+            # uncommitted A disconnected state or its new unresolved gap.
+            assert reader.execute("""SELECT count(*) AS n FROM feed_health
+                WHERE symbol='ETHUSDT' AND topic='connection'
+                AND status='disconnected'""").fetchone()["n"] == 0
+        # writer's context commits while preserving the session fence.
+    with connection(data_settings) as reader:
+        assert reader.execute(
+            "SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS acquired",
+            (lock_key,)).fetchone()["acquired"] is True
+        state = reader.execute("""SELECT status FROM feed_health WHERE
+            symbol='ETHUSDT' AND topic='connection'
+            ORDER BY ts DESC LIMIT 1""").fetchone()
+        assert state["status"] == "disconnected"
+        original_gap = reader.execute("""SELECT id,source,start_ts,end_ts,resolved_at
+            FROM data_gaps WHERE symbol='ETHUSDT' AND source='publicTrade'
+            ORDER BY id DESC LIMIT 1""").fetchone()
+        assert original_gap["id"] == pending
+        assert original_gap["end_ts"] is None
+        assert original_gap["resolved_at"] is None
+
+
+def test_round9_pg_shutdown_outage_atomic_source_fence(data_settings):
+    """An A orderly cancel also records source loss under the exact B/E fence."""
+    from psycopg.rows import dict_row
+    from eth_tester.live import persist_ws_disconnect
+
+    stamp = datetime.now(UTC) - timedelta(seconds=5)
+    lock_key = "eth_paper_admission_source:ETHUSDT"
+    with connection(data_settings) as writer:
+        new_gap = persist_ws_disconnect(
+            writer, "ETHUSDT", "test-shutdown", "worker_cancelled",
+            last_trade=stamp, connected_at=stamp-timedelta(minutes=1))
+        with psycopg.connect(
+                data_settings.database_url, row_factory=dict_row) as reader:
+            assert reader.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS acquired",
+                (lock_key,)).fetchone()["acquired"] is False
+    with connection(data_settings) as conn:
+        assert conn.execute("""SELECT count(*) AS n FROM feed_health
+            WHERE symbol='ETHUSDT' AND topic='connection'
+              AND status='disconnected'""").fetchone()["n"] == 1
+        row = conn.execute("""SELECT end_ts,resolved_at FROM data_gaps
+            WHERE id=%s""", (new_gap,)).fetchone()
+        assert row["end_ts"] is None and row["resolved_at"] is None

@@ -39,6 +39,13 @@ def latest_closed(tf, now):
 
 
 def record_gap(conn, symbol, source, start, end, reason):
+    # Share B/E admission source fence only for public WS identity/L2 outages.
+    # Historical REST gap bookkeeping is independent and never becomes paper
+    # evidence merely by sharing a transaction.
+    if source in ("publicTrade", "orderbook"):
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            ("eth_paper_admission_source:" + symbol,))
     exists = conn.execute(
         """SELECT id FROM data_gaps WHERE source=%s AND symbol=%s
            AND start_ts=%s AND end_ts=%s AND resolved_at IS NULL LIMIT 1""",
