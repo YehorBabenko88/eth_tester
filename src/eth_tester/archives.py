@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+from shutil import disk_usage
 import httpx
 from .database import connection
 
@@ -41,6 +42,9 @@ async def download_archive(settings,day,client):
           VALUES('trades_archive',%s,%s,'running',1)
           ON CONFLICT(source,symbol,day) DO UPDATE SET
           state='running',attempts=ingestion_job.attempts+1,updated_at=now()""",(symbol,day))
+    free=disk_usage(tempfile.gettempdir()).free
+    if free < settings.minimum_free_gb*1024**3:
+        raise RuntimeError(f"Disk space too low: {free/1024**3:.1f} GiB")
     with tempfile.TemporaryDirectory() as directory:
         path=Path(directory)/"trades.csv.gz"
         checksum=hashlib.sha256()
@@ -59,21 +63,26 @@ async def download_archive(settings,day,client):
                     checksum.update(chunk)
                     writer.write(chunk)
         count=0
+        # Atomic COPY staging: never mark partial or damaged gzip archive complete.
         with connection(settings) as conn:
-            with gzip.open(path,"rt",newline="",encoding="utf-8-sig") as file:
-                for row in csv.DictReader(file):
-                    stamp,identifier,price,qty,side=parse_trade(row)
-                    if stamp.date()!=day:
-                        raise ValueError(f"Archive UTC day mismatch {stamp} {day}")
-                    conn.execute("""INSERT INTO trades(symbol,ts,trade_id,price,qty,side,notional,source,raw)
-                       VALUES(%s,%s,%s,%s,%s,%s,%s,'archive',%s::jsonb)
-                       ON CONFLICT(symbol,ts,trade_id) DO NOTHING""",
-                       (symbol,stamp,identifier,price,qty,side,price*qty,json.dumps(row)))
-                    count+=1
+            with conn.cursor() as cur:
+                cur.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+                with cur.copy("COPY eth_stage (symbol,ts,trade_id,price,qty,side,notional,source,raw) FROM STDIN") as writer:
+                    with gzip.open(path,"rt",newline="",encoding="utf-8-sig") as file:
+                        for row in csv.DictReader(file):
+                            stamp,identifier,price,qty,side=parse_trade(row)
+                            if stamp.date()!=day:
+                                raise ValueError(f"Archive UTC day mismatch {stamp} {day}")
+                            writer.write_row((symbol,stamp,identifier,price,qty,side,price*qty,
+                                              "archive",json.dumps(row)))
+                            count+=1
+                cur.execute("""INSERT INTO trades(symbol,ts,trade_id,price,qty,side,notional,source,raw)
+                    SELECT symbol,ts,trade_id,price,qty,side,notional,source,raw FROM eth_stage
+                    ON CONFLICT(symbol,ts,trade_id) DO NOTHING""")
             conn.execute("""UPDATE ingestion_job SET state='complete',bytes_downloaded=%s,
-             row_count=%s,sha256=%s,error=NULL,updated_at=now()
-             WHERE source='trades_archive' AND symbol=%s AND day=%s""",
-             (size,count,checksum.hexdigest(),symbol,day))
+              row_count=%s,sha256=%s,error=NULL,updated_at=now()
+              WHERE source='trades_archive' AND symbol=%s AND day=%s""",
+              (size,count,checksum.hexdigest(),symbol,day))
     return "complete"
 
 async def backfill_archives(settings):
