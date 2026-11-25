@@ -9,7 +9,7 @@ from .strategy import price_signal
 from .orderflow import confirm_rejection
 from .simulation.crossing import resolve_first_crossing
 
-def estimated_funding(conn,settings,opened,observed,qty,entry,direction):
+def estimated_funding(conn,settings,opened,observed,qty,entry,direction,*,with_events=False):
     """Never synthesize funding from entry price: require event-time mark evidence.
 
     Historical funding chronology may still be incomplete: a returned 'marked'
@@ -23,10 +23,12 @@ def estimated_funding(conn,settings,opened,observed,qty,entry,direction):
       FROM funding f WHERE f.symbol=%s AND f.ts>%s AND f.ts<=%s
       ORDER BY f.ts""",(settings.symbol,opened,observed)).fetchall()
     if not rows or any(row["mark_price"] is None for row in rows):
-        return Decimal(0),"unverified"
+        return (Decimal(0),"unverified",[]) if with_events else (Decimal(0),"unverified")
     sign=Decimal(1) if direction=="long" else Decimal(-1)
-    return (sign*sum((Decimal(qty)*Decimal(row["mark_price"])*Decimal(row["rate"])
-                      for row in rows),Decimal(0)),"marked_not_completeness_proven")
+    amount=sign*sum((Decimal(qty)*Decimal(row["mark_price"])*Decimal(row["rate"])
+                     for row in rows),Decimal(0))
+    return (amount,"marked_not_completeness_proven",rows) if with_events else (
+        amount,"marked_not_completeness_proven")
 
 def engine_tick(settings):
     now=datetime.now(timezone.utc)
@@ -64,9 +66,9 @@ def engine_tick(settings):
             reason=crossing["reason"]
             if crossing["ambiguous_same_timestamp"]:
                 reason+="_same_timestamp_ambiguous_stop_first"
-            funding,funding_quality=estimated_funding(
+            funding,funding_quality,funding_evidence=estimated_funding(
                 conn,settings,trade["opened_at"],recent["ts"],
-                trade["qty"],trade["entry"],trade["direction"])
+                trade["qty"],trade["entry"],trade["direction"],with_events=True)
             if funding_quality!="marked_not_completeness_proven":
                 reason+="_funding_unverified"
         else:
@@ -107,7 +109,8 @@ def engine_tick(settings):
             if abs(Decimal(recent["price"])/Decimal(bars[-1]["close"])-1)>Decimal("0.005"):
                 return "signal_expired_price_gap"
     if trade:
-        identifier=close_paper(settings,recent["price"],reason,funding,recent["ts"],trade["id"])
+        identifier=close_paper(settings,recent["price"],reason,funding,recent["ts"],trade["id"],
+                               funding_evidence=funding_evidence)
         if identifier:
             try:
                 from .charts import render_trade
