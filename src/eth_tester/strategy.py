@@ -79,6 +79,57 @@ def calibrated_expectancy(direction, price, stop, take, fee, slip, probability_l
         return None
 
 
+def certified_expectancy(signal, certificate, *, decision_at, entry_price,
+                          fee, slip):
+    """Consume a pinned, historical F certificate only when available as-of.
+
+    This validates the evidence envelope, not the underlying holdout itself.
+    The producer must verify immutable source checksum and publication time.
+    """
+    try:
+        if not isinstance(certificate, dict) or decision_at.tzinfo is None:
+            return None
+        if certificate["strategy_version"] != signal.reason["strategy_version"]:
+            return None
+        if (certificate["paper_only"] is not True
+                or certificate["independent_trades_assumed"] is not True
+                or certificate["method"] != "one_sided_wilson_95_iid_assumption"
+                or certificate["selection"] !=
+                "frozen_model_nonuncertain_positive_predicted_net"):
+            return None
+        model_version = certificate["model_version"]
+        checksum = certificate["selected_evidence_sha256"]
+        if (not isinstance(model_version, str) or not model_version
+                or not isinstance(checksum, str) or len(checksum) != 64
+                or any(char not in "0123456789abcdef" for char in checksum)):
+            return None
+        trials, wins = certificate["observations"], certificate["net_wins"]
+        if (type(trials) is not int or type(wins) is not int
+                or trials < 30 or not 0 <= wins <= trials):
+            return None
+        start_ms = certificate["holdout_start_ms"]
+        end_ms = certificate["holdout_end_ms"]
+        issued_ms = certificate["issued_at_ms"]
+        if any(type(value) is not int for value in (start_ms, end_ms, issued_ms)):
+            return None
+        decision_ms = int(decision_at.timestamp() * 1000)
+        if not 0 <= start_ms <= end_ms <= issued_ms <= decision_ms:
+            return None
+        economics_result = calibrated_expectancy(
+            signal.direction, entry_price, signal.stop, signal.take,
+            fee, slip, certificate["probability_lower"])
+        if economics_result is None:
+            return None
+        return {**economics_result, "certificate_model_version": model_version,
+                "certificate_evidence_sha256": checksum,
+                "certificate_issued_at_ms": issued_ms,
+                "certificate_method": certificate["method"],
+                "iid_assumption_not_verified": True}
+    except (AttributeError, KeyError, InvalidOperation, OverflowError,
+            TypeError, ValueError):
+        return None
+
+
 def price_signal(closed_candles,fee_rate=D("0.00055"),slip_bps=D("2"),
                  max_lookback=180,*,volume_profiles=()):
     params=Parameters()
