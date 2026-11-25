@@ -175,4 +175,8 @@ async def live_rest_reconcile(settings):
             await asyncio.sleep(120)
 
 async def run_live(settings):
-    await asyncio.gather(live_feed(settings),live_rest_reconcile(settings))
+    # Keep WS ingestion independent from slow historical REST backfills.
+    from .recent_recovery import run_recent_recovery
+    await asyncio.gather(
+        live_feed(settings), live_rest_reconcile(settings),
+        run_recent_recovery(settings))
