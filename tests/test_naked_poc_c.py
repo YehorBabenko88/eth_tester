@@ -36,5 +36,5 @@ def test_nearest_naked_poc_is_price_distance():
     book=NakedPOCBook()
     for price in (90,110,120):
         book.register("D",t,price,available_at=t+timedelta(days=1),
-                      quality="verified")
+                      observed_at=t+timedelta(days=1),quality="verified")
     assert [x["state"].price for x in book.nearest("D",100,limit=2)]==[90,110]
