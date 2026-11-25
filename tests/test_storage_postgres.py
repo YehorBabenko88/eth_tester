@@ -301,15 +301,18 @@ def test_verified_backup_restore_and_scoped_delete(postgres_lab, tmp_path):
             assert conn.execute(
                 "SELECT count(*) FROM trades WHERE trade_id LIKE 'BPG-%'"
             ).fetchone()[0] == 2
-        manifest = deletion_manifest(restored, archive)
+        restored_backup = Path(tmp_path) / "restored-owned.dump"
+        backup_database(restored, restored_backup)
+        restored_sha = backup_sha256(restored_backup)
+        manifest = deletion_manifest(restored, restored_backup)
         with pytest.raises(ValueError):
             drop_owned_database(
-                restored, confirmation="wrong", backup_path=archive,
-                backup_sha=checksum, expected_database_oid=manifest["database_oid"],
+                restored, confirmation="wrong", backup_path=restored_backup,
+                backup_sha=restored_sha, expected_database_oid=manifest["database_oid"],
             )
         assert drop_owned_database(
             restored, confirmation=manifest["confirmation_phrase"],
-            backup_path=archive, backup_sha=checksum,
+            backup_path=restored_backup, backup_sha=restored_sha,
             expected_database_oid=manifest["database_oid"],
         ) == restored_name
     finally:
