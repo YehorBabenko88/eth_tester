@@ -4,6 +4,9 @@ Each day's contribution is stored separately so calendar-week/month price bins
 can be rebuilt without double-counting previously imported archive days.
 """
 from datetime import datetime, timedelta, timezone
+import json
+
+from .analytics_core import value_profile
 
 from .database import connection
 
@@ -109,6 +112,44 @@ def rollup_day(settings, day, tf, digest):
                 quality=EXCLUDED.quality""",
                 (settings.symbol, tf, affected, settings.symbol, tf, affected,
                  settings.symbol, tf))
+        if affected:
+            # One ordered query per changed day/frame, not one query per price.
+            price_rows = conn.execute("""SELECT bucket,price,buy_qty,sell_qty
+                FROM footprint WHERE symbol=%s AND tf=%s
+                  AND bucket=ANY(%s::timestamptz[])
+                ORDER BY bucket,price""",
+                (settings.symbol, tf, affected)).fetchall()
+            profiles = {}
+            for row in price_rows:
+                histogram = profiles.setdefault(row["bucket"], {})
+                histogram[row["price"]] = row["buy_qty"] + row["sell_qty"]
+            for stamp, histogram in profiles.items():
+                profile = value_profile(histogram)
+                payload = json.dumps({
+                    "vpoc": str(profile["vpoc"]),
+                    "vah": str(profile["vah"]), "val": str(profile["val"]),
+                    "hvn": [str(p) for p in profile["hvn"]],
+                    "lvn": [str(p) for p in profile["lvn"]],
+                    "value_area_fraction": "0.70",
+                    "profile_coverage": "archive_days_observed_not_verified",
+                    "profile_method": "contiguous_volume_expansion"})
+                conn.execute("""UPDATE features
+                    SET metadata=features.metadata || %s::jsonb
+                    WHERE symbol=%s AND tf=%s AND ts=%s""",
+                    (payload, settings.symbol, tf, stamp))
+            # Historical corrections invalidate previously accumulated CVD.
+            # Roll the checkpoint back to the last bucket before the change.
+            predecessor = conn.execute("""SELECT ts FROM features
+                WHERE symbol=%s AND tf=%s AND ts<%s
+                ORDER BY ts DESC LIMIT 1""",
+                (settings.symbol, tf, affected[0])).fetchone()
+            conn.execute("""UPDATE analytics_cursor SET
+                cursor_ts=%s,state='dirty',quality='recompute_required',
+                updated_at=now()
+                WHERE processor='cvd' AND symbol=%s AND tf=%s
+                  AND cursor_ts>=%s""",
+                (predecessor["ts"] if predecessor else None,
+                 settings.symbol, tf, affected[0]))
         conn.execute("""INSERT INTO aggregation_job(symbol,tf,day,archive_sha256,rows)
             VALUES(%s,%s,%s,%s,%s)
             ON CONFLICT(symbol,tf,day) DO UPDATE SET
