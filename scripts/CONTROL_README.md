@@ -231,3 +231,55 @@ The owner-only Telegram `/trade ID` read now includes the persisted `funding_ver
 B's current R14 owner batch makes **no schema change**, so G does not create a competing outbox schema. An eventual B/G protocol needs owner identity + immutable `event_key` UNIQUE, payload checksum and redaction, monotonic `pending/leased/sent` states, bounded delivery TTL, lease timeout, retry/backoff, explicit Telegram response persistence, and protected retention. Crash after the HTTP send but before database ACK means **at-least-once**, never exactly-once. Commands received while the bot is offline may be lost because the current Telegram polling intentionally uses `drop_pending_updates=True`; replaying stale `startsim` is unsafe. Do not call existing live owner alerts durable or guaranteed delivered.
 
 Automatic cleanup and Telegram remote deletion remain disabled. No native Windows, real PG17/18, real Telegram, 24h service, or exchange delivery was accepted in this G round. G isolated source-matched 115 PASS / 3 native Windows SKIP and compileall PASS; exact downstream GitHub CI must be checked separately.
+
+## Round 15 G — bounded prospective research in Telegram, not certified OOS
+
+The owner-only `/research` view now displays the **actual E per-closed-minute
+research observations** from `strategy_signals`, `tf='1'` and the exact
+`eth_observed_minute_shadow_v1` version for one bounded rolling UTC 24-hour
+window. There are 1,440 expected closed minutes, counted independently of
+whether the paper engine found a candidate, had an open position or was paused.
+Stored observations are separated into four disjoint outcomes:
+- actual model no-trade/no-signal diagnostics *with recognized fail-closed D
+  reasons*, still **unverified source**;
+- hypothetical research candidates, **not actual entries**;
+- E-recorded unavailable data/research;
+- invalid/noncanonical evidence, never silently counted as no-trade.
+
+A fifth category is **missing observations**, derived from expected closed
+minutes minus actual unique saved minutes. These are not no-signal controls:
+loss of the engine, database, source, or historical replay can leave gaps.
+Display is based on a single parameterized SELECT with symbol, version, UTC
+time, and E's explicit `ml_eligible=false`,
+`research_cohort_complete=false`,
+`prospective_source_certified=false`,
+`source_identity_authoritative=false` gates.
+This count is an **observational diagnostic**, not independent B exchange
+provenance, certified selection-free research, label maturity, funding accuracy,
+PnL, OOS performance, or authorization to train/promote models.
+
+`/risk` continues to display the persisted position and engine heartbeat
+without modifying them; it explicitly warns that the nominal policy is one
+paper position of USD 1000 and that **E** (not Telegram) owns the reserve,
+admission lock and provisional financial risk policy. Until E's exact R15
+economic contract is committed, **G invents no reserve column or monetary
+certainty**. B's proposed provisional receipt schema cannot certify fees,
+funding or zero-interval schedule by itself. `/stats` and `/trade`
+continue to mark paper economics provisional. Windows chart reader is still
+**OFF by default** pending independent native Windows/LocalService acceptance;
+automatic cleanup and Telegram `/delete` remain disabled.
+
+**Actual local test execution (isolated synthetic / fake SQL adapter):**
+128 PASS, 3 SKIP (the three previous native Windows tests); compileall PASS.
+13 newly added research-test invocations cover missing/observed/no-trade
+separation, malformed/inconsistent envelopes, fail-closed classification,
+24-hour UTC/symbol/version SQL scoping and no DB mutations. Two R11
+regression fixture copies initially failed due to assuming old heartbeat
+`fetchall`; test fixtures were updated to expect the new `fetchone`
+aggregate without weakening fail-closed production behavior.
+Exact local G source/test byte SHA matched the prepared published Git blobs.
+**NOT RUN:** actual PostgreSQL17/18 SQL execution or row-plan, full-repository
+pytest/CI, native Windows Telegram and NTFS operations, sustained worker
+outage/WS gaps, independent F/B source receipt and OOS audit, economic reserve
+runtime acceptance. G does not send real orders, change E paper accounting,
+create ML models or modify the database schema.

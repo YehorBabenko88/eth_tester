@@ -214,7 +214,10 @@ def read_view(settings, name):
                     f"номинал: {positions['notional']}\n"
                     f"Engine/разрыв потока: {_json(engine, 600)}\n"
                     f"Последний paper_trade_review_v1 (НЕ ML): {_json(review, 600)}\n"
-                    "Equity и risk могут зависеть от неподтверждённых funding/mark.\n"
+                    "Политика: не более 1 бумажной позиции номиналом 1000 USD; "
+                    "проверку допуска и резерва делает E, НЕ Telegram.\n"
+                    "Equity и risk предварительные: funding/mark могут быть "
+                    "не подтверждены; статус engine не сертификат расходов.\n"
                     "Реальные ордера запрещены")
         if name == "signals":
             rows = conn.execute("""SELECT bar_ts,tf,decision,version
@@ -231,13 +234,75 @@ def read_view(settings, name):
                           f"{r['created_at']}\n{_json(r['validation'], 300)}"
                           for r in rows) or "нет")
         if name == "research":
-            rows = conn.execute("""SELECT component,status,detail,updated_at
-                FROM bot_heartbeat WHERE component IN
-                ('control_label_horizons','control_train_causal_shadow')
-                ORDER BY component""").fetchall()
-            return "Исследовательская выборка НЕПОЛНАЯ: нет всех no_signal/no_trade bars; это не OOS и не сертификат ML.\n" + (
-                "\n".join(f"{r['component']}: {r['status']} {r['updated_at']} "
-                          f"{_json(r['detail'], 400)}" for r in rows) or "нет")
+            # Existing immutable E per-closed-minute observation key; strictly
+            # observational and UNATTESTED. One bounded 24-hour SELECT, no DB
+            # writes or model qualification. Missing is never "no_signal".
+            row = conn.execute("""WITH boundary AS (
+                  SELECT date_trunc('minute', clock_timestamp()) AS current_minute
+                ), observed AS (
+                  SELECT s.bar_ts, s.decision, s.reason
+                  FROM strategy_signals s CROSS JOIN boundary b
+                  WHERE s.symbol=%s AND s.tf='1'
+                    AND s.version='eth_observed_minute_shadow_v1'
+                    AND s.bar_ts>=b.current_minute - interval '24 hours'
+                    AND s.bar_ts<b.current_minute
+                ), checked AS (
+                  SELECT *,
+                    (reason->>'contract' = 'eth_observed_minute_shadow_v1'
+                     AND reason->>'independent_of_incumbent' = 'true'
+                     AND reason->>'paper_only' = 'true'
+                     AND reason->>'paper_entry_authorized' = 'false'
+                     AND reason->>'ml_eligible' = 'false'
+                     AND reason->>'research_cohort_complete' = 'false'
+                     AND reason->>'prospective_source_certified' = 'false'
+                     AND reason->>'source_identity_authoritative' = 'false'
+                    ) AS valid_envelope
+                  FROM observed
+                )
+                SELECT count(*) AS observed,
+                   count(*) FILTER (WHERE valid_envelope
+                     AND decision='research_no_trade'
+                     AND reason#>>'{shadow,status}'='no_trade'
+                     AND reason#>>'{shadow,reason}' IN
+                       ('no_causal_pattern',
+                        'all_candidates_unconfirmed_or_mtf_conflicted',
+                        'conflicting_shadow_directions',
+                        'candidate_cap_exceeded_no_trade')
+                   ) AS no_trade,
+                   count(*) FILTER (WHERE valid_envelope
+                     AND decision='research_candidates_unverified'
+                     AND reason#>>'{shadow,status}'='shadow_candidates'
+                   ) AS candidates,
+                   count(*) FILTER (WHERE valid_envelope
+                     AND decision='research_unavailable'
+                     AND reason->>'unavailable_reason' IS NOT NULL
+                   ) AS unavailable,
+                   min(bar_ts) AS first_minute, max(bar_ts) AS last_minute
+                FROM checked""", (settings.symbol,)).fetchone()
+            observed = int(row["observed"]) if row else 0
+            no_trade = int(row["no_trade"]) if row else 0
+            candidates = int(row["candidates"]) if row else 0
+            unavailable = int(row["unavailable"]) if row else 0
+            expected = 24 * 60
+            malformed = observed - no_trade - candidates - unavailable
+            missing = expected - observed
+            if min(observed, no_trade, candidates, unavailable,
+                   malformed, missing) < 0:
+                raise RuntimeError("Research diagnostic contains impossible counts")
+            return (
+                "Независимое исследование, последние 24 часа UTC "
+                "(НЕ OOS и НЕ сертификат ML):\n"
+                f"Ожидалось закрытых минут: {expected}; "
+                f"записано: {observed}; пропущено: {missing}\n"
+                f"No-trade (только модель): {no_trade}; "
+                f"кандидатов (НЕ ордера): {candidates}; "
+                f"источник недоступен: {unavailable}; "
+                f"неполная/некорректная запись: {malformed}\n"
+                f"Первая: {row['first_minute'] if row else '-'}; "
+                f"последняя: {row['last_minute'] if row else '-'}\n"
+                "Пропуски НЕ являются no_signal. Без независимых "
+                "источников и проверки расходов нет допуска к обучению."
+            )
         if name == "coverage":
             rows = conn.execute("""SELECT source,interval,status,quality,
                 checked_at FROM ingestion_coverage WHERE symbol=%s

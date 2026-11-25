@@ -136,15 +136,19 @@ def test_no_manual_chart_dangerous_sql_in_new_view_module():
 
 def test_research_exposes_incomplete_cohort_without_promoting_ml(monkeypatch):
     class Query:
-        def fetchall(self):return []
+        def fetchone(self):
+            return {'observed': 0, 'no_trade': 0, 'candidates': 0,
+                    'unavailable': 0, 'first_minute': None,
+                    'last_minute': None}
     class Conn:
         def execute(self,*a,**k):return Query()
     @contextmanager
     def fake(_): yield Conn()
     monkeypatch.setattr(view, 'connection', fake)
     value=view.read_view(SimpleNamespace(symbol='ETHUSDT'),'research')
-    assert 'НЕПОЛНАЯ' in value
-    assert 'не OOS' in value
+    assert 'НЕ OOS' in value
+    assert 'пропущено: 1440' in value
+    assert 'НЕ являются no_signal' in value
 
 
 def test_utf16_and_maintenance_retention_backward_compatibility():
