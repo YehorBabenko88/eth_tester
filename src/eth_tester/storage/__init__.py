@@ -49,13 +49,13 @@ def backup_sha256(path):
 
 
 def verify_backup(path, *, expected_sha256=None):
+    if not shutil.which("pg_restore"):
+        raise RuntimeError("pg_restore unavailable")
     source = Path(path).resolve(strict=True)
     if source.stat().st_size <= 0:
         raise RuntimeError("Empty PostgreSQL backup")
     if expected_sha256 is not None and backup_sha256(source) != expected_sha256:
         raise RuntimeError("PostgreSQL backup checksum mismatch")
-    if not shutil.which("pg_restore"):
-        raise RuntimeError("pg_restore unavailable")
     result = subprocess.run(
         ["pg_restore", "--list", str(source)],
         capture_output=True, text=True, check=True, timeout=120,
