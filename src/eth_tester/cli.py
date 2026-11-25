@@ -9,7 +9,7 @@ def main():
     parser.add_argument("--trade-id",type=int)
     commands=parser.add_subparsers(dest="command",required=True)
     for cmd in ("init","backfill","archives","live","levels","footprint",
-                "telegram","status","chart"):
+                "telegram","status","chart","backtest","engine","learn","cleanup","analyse"):
         commands.add_parser(cmd)
     args=parser.parse_args()
     settings=Settings()
@@ -36,6 +36,21 @@ def main():
     elif args.command=="telegram":
         from .telegram_control import run_telegram
         asyncio.run(run_telegram(settings))
+    elif args.command=="backtest":
+        from .backtest import run_backtest
+        print("Backtest:",run_backtest(settings,args.tf))
+    elif args.command=="engine":
+        from .runner import run_engine
+        asyncio.run(run_engine(settings))
+    elif args.command=="analyse":
+        from .workers import analytics_worker
+        asyncio.run(analytics_worker(settings))
+    elif args.command=="learn":
+        from .learning import train_shadow
+        print("Shadow learning:",train_shadow(settings))
+    elif args.command=="cleanup":
+        from .retention import cleanup_diagnostics
+        print(cleanup_diagnostics(settings))
     elif args.command=="status":
         with connection(settings) as conn:
             for row in conn.execute("SELECT source,interval,status,cursor_ts FROM ingestion_cursor"):
