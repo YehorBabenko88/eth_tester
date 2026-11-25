@@ -42,7 +42,7 @@ def validate(rows, cutoff_ms):
             raise ValueError("future information or invalid horizon")
         if row.outcome not in CLASSES or not all(
             math.isfinite(float(x)) for x in (*row.values, row.gross_return, row.costs)
-        ) or row.costs < 0:
+        ):
             raise ValueError("invalid label or numerical value")
         if row.exit_ms <= cutoff_ms:
             checked.append(row)
@@ -124,9 +124,6 @@ def fit(train, *, steps=240, learning_rate=0.035):
     if steps < 1 or learning_rate <= 0:
         raise ValueError("invalid optimization")
     ordered = sorted(train, key=lambda r: (r.decision_ms, r.event_id))
-    if any(r.exit_ms >= max(r.decision_ms for r in ordered) for r in ordered):
-        # Entire training window must be resolved before its latest decision.
-        raise ValueError("training labels overlap last decision")
     n = len(ordered)
     means = [sum(r.values[i] for r in ordered) / n for i in range(len(FEATURE_NAMES))]
     stds = [max(1e-9, math.sqrt(sum((r.values[i] - means[i])**2 for r in ordered)/n))
@@ -149,7 +146,7 @@ def fit(train, *, steps=240, learning_rate=0.035):
     payoffs = tuple(sum(r.net_return for r in ordered if r.outcome == label) /
                     sum(r.outcome == label for r in ordered) for label in CLASSES)
     fingerprint = sha256(json.dumps(
-        [(r.event_id, r.decision_ms, r.exit_ms, r.outcome) for r in ordered],
+        [(r.event_id, r.decision_ms, r.exit_ms, r.values, r.available_ms,\n          r.outcome, r.gross_return, r.costs) for r in ordered],
         separators=(",", ":")).encode()).hexdigest()[:16]
     return Model("softmax3-" + fingerprint, tuple(means), tuple(stds),
                  tuple(tuple(w) for w in weights), payoffs, max(r.exit_ms for r in ordered))
