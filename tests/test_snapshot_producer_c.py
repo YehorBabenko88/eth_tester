@@ -171,3 +171,136 @@ def test_all_thirteen_close_boundaries_are_utc(tf):
         start = datetime(2026, 2, 2, tzinfo=UTC)
     assert close_time(start, tf) > start
     assert close_time(start, tf).tzinfo == UTC
+
+
+
+def test_round4_no_direct_snapshot_insert_code_path():
+    import inspect
+    from eth_tester import snapshot_producer as producer
+
+    assert "INSERT INTO feature_snapshots" not in inspect.getsource(
+        producer.certify_snapshot)
+    assert "write_feature_snapshot(" in inspect.getsource(
+        producer.certify_snapshot)
+
+
+def test_round4_missing_independent_oi_or_book_witness_rejects():
+    from eth_tester.snapshot_producer import _independent_sources
+
+    start, end, sampled, _, _, _ = example()
+    class NoSQL:
+        def execute(self, *args, **kwargs):
+            raise AssertionError("No certificate lookup from mutable flags")
+    class Settings:
+        symbol = "ETHUSDT"
+        category = "linear"
+    with pytest.raises(CertificationRejected, match="independent_nine_feature"):
+        _independent_sources(
+            NoSQL(), Settings(), {"source_coverage_verified": True},
+            start, end, sampled, [], [], {}, {})
+
+
+def test_round4_all_nine_witnesses_require_database_receipt():
+    from eth_tester.snapshot_producer import _independent_sources
+    from eth_tester.ml import FEATURE_NAMES
+
+    start, end, sampled, _, _, _ = example()
+    sampled += timedelta(minutes=10)
+    seen = []
+    witness_time = int((sampled-timedelta(minutes=2)).timestamp()*1000)
+    checked = sampled-timedelta(minutes=1)
+    proof_hash = "c"*64
+    class DB:
+        def execute(self, sql, args):
+            seen.append((sql, args))
+            return type("Cursor", (), {"fetchall": lambda self: [{
+                "checked_at": checked, "status": "verified",
+                "evidence": {
+                    "source_receipt_ms": witness_time,
+                    "evidence_ref": "original-ingest-0",
+                    "receipt_is_independently_recorded": True,
+                    "proves_all_trade_ids": True,
+                    "orderbook_replay_complete": True,
+                    "oi_receipt_and_grid_verified": True,
+                },
+            }]})()
+    class Settings:
+        symbol = "ETHUSDT"
+        category = "linear"
+    hints = {}
+    for name in FEATURE_NAMES:
+        source = {
+            "oi": "open_interest", "book_imbalance": "orderbook",
+            "level_distance": "candles", "volatility": "candles",
+        }.get(name, "trades_archive")
+        hints[name] = {
+            "source": source, "interval": "" if source=="trades_archive" else "1",
+            "checksum": proof_hash, "evidence_ref": "original-ingest-0",
+            "source_receipt_ms": witness_time,
+            "source_checked_at_ms": int(checked.timestamp()*1000),
+        }
+    oi = [{"ts": start, "value": Decimal(11)}]
+    book = {"updated_at": start, "valid": True}
+    level = {"confirmed_at": start}
+    sources, available = _independent_sources(
+        DB(), Settings(), {"independent_feature_sources": hints},
+        start, end, sampled,
+        [{"archive_sha256": proof_hash}], oi, book, level)
+    assert set(sources) == set(FEATURE_NAMES)
+    assert len(seen) == len(FEATURE_NAMES)
+    assert all(available[name] >= int(end.timestamp()*1000)
+               for name in FEATURE_NAMES)
+    # An independently checked receipt cannot be backdated or fabricated from
+    # a historical exchange timestamp.
+    hints["oi"]["source_receipt_ms"] = int(start.timestamp()*1000)
+    with pytest.raises(CertificationRejected, match="source_receipt_not"):
+        _independent_sources(
+            DB(), Settings(), {"independent_feature_sources": hints},
+            start, end, sampled, [{"archive_sha256": proof_hash}],
+            oi, book, level)
+
+
+def test_round4_reject_legacy_writer_contract_even_if_coverage_boolean_true():
+    from eth_tester.snapshot_producer import _verify_b_writer_v2
+
+    start, _, _, _, _, _ = example()
+    class DB:
+        def execute(self, *args, **kwargs):
+            return type("Cursor", (), {"fetchone": lambda self: {
+                "source_checksum": SHA, "quality": "complete",
+                "is_causal": True, "available_at": start,
+                "observed_at": start, "computed_at": start,
+                "provenance": {
+                    "contract": "eth_feature_snapshot_v1",
+                    "source_coverage_verified": True,
+                },
+            }})()
+    with pytest.raises(CertificationRejected, match="canonical_storage_v2"):
+        _verify_b_writer_v2(DB(), "historic-key", SHA)
+
+
+def test_round4_canonical_writer_postcondition_enforces_real_clock_order():
+    from eth_tester.snapshot_producer import _verify_b_writer_v2
+    from eth_tester.ml import FEATURE_NAMES
+
+    start, _, _, _, _, _ = example()
+    state = {
+        "source_checksum": SHA, "quality": "complete", "is_causal": True,
+        "available_at": start, "observed_at": start+timedelta(seconds=1),
+        "computed_at": start+timedelta(seconds=2),
+        "provenance": {
+            "contract": "eth_feature_snapshot_v2",
+            "source_coverage_verified": True, "certified_by": "storage_b",
+            "source_receipt_ms": int(start.timestamp()*1000),
+            "source_checked_at_ms": int(start.timestamp()*1000),
+            "feature_sources": {name: {"checksum": SHA}
+                                for name in FEATURE_NAMES},
+        },
+    }
+    class DB:
+        def execute(self, *args, **kwargs):
+            return type("Cursor", (), {"fetchone": lambda self: state})()
+    assert _verify_b_writer_v2(DB(), "key", SHA) is state
+    state["computed_at"] = start-timedelta(microseconds=1)
+    with pytest.raises(CertificationRejected, match="snapshot_observation_clock"):
+        _verify_b_writer_v2(DB(), "key", SHA)

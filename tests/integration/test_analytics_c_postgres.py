@@ -119,7 +119,7 @@ def test_indicator_asof_and_trade_vwap(c_pg):
 
 
 
-def test_round2_certified_snapshot_immutable_and_actual_materialization_time(c_pg):
+def test_round4_synthetic_archive_cannot_issue_causal_snapshot(c_pg):
     """Synthetic archive proof; production A currently emits partial only."""
     import json
     from eth_tester.snapshot_producer import certify_snapshot, coverage_certificate
@@ -190,30 +190,15 @@ def test_round2_certified_snapshot_immutable_and_actual_materialization_time(c_p
             conn.execute("""INSERT INTO open_interest(
                 symbol,interval,ts,value)
                 VALUES('ETHUSDT','5min',%s,%s)""", (stamp, value))
-    published = certify_snapshot(c_pg, "1")
-    assert published["status"] == "published", published
-    again = certify_snapshot(c_pg, "1")
-    assert again["status"] == "already_published", again
+    # These are synthetic flags, not independently witnessed source receipts.
+    # The canonical writer is the ONLY permitted certified insertion path.
+    # They MUST NOT create a causal snapshot, even with matching volumes.
+    result = certify_snapshot(c_pg, "1")
+    assert result["status"] == "rejected", result
+    assert result["reason"] == "independent_nine_feature_witnesses_missing"
     with connection(c_pg) as conn:
-        rows = conn.execute("""SELECT bar_ts,available_at,observed_at,computed_at,
-            quality,is_causal,source_checksum,values_json,provenance
-            FROM feature_snapshots WHERE symbol='ETHUSDT'""").fetchall()
-    assert len(rows) == 1
-    one = rows[0]
-    assert one["bar_ts"] == start
-    assert one["source_checksum"] == source_sha
-    assert one["quality"] == "complete" and one["is_causal"]
-    assert one["available_at"] == one["observed_at"] == one["computed_at"]
-    assert one["computed_at"] >= observed > day_end
-    assert one["values_json"]["oi"] == "10"
-    assert one["provenance"]["availability_convention"] == (
-        "DB_materialization_time_not_bar_close")
-    assert all(stamp >= int(observed.timestamp() * 1000)
-               for stamp in one["provenance"]["feature_available_ms"].values())
-    with pytest.raises(psycopg.errors.RaiseException):
-        with connection(c_pg) as conn:
-            conn.execute("""UPDATE feature_snapshots SET is_causal=false
-                WHERE source_checksum=%s""", (source_sha,))
+        assert conn.execute(
+            "SELECT count(*) AS n FROM feature_snapshots").fetchone()["n"] == 0
 
 
 def test_round2_partial_coverage_never_materializes_certified_snapshot(c_pg):
@@ -262,3 +247,51 @@ def test_round2_archive_live_overlap_preserves_rollup_and_all_frames(c_pg):
         result = conn.execute("""SELECT sum(buy_qty+sell_qty) AS total
             FROM footprint WHERE symbol='ETHUSDT' AND tf='1'""").fetchone()
     assert result["total"] == Decimal(3)
+
+
+
+def test_round4_partial_history_and_l2_cannot_bypass_b_writer(c_pg, monkeypatch):
+    from eth_tester import snapshot_producer as producer
+
+    start = datetime.now(UTC).replace(second=0, microsecond=0)
+    start -= timedelta(minutes=4)
+    with connection(c_pg) as conn:
+        conn.execute("""INSERT INTO candles(
+            symbol,kind,tf,ts,open,high,low,close,volume,source)
+            VALUES('ETHUSDT','trade','1',%s,100,101,99,100,3,'qa')""",
+            (start,))
+        conn.execute("""INSERT INTO features(
+            symbol,tf,ts,poc,delta,cvd,volume,tape_tps,quality)
+            VALUES('ETHUSDT','1',%s,100,1,1,3,0.05,'partial_unverified')""",
+            (start,))
+    attempts = []
+    def forbidden_writer(*args, **kwargs):
+        attempts.append(kwargs)
+        raise AssertionError("No certification without original source evidence")
+    monkeypatch.setattr(producer, "write_feature_snapshot", forbidden_writer)
+    for _ in range(2):
+        result = producer.certify_snapshot(c_pg, "1")
+        assert result["status"] == "rejected", result
+    assert attempts == []
+    with connection(c_pg) as conn:
+        assert conn.execute(
+            "SELECT count(*) AS n FROM feature_snapshots").fetchone()["n"] == 0
+
+
+def test_round4_storage_v1_direct_insert_record_not_reusable(c_pg):
+    """An immutable legacy row cannot be mistaken for a B-certified v2 proof."""
+    from eth_tester.snapshot_producer import CertificationRejected, _verify_b_writer_v2
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    source = "a" * 64
+    with connection(c_pg) as conn:
+        conn.execute("""INSERT INTO feature_snapshots(
+            snapshot_key,symbol,tf,bar_ts,available_at,observed_at,
+            computed_at,source,source_checksum,quality,is_causal,values_json,provenance)
+            VALUES('legacy-c-direct','ETHUSDT','1',%s,%s,%s,%s,
+                   'old_direct_writer',%s,'complete',true,
+                   '{}'::jsonb,'{"source_coverage_verified":true}'::jsonb)""",
+            (start, start+timedelta(minutes=1),
+             start+timedelta(minutes=2), start+timedelta(minutes=3), source))
+        with pytest.raises(CertificationRejected, match="canonical_storage_v2"):
+            _verify_b_writer_v2(conn, "legacy-c-direct", source)

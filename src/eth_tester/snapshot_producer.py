@@ -16,6 +16,7 @@ from .analytics_core import FRAMES, bucket, close_time, value_profile
 from .book_analysis import snapshot_metrics
 from .database import connection
 from .ml import FEATURE_NAMES
+from .storage.snapshots import write_feature_snapshot
 
 
 UTC = timezone.utc
@@ -227,11 +228,142 @@ def certified_values(feature, price_rows, level, book, oi_rows, source_sha256,
     }
 
 
-def certify_snapshot(settings, tf="1"):
-    """Publish one snapshot at its ACTUAL observation/computation time, or reject.
 
-    Never retrodict an old paper decision. Only B's additive tables are written.
-    Source certificates are pinned to archive checksums and all minute volumes.
+def _utc_ms(timestamp):
+    return int(_time(timestamp).timestamp() * 1000)
+
+
+def _independent_sources(conn, settings, metadata, start, end, sampled, manifest,
+                         oi, book, level):
+    """All nine receipts must be independently witnessed by source coverage.
+
+    Mutable features metadata is a lookup pointer, NEVER source proof itself.
+    The coverage database row must substantiate the event, source checksum and
+    an actual pre-publication receipt. Missing witnesses reject by default.
+    """
+    hints = metadata.get("independent_feature_sources")
+    if not isinstance(hints, dict) or set(hints) != set(FEATURE_NAMES):
+        _reject("independent_nine_feature_witnesses_missing")
+    allowed = {
+        "oi": ("open_interest", "oi"),
+        "cvd": ("trades_archive",),
+        "delta": ("trades_archive",),
+        "poc": ("trades_archive",),
+        "footprint": ("trades_archive",),
+        "tape_speed": ("trades_archive",),
+        "book_imbalance": ("orderbook", "book_events"),
+        "level_distance": ("candles", "history_candles"),
+        "volatility": ("candles", "history_candles"),
+    }
+    events = {
+        "oi": _utc_ms(oi[0]["ts"]),
+        "cvd": _utc_ms(start), "delta": _utc_ms(start),
+        "poc": _utc_ms(start), "footprint": _utc_ms(start),
+        "tape_speed": _utc_ms(start),
+        "book_imbalance": _utc_ms(book["updated_at"]),
+        "level_distance": _utc_ms(level["confirmed_at"]),
+        "volatility": _utc_ms(start),
+    }
+    sampled_ms, close_ms = _utc_ms(sampled), _utc_ms(end)
+    archived = {item["archive_sha256"] for item in manifest}
+    if len(manifest) != 1:
+        _reject("multiday_trade_identity_needs_composite_source_witness")
+    sources, available = {}, {}
+    for name in FEATURE_NAMES:
+        hint = hints[name]
+        if not isinstance(hint, dict):
+            _reject("invalid_feature_source_hint:" + name)
+        source, interval, digest = (
+            hint.get("source"), hint.get("interval"), hint.get("checksum"))
+        if (source not in allowed[name] or not isinstance(interval, str)
+                or not isinstance(digest, str) or not HEX64.fullmatch(digest)):
+            _reject("invalid_independent_source_reference:" + name)
+        if source == "trades_archive" and digest not in archived:
+            _reject("archive_sha_mismatch:" + name)
+        event_ms = events[name]
+        found = conn.execute("""SELECT status,checksum,checked_at,evidence
+            FROM ingestion_coverage
+            WHERE source=%s AND symbol=%s AND instrument=%s
+              AND interval=%s AND checksum=%s AND status='verified'
+              AND start_ts<=to_timestamp(%s/1000.0)
+              AND end_ts>to_timestamp(%s/1000.0)
+            ORDER BY checked_at DESC LIMIT 2""",
+            (source, settings.symbol, settings.category, interval,
+             digest, event_ms, event_ms)).fetchall()
+        if len(found) != 1:
+            _reject("verified_source_event_window_missing:" + name)
+        record = found[0]
+        raw = record.get("evidence") or {}
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        if not isinstance(raw, dict):
+            _reject("invalid_source_receipt:" + name)
+        evidence_ref = raw.get("evidence_ref")
+        if (not isinstance(evidence_ref, str) or not evidence_ref or
+                hint.get("evidence_ref") != evidence_ref):
+            _reject("independent_evidence_reference_missing:" + name)
+        receipt = raw.get("source_receipt_ms")
+        checked = _utc_ms(record["checked_at"])
+        if (type(receipt) is not int or receipt < event_ms or
+                receipt > checked or checked > sampled_ms or
+                hint.get("source_receipt_ms") != receipt or
+                hint.get("source_checked_at_ms") != checked or
+                raw.get("receipt_is_independently_recorded") is not True):
+            _reject("source_receipt_not_independently_proven:" + name)
+        if (source == "trades_archive" and
+                raw.get("proves_all_trade_ids") is not True):
+            _reject("trade_identity_not_independently_proven:" + name)
+        if (name == "book_imbalance" and
+                raw.get("orderbook_replay_complete") is not True):
+            _reject("l2_receipt_not_proven")
+        if (name == "oi" and
+                raw.get("oi_receipt_and_grid_verified") is not True):
+            _reject("oi_receipt_not_proven")
+        available[name] = max(close_ms, checked, receipt)
+        sources[name] = {
+            "source": source, "instrument": settings.category,
+            "interval": interval, "checksum": digest,
+            "evidence_ref": evidence_ref,
+            "source_event_ms": event_ms,
+            "source_receipt_ms": receipt,
+            "source_checked_at_ms": checked,
+            "coverage_status": record["status"],
+        }
+    return sources, available
+
+
+def _verify_b_writer_v2(conn, key, digest):
+    """Reject old B v1 contract inside the INSERT transaction (rolls back)."""
+    row = conn.execute("""SELECT source_checksum,quality,is_causal,
+        available_at,observed_at,computed_at,provenance
+        FROM feature_snapshots WHERE snapshot_key=%s FOR SHARE""",
+        (key,)).fetchone()
+    if row is None:
+        _reject("canonical_writer_row_missing")
+    proof = row["provenance"] or {}
+    if isinstance(proof, str):
+        proof = json.loads(proof)
+    if (row["source_checksum"] != digest or
+            row["quality"] != "complete" or row["is_causal"] is not True or
+            not isinstance(proof, dict) or
+            proof.get("contract") != "eth_feature_snapshot_v2" or
+            proof.get("source_coverage_verified") is not True or
+            not proof.get("certified_by") or
+            type(proof.get("source_receipt_ms")) is not int or
+            type(proof.get("source_checked_at_ms")) is not int or
+            set((proof.get("feature_sources") or {})) != set(FEATURE_NAMES)):
+        _reject("canonical_storage_v2_provenance_missing")
+    if not (row["available_at"] <= row["observed_at"] <=
+            row["computed_at"]):
+        _reject("snapshot_observation_clock_order")
+    return row
+
+
+def certify_snapshot(settings, tf="1"):
+    """Use B's exclusive writer; never bless archive volume as all-nine proof.
+
+    End-user decision eligibility needs genuine per-source receipts and a
+    canonical B v2 writer, not merely exchange event times or an OHLC grid.
     """
     if tf not in FRAMES:
         raise ValueError("unsupported_frame")
@@ -240,75 +372,73 @@ def certify_snapshot(settings, tf="1"):
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                          (f"snapshot:{settings.symbol}:{tf}",))
-            clock = conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
-            candidate = conn.execute("""SELECT f.*,c.close AS market_close
-                FROM features f JOIN candles c ON c.symbol=f.symbol
-                   AND c.tf=f.tf AND c.ts=f.ts AND c.kind='trade'
-                WHERE f.symbol=%s AND f.tf=%s AND c.closed
-                ORDER BY f.ts DESC LIMIT 5""",
+            sampled = conn.execute(
+                "SELECT clock_timestamp() AS ts").fetchone()["ts"]
+            candidates = conn.execute("""SELECT f.*, c.close AS market_close
+                FROM features f JOIN candles c ON
+                  c.symbol=f.symbol AND c.tf=f.tf AND c.ts=f.ts
+                  AND c.kind='trade' AND c.closed
+                WHERE f.symbol=%s AND f.tf=%s ORDER BY f.ts DESC LIMIT 5""",
                 (settings.symbol, tf)).fetchall()
-            feature = next((row for row in candidate if
-                            close_time(row["ts"], tf) <= clock), None)
+            feature = next((row for row in candidates if
+                            close_time(row["ts"], tf) <= sampled), None)
             if not feature:
-                _reject("no_fully_closed_candle_and_feature")
+                _reject("no_closed_candle_and_features")
             start = feature["ts"]
             if bucket(start, tf) != start:
-                _reject("unaligned_source_candle")
+                _reject("unaligned_candle")
             end = close_time(start, tf)
-            # The source archive may be historical, but publication timestamps
-            # are captured from the DB now and can only inform FUTURE decisions.
-            rows = conn.execute("""SELECT * FROM ingestion_coverage
-                WHERE source='trades_archive' AND symbol=%s AND instrument=%s
-                  AND interval='' AND start_ts<%s AND end_ts>%s
-                ORDER BY start_ts""",
+            coverage = conn.execute("""SELECT * FROM ingestion_coverage
+                WHERE source='trades_archive' AND symbol=%s AND
+                  instrument=%s AND interval='' AND
+                  start_ts<%s AND end_ts>%s ORDER BY start_ts""",
                 (settings.symbol, settings.category, end, start)).fetchall()
-            first_day = start.date()
-            # For intraday buckets the end is still within the same UTC
-            # calendar day. Include that day; for D/W/M end is exclusive.
-            last_day_exclusive = (end - timedelta(microseconds=1)).date() + timedelta(days=1)
+            first = start.date()
+            exclusive = (end-timedelta(microseconds=1)).date()+timedelta(days=1)
             jobs = conn.execute("""SELECT day,state,sha256 FROM ingestion_job
                 WHERE source='trades_archive' AND symbol=%s
-                  AND day >= %s AND day < %s""",
-                (settings.symbol, first_day, last_day_exclusive)).fetchall()
-            jobs_by_day = {item["day"]: item for item in jobs}
+                  AND day >=%s AND day < %s""",
+                (settings.symbol, first, exclusive)).fetchall()
             checks = {}
-            for row in rows:
-                digest = row.get("checksum")
+            for record in coverage:
+                digest = record.get("checksum")
                 if not isinstance(digest, str) or not HEX64.fullmatch(digest):
                     continue
-                a = max(start, row["start_ts"])
-                b = min(end, row["end_ts"])
-                if a >= b:
+                lo, hi = max(start, record["start_ts"]), min(end, record["end_ts"])
+                if lo >= hi:
                     continue
-                result = conn.execute("""SELECT count(*) AS total,
-                    count(*) FILTER (WHERE status='match') AS matched,
-                    count(DISTINCT minute_ts) AS unique_minutes,
-                    max(checked_at) AS latest_checked
-                    FROM trade_candle_volume_checks WHERE symbol=%s
-                      AND instrument=%s AND minute_ts >= %s
-                      AND minute_ts < %s AND archive_source='trades_archive'
-                      AND archive_sha256=%s""",
-                    (settings.symbol, settings.category, a, b, digest)).fetchone()
-                checks[(row["start_ts"].date(), digest)] = result
-            # Actual publication time is captured only AFTER reading source
-            # data. Never use a bar close as an artificial observed_at.
-            sampled = conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
-            source_sha, manifest = coverage_certificate(
-                start, end, sampled, rows, jobs_by_day, checks)
-            ledger = conn.execute("""SELECT day,archive_sha256 FROM aggregation_job
-                WHERE symbol=%s AND tf=%s AND day >= %s AND day < %s""",
-                (settings.symbol, tf, first_day, last_day_exclusive)).fetchall()
-            archived = {row["day"]: row["archive_sha256"] for row in ledger}
+                checks[(record["start_ts"].date(), digest)] = conn.execute(
+                    """SELECT count(*) AS total,
+                         count(*) FILTER(WHERE status='match') AS matched,
+                         count(DISTINCT minute_ts) AS unique_minutes,
+                         max(checked_at) AS latest_checked
+                       FROM trade_candle_volume_checks
+                       WHERE symbol=%s AND instrument=%s
+                         AND minute_ts >=%s AND minute_ts <%s
+                         AND archive_source='trades_archive'
+                         AND archive_sha256=%s""",
+                    (settings.symbol, settings.category, lo, hi, digest)
+                ).fetchone()
+            sampled = conn.execute(
+                "SELECT clock_timestamp() AS ts").fetchone()["ts"]
+            digest, manifest = coverage_certificate(
+                start, end, sampled, coverage,
+                {row["day"]: row for row in jobs}, checks)
+            archive_jobs = conn.execute("""SELECT day,archive_sha256
+                FROM aggregation_job WHERE symbol=%s AND tf=%s
+                AND day >=%s AND day <%s""",
+                (settings.symbol, tf, first, exclusive)).fetchall()
+            archived = {row["day"]: row["archive_sha256"] for row in archive_jobs}
             if len(archived) != len(manifest) or any(
-                    archived.get(datetime.fromisoformat(item["day"]).date()) !=
-                    item["archive_sha256"] for item in manifest):
-                _reject("rollup_archive_checksum_drift")
-            price_rows = conn.execute("""SELECT price,buy_qty,sell_qty,trades
+                    archived.get(datetime.fromisoformat(item["day"]).date())
+                    != item["archive_sha256"] for item in manifest):
+                _reject("archive_rollup_sha_changed")
+            footprint = conn.execute("""SELECT price,buy_qty,sell_qty,trades
                 FROM footprint WHERE symbol=%s AND tf=%s AND bucket=%s
                 ORDER BY price LIMIT 20001""",
                 (settings.symbol, tf, start)).fetchall()
-            if len(price_rows) > 20000:
-                _reject("unbounded_footprint")
+            if len(footprint) > 20000:
+                _reject("price_footprint_unbounded")
             book = conn.execute("""SELECT bids,asks,updated_at,valid
                 FROM market_book_state WHERE symbol=%s""",
                 (settings.symbol,)).fetchone()
@@ -318,46 +448,33 @@ def certify_snapshot(settings, tf="1"):
                 (settings.symbol, sampled)).fetchall()
             level = conn.execute("""SELECT id,level_price,confirmed_at,source
                 FROM levels WHERE symbol=%s AND tf=%s AND status='unbroken'
-                  AND confirmed_at <= %s AND source='causal_closed_pivot'
+                  AND confirmed_at<=%s AND source='causal_closed_pivot'
                 ORDER BY abs(level_price-%s),confirmed_at,id LIMIT 1""",
                 (settings.symbol, tf, sampled, feature["market_close"])).fetchone()
-            values, extra = certified_values(
-                feature, price_rows, level, book, oi, source_sha,
-                start, end, sampled)
-            exists = conn.execute("""SELECT snapshot_key FROM feature_snapshots
-                WHERE symbol=%s AND tf=%s AND bar_ts=%s AND
-                  source_checksum=%s AND quality='complete' AND is_causal
-                ORDER BY computed_at DESC LIMIT 1""",
-                (settings.symbol, tf, start, source_sha)).fetchone()
-            if exists:
-                return {"status": "already_published", "tf": tf,
-                        "snapshot_key": exists["snapshot_key"]}
-            epoch = int(sampled.timestamp() * 1000)
-            provenance = {
-                "feature_available_ms": {name: epoch for name in FEATURE_NAMES},
-                "bar_close_exchange_time": end.isoformat(),
-                "source_manifest": manifest,
-                "source_checksum": source_sha,
-                "published_at": sampled.isoformat(),
-                "availability_convention": "DB_materialization_time_not_bar_close",
-                **extra,
-            }
-            identity = _hash({"symbol": settings.symbol, "tf": tf,
-                              "bar_ts": start.isoformat(), "source": source_sha,
-                              "values": values, "level_id": extra["level_id"]})
-            inserted = conn.execute("""INSERT INTO feature_snapshots(
-                snapshot_key,symbol,tf,bar_ts,available_at,observed_at,
-                computed_at,source,source_checksum,quality,is_causal,
-                values_json,provenance)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,'certified_archive_materialization',
-                       %s,'complete',true,%s::jsonb,%s::jsonb)
-                ON CONFLICT(snapshot_key) DO NOTHING RETURNING snapshot_key""",
-                (identity, settings.symbol, tf, start, sampled, sampled, sampled,
-                 source_sha, json.dumps(values), json.dumps(provenance))).fetchone()
-            if not inserted:
-                return {"status": "already_published", "tf": tf,
-                        "snapshot_key": identity}
+            values, _ = certified_values(
+                feature, footprint, level, book, oi, digest, start, end, sampled)
+            metadata = feature.get("metadata") or {}
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            if not isinstance(metadata, dict):
+                _reject("invalid_indicator_metadata")
+            sources, availability = _independent_sources(
+                conn, settings, metadata, start, end, sampled, manifest,
+                oi, book, level)
+            observed = conn.execute(
+                "SELECT clock_timestamp() AS ts").fetchone()["ts"]
+            key = write_feature_snapshot(
+                conn, symbol=settings.symbol, tf=tf, bar_ts=start,
+                observed_at=observed, values=values,
+                feature_available_ms=availability,
+                source="analytics_canonical_nine_sources",
+                source_checksum=digest, instrument=settings.category,
+                feature_sources=sources, certified=True)
+            _verify_b_writer_v2(conn, key, digest)
             return {"status": "published", "tf": tf,
-                    "snapshot_key": identity, "source_checksum": source_sha}
+                    "snapshot_key": key, "source_checksum": digest}
     except CertificationRejected as exc:
         return {"status": "rejected", "tf": tf, "reason": str(exc)}
+    except ValueError as exc:
+        return {"status": "rejected", "tf": tf,
+                "reason": "storage_writer_rejected:" + str(exc)[:150]}
