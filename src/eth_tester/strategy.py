@@ -25,7 +25,36 @@ def economics(direction, price, stop, take, fee, slip, params=Parameters()):
             "net_reward_risk":str(win/loss),"funding_reserve_fraction":params.funding_reserve,
             "break_even_win_rate":str(loss/(win+loss))}
 
-def price_signal(closed_candles,fee_rate=D("0.00055"),slip_bps=D("2"),max_lookback=180):
+def calibrated_expectancy(direction, price, stop, take, fee, slip, probability_lower,
+                           params=Parameters()):
+    """Reject without an independently calibrated conservative win-rate bound.
+
+    The baseline economics() only proves that a successful TP covers modelled
+    expenses, never that the strategy has positive expected value.
+    """
+    if probability_lower is None:
+        return None
+    try:
+        probability = D(str(probability_lower))
+        if not probability.is_finite() or not D(0) < probability < D(1):
+            return None
+        costs = economics(direction, price, stop, take, fee, slip, params)
+        if costs is None:
+            return None
+        win = D(costs["net_target_fraction"])
+        loss = D(costs["net_risk_fraction"])
+        expected = probability * win - (D(1) - probability) * loss
+        if expected < D(params.min_net):
+            return None
+        return {**costs, "win_probability_lower_bound": str(probability),
+                "expected_net_fraction_lower_bound": str(expected),
+                "calibration_required": True}
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def price_signal(closed_candles,fee_rate=D("0.00055"),slip_bps=D("2"),
+                 max_lookback=180,*,volume_profiles=()):
     params=Parameters()
     candles=list(closed_candles[-max_lookback:])
     if len(candles)<12:
@@ -71,6 +100,13 @@ def price_signal(closed_candles,fee_rate=D("0.00055"),slip_bps=D("2"),max_lookba
                     "side":side,"level":str(level),"atr":str(atr),"reference_price":str(price),
                     "source":"closed_candles","economics":costs,"requires_live_confirmation":True}
             candidates.append((abs(price-level),name,Signal(direction,level,stop,take,reason)))
+        if volume_profiles:
+            from .strategies.volume import volume_signal
+            for profile in volume_profiles:
+                candidate = volume_signal(candles, profile, fee_rate, slip_bps)
+                if candidate is not None:
+                    candidates.append((abs(price - candidate.level),
+                                       candidate.reason["strategy"], candidate))
         return min(candidates,key=lambda x:(x[0],x[1]))[2] if candidates else None
     except (InvalidOperation,ValueError,TypeError,KeyError):
         return None
