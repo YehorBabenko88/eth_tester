@@ -48,19 +48,13 @@ def classify_levels(candles,flank=2):
         result.append((side,origin,price,confirmed,broken))
     return result
 
-def build_levels(settings,tf="60",flank=2):
-    with connection(settings) as conn:
-        candles=conn.execute("""SELECT ts,high,low,close FROM candles WHERE
-          symbol=%s AND kind='trade' AND tf=%s AND closed ORDER BY ts""",
-          (settings.symbol,tf)).fetchall()
-        levels=classify_levels(candles,flank)
-        for side,origin,price,_,broken in levels:
-            conn.execute("""INSERT INTO levels(symbol,tf,side,origin_ts,level_price,status,broken_ts,source)
-             VALUES(%s,%s,%s,%s,%s,%s,%s,'confirmed_pivot')
-             ON CONFLICT(symbol,tf,side,origin_ts,level_price)
-             DO UPDATE SET status=EXCLUDED.status,broken_ts=EXCLUDED.broken_ts""",
-             (settings.symbol,tf,side,origin,price,"broken" if broken else "unbroken",broken))
-    return len(levels)
+def build_levels(settings, tf="60", flank=2):
+    """Checkpointed causal level lifecycle, persisted through Storage B migration."""
+    from .levels_incremental import process_levels
+
+    return process_levels(settings, tf, flank)
+
+
 
 def build_footprint(settings,tf="1",hours=24):
     if tf not in TF_SECONDS:
