@@ -117,3 +117,58 @@ def test_live_footprint_is_idempotent(pg_settings):
     assert build_footprint(pg_settings, "1", hours=2) == 1
     with connection(pg_settings) as conn:
         assert conn.execute("SELECT count(*) AS n FROM footprint WHERE tf='1'").fetchone()["n"] == 1
+
+
+def test_cvd_asof_and_idempotence(pg_settings):
+    """CVD is a cumulative sum, and future OI/funding must not leak backward."""
+    from eth_tester.analytics import enrich_features
+
+    first = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    first -= timedelta(minutes=5)
+    with connection(pg_settings) as conn:
+        for n, delta in enumerate((D(3), D(-1), D(2))):
+            conn.execute("""INSERT INTO features(symbol,tf,ts,delta,volume)
+                VALUES('ETHUSDT','1',%s,%s,5)""",
+                (first + timedelta(minutes=n), delta))
+        conn.execute("""INSERT INTO open_interest(symbol,interval,ts,value)
+            VALUES('ETHUSDT','5min',%s,8000)""", (first + timedelta(minutes=25),))
+        conn.execute("""INSERT INTO funding(symbol,ts,rate)
+            VALUES('ETHUSDT',%s,0.01)""", (first + timedelta(minutes=25),))
+    assert enrich_features(pg_settings, tf="1", hours=1) == 3
+    assert enrich_features(pg_settings, tf="1", hours=1) == 3
+    with connection(pg_settings) as conn:
+        rows = conn.execute("""SELECT cvd,oi,funding_rate FROM features
+            WHERE symbol='ETHUSDT' AND tf='1' ORDER BY ts""").fetchall()
+    assert [row["cvd"] for row in rows] == [D(3), D(2), D(4)]
+    assert all(row["oi"] is None and row["funding_rate"] is None for row in rows)
+
+
+def test_partial_archive_cannot_close_multiday_gap(pg_settings):
+    from eth_tester.archives import resolve_archived_gaps
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(days=1, minutes=5)
+    with connection(pg_settings) as conn:
+        conn.execute("""INSERT INTO data_gaps(source,symbol,start_ts,end_ts,explanation)
+            VALUES('publicTrade','ETHUSDT',%s,%s,'test disconnect')""", (start, end))
+        conn.execute("""INSERT INTO ingestion_job(source,symbol,day,state)
+            VALUES('trades_archive','ETHUSDT',%s,'complete')""", (start.date(),))
+    assert resolve_archived_gaps(pg_settings) == 0
+    with connection(pg_settings) as conn:
+        remaining = conn.execute("""SELECT count(*) AS n FROM data_gaps
+            WHERE resolved_at IS NULL""").fetchone()["n"]
+    assert remaining == 1
+
+
+@pytest.mark.xfail(strict=False, reason="DATA Issue #10: differing trade_id replay is silently dropped")
+def test_conflicting_duplicate_trade_is_explicitly_rejected(pg_settings):
+    stamp = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    first = {"topic": "publicTrade.ETHUSDT", "data": [
+        {"i": "same-id", "T": stamp, "p": "100", "v": "1", "S": "Buy"}]}
+    changed = {"topic": "publicTrade.ETHUSDT", "data": [
+        {"i": "same-id", "T": stamp, "p": "100", "v": "2", "S": "Buy"}]}
+    with connection(pg_settings) as conn:
+        ingest_ws(conn, "ETHUSDT", first)
+    with pytest.raises((ValueError, RuntimeError, psycopg.Error)):
+        with connection(pg_settings) as conn:
+            ingest_ws(conn, "ETHUSDT", changed)
