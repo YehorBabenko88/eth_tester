@@ -79,7 +79,7 @@ async def recover_recent_public_trades(settings, client):
             start_ms=int(earliest.timestamp() * 1000),
             end_exclusive_ms=int(latest.timestamp() * 1000) + 1,
             status="partial", observed_rows=len(ids),
-            expected_rows=None, checksum=digest_rows(sorted(ids)),
+            expected_rows=None, checksum=digest_rows([(key, ids[key]) for key in sorted(ids)]),
             quality="rolling_api_limit_not_full_tape",
             evidence={"method": "recent-trade", "limit": 1000,
                       "returned_rows": len(rows), "page_saturated": len(rows) == 1000,
