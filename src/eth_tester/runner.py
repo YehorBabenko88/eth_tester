@@ -3,11 +3,15 @@ import asyncio
 from datetime import datetime,timedelta,timezone
 from decimal import Decimal
 import json
+import logging
 from .database import connection
 from .paper import open_paper,close_paper
 from .strategy import price_signal
 from .orderflow import confirm_rejection
 from .simulation.crossing import resolve_first_crossing
+from .simulation.review import review_one_closed_trade
+
+LOGGER=logging.getLogger(__name__)
 from .simulation.identity import (bind_snapshot_reference, require_new_strategy_identity,
                                   rule_identity)
 
@@ -94,9 +98,12 @@ def engine_tick(settings):
           ORDER BY ts DESC,trade_id DESC LIMIT 1""",
           (settings.symbol,now-timedelta(seconds=15),
            now+timedelta(seconds=2))).fetchone()
-        if not recent or not status or status["status"]!="connected":
-            return "waiting_live_feed"
         trade=conn.execute("SELECT * FROM paper_trades WHERE state='open' LIMIT 1").fetchone()
+        if not recent or not status or status["status"]!="connected":
+            # Do not hide a durable open position after an internet outage.
+            # Never fabricate a stop/take fill across missing trade prints.
+            return ("waiting_live_feed_open_position" if trade
+                    else "waiting_live_feed")
         if trade:
             stop,take=Decimal(trade["stop"]),Decimal(trade["take"])
             gap=conn.execute("""SELECT 1 FROM data_gaps WHERE symbol=%s
@@ -121,6 +128,8 @@ def engine_tick(settings):
             reason=crossing["reason"]
             if crossing["ambiguous_same_timestamp"]:
                 reason+="_same_timestamp_ambiguous_stop_first"
+            # close_paper independently reads the already-persisted as-of BBO
+            # inside its own settlement transaction, never from caller flags.
             funding,funding_quality,funding_evidence=estimated_funding(
                 conn,settings,trade["opened_at"],recent["ts"],trade["qty"],
                 trade["entry"],trade["direction"],with_events=True)
@@ -258,16 +267,53 @@ def engine_tick(settings):
 
 
 async def run_engine(settings):
+    """24/7 paper loop: intermittent DB failures cannot terminate monitoring.
+
+    Research reviews are restart-safe and cannot change simulated settlements.
+    """
     while True:
         try:
             state=await asyncio.to_thread(engine_tick,settings)
-            with connection(settings) as conn:
-                conn.execute("""INSERT INTO bot_heartbeat(component,status)
-                VALUES('paper_engine',%s) ON CONFLICT(component) DO UPDATE SET
-                status=EXCLUDED.status,updated_at=now()""",(state[:250],))
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
+            state="engine_error"
+            LOGGER.error("Paper simulation tick failed (%s)",type(exc).__name__)
+            try:
+                with connection(settings) as conn:
+                    conn.execute("""INSERT INTO bot_events(severity,event,data)
+                      VALUES('error','engine_failure',%s::jsonb)""",
+                      (json.dumps({"error_type":type(exc).__name__,
+                                   "paper_only":True}),))
+            except Exception:
+                LOGGER.warning("Engine event DB unavailable; next cycle retries")
+        try:
             with connection(settings) as conn:
-                conn.execute("""INSERT INTO bot_events(severity,event,data)
-                  VALUES('error','engine_failure',%s::jsonb)""",
-                  (json.dumps({"error":str(exc)[:500]}),))
+                old=conn.execute("""SELECT status FROM bot_heartbeat
+                    WHERE component='paper_engine'""").fetchone()
+                previous=old["status"] if old else None
+                conn.execute("""INSERT INTO bot_heartbeat(component,status,detail)
+                    VALUES('paper_engine',%s,%s::jsonb)
+                    ON CONFLICT(component) DO UPDATE SET
+                    status=EXCLUDED.status,detail=EXCLUDED.detail,
+                    updated_at=clock_timestamp()""",
+                    (state[:250],json.dumps({"paper_only":True,
+                     "open_position_risk":state=="waiting_live_feed_open_position",
+                     "automatic_fake_exit":False})))
+                if (state!=previous and state in (
+                        "waiting_live_feed_open_position",
+                        "blocked_unresolved_tick_gap")):
+                    conn.execute("""INSERT INTO bot_events(severity,event,data)
+                      VALUES('warning','paper_source_risk',%s::jsonb)""",
+                      (json.dumps({"status":state,"symbol":settings.symbol,
+                                   "paper_only":True,
+                                   "source_completeness_claimed":False}),))
+        except Exception:
+            LOGGER.warning("Paper heartbeat DB unavailable; next cycle retries")
+        try:
+            await asyncio.to_thread(review_one_closed_trade,settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.warning("Paper trade review failed; next cycle retries")
         await asyncio.sleep(15)

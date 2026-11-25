@@ -397,3 +397,173 @@ def test_round8_historical_gap_preserved_but_only_current_overlap_blocks(
         gaps=conn.execute("""SELECT resolved_at FROM data_gaps
             WHERE explanation='synthetic_qagap'""").fetchall()
         assert len(gaps)==1 and gaps[0]["resolved_at"] is None
+
+
+def test_round9_missing_ws_preserves_open_exposure_and_never_fills(simulated_pg):
+    from eth_tester.runner import engine_tick
+    opened=start_time()
+    ident=open_paper(simulated_pg,"long",D(100),D(98),D(105),
+                     verified_reason(),observed_at=opened)
+    assert engine_tick(simulated_pg)=="waiting_live_feed_open_position"
+    with connection(simulated_pg) as conn:
+        row=conn.execute("SELECT state,exit FROM paper_trades WHERE id=%s",
+                         (ident,)).fetchone()
+        assert row["state"]=="open" and row["exit"] is None
+        assert conn.execute("SELECT count(*) AS n FROM paper_order_events").fetchone()["n"]==1
+        assert conn.execute("SELECT paper_trade_id FROM paper_position_state").fetchone()["paper_trade_id"]==ident
+
+
+def test_round9_asof_bid_ask_worsens_exit_without_fabricating_fill(simulated_pg):
+    opened=start_time()
+    ident=open_paper(simulated_pg,"long",D(100),D(98),D(105),
+                     verified_reason(),observed_at=opened)
+    event=opened+timedelta(seconds=3)
+    # Synthetic PG test-only DB ticker fixture; not an exchange receipt.
+    with connection(simulated_pg) as conn:
+        conn.execute("""INSERT INTO market_ticker_events(
+            symbol,exchange_ts,received_ts,event_type,bid_price,ask_price,raw)
+            VALUES('ETHUSDT',%s,%s,'snapshot',99.5,100.1,'{}'::jsonb)""",
+            (event-timedelta(seconds=2),
+             event-timedelta(milliseconds=150)))
+    assert close_paper(simulated_pg,D(100),"manual",observed_at=event,
+                       expected_id=ident)==ident
+    with connection(simulated_pg) as conn:
+        trade=conn.execute("SELECT exit,fee_paid,slippage_paid FROM paper_trades WHERE id=%s",
+                           (ident,)).fetchone()
+        fill=conn.execute("""SELECT quality,spread_cost,slippage_cost,
+                         provenance FROM paper_order_events
+                         WHERE paper_trade_id=%s AND action='exit'""",
+                          (ident,)).fetchone()
+        assert trade["exit"]<D("100")
+        assert fill["quality"]=="observed_bbo_proxy_no_depth_or_executable_fill"
+        assert fill["spread_cost"]>0 and fill["slippage_cost"]>0
+        assert fill["provenance"]["exchange_fill_proven"] is False
+        assert fill["provenance"]["paper_only"] is True
+        assert trade["slippage_paid"]>0
+    assert close_paper(simulated_pg,D(101),"duplicate",observed_at=event,
+                       expected_id=ident) is None
+
+
+def test_round9_recovery_review_is_durable_and_restart_idempotent(simulated_pg):
+    from eth_tester.simulation.review import review_one_closed_trade
+    stamp=start_time()
+    ident=open_paper(simulated_pg,"long",D(100),D(98),D(105),
+                     verified_reason(),observed_at=stamp)
+    close_paper(simulated_pg,D(102),"take",observed_at=stamp+timedelta(seconds=2),
+                expected_id=ident)
+    assert review_one_closed_trade(simulated_pg)=="review_recorded"
+    assert review_one_closed_trade(simulated_pg)=="review_up_to_date"
+    with connection(simulated_pg) as conn:
+        reviews=conn.execute("""SELECT data FROM bot_events
+           WHERE event='paper_trade_review_v1'""").fetchall()
+        assert len(reviews)==1
+        data=reviews[0]["data"]
+        assert data["trade_id"]==ident
+        assert data["paper_only"] is True and data["ml_eligible"] is False
+        assert data["exchange_fill_proven"] is False
+        assert data["drawdown_quality"]=="realized_closed_paper_only"
+        assert data["observed_quality"] in (
+            "unavailable_no_observed_prints",
+            "observed_websocket_partial_not_exchange_complete")
+
+
+def test_round9_research_never_certifies_excursions_over_tick_gap(simulated_pg):
+    from eth_tester.simulation.review import review_one_closed_trade
+    stamp=start_time()
+    ident=open_paper(simulated_pg,"short",D(100),D(102),D(95),
+                     verified_reason(),observed_at=stamp)
+    close_paper(simulated_pg,D(101),"stop",observed_at=stamp+timedelta(seconds=4),
+                expected_id=ident)
+    with connection(simulated_pg) as conn:
+        conn.execute("""INSERT INTO data_gaps(source,symbol,start_ts,
+            end_ts,explanation) VALUES('publicTrade','ETHUSDT',%s,%s,
+            'injected_round9_research_gap')""",
+            (stamp+timedelta(seconds=1),stamp+timedelta(seconds=3)))
+    assert review_one_closed_trade(simulated_pg)=="review_recorded"
+    with connection(simulated_pg) as conn:
+        data=conn.execute("""SELECT data FROM bot_events
+            WHERE event='paper_trade_review_v1'""").fetchone()["data"]
+        assert data["observed_quality"]=="unavailable_gap_or_over_24h_window"
+        assert data["mae_fraction"] is None and data["mfe_fraction"] is None
+
+
+def test_round9_research_insert_crash_rolls_back_and_retries(simulated_pg):
+    from eth_tester.simulation.review import review_one_closed_trade
+    stamp=start_time()
+    ident=open_paper(simulated_pg,"long",D(100),D(98),D(105),
+                     verified_reason(),observed_at=stamp)
+    close_paper(simulated_pg,D(102),"take",observed_at=stamp+timedelta(seconds=2),
+                expected_id=ident)
+    with connection(simulated_pg) as conn:
+        conn.execute("""CREATE FUNCTION qa_review_crash() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+               IF NEW.event='paper_trade_review_v1'
+               THEN RAISE EXCEPTION 'synthetic review commit crash';
+               END IF;
+               RETURN NEW;
+             END; $$;""")
+        conn.execute("""CREATE TRIGGER qa_review_crash_trigger
+             BEFORE INSERT ON bot_events FOR EACH ROW
+             EXECUTE FUNCTION qa_review_crash()""")
+    with pytest.raises(psycopg.Error,match="synthetic review commit crash"):
+        review_one_closed_trade(simulated_pg)
+    with connection(simulated_pg) as conn:
+        assert conn.execute("""SELECT count(*) AS n FROM bot_events
+             WHERE event='paper_trade_review_v1'""").fetchone()["n"]==0
+        assert conn.execute("""SELECT state FROM paper_trades
+             WHERE id=%s""",(ident,)).fetchone()["state"]=="closed"
+        conn.execute("DROP TRIGGER qa_review_crash_trigger ON bot_events")
+        conn.execute("DROP FUNCTION qa_review_crash()")
+    assert review_one_closed_trade(simulated_pg)=="review_recorded"
+    assert review_one_closed_trade(simulated_pg)=="review_up_to_date"
+
+
+def test_round9_pause_blocks_new_entry_but_not_verified_existing_exit(simulated_pg):
+    from eth_tester.runner import engine_tick
+    stamp=start_time()
+    ident=open_paper(simulated_pg,"long",D(100),D(98),D(105),
+                     verified_reason(),observed_at=stamp)
+    with connection(simulated_pg) as conn:
+        conn.execute("UPDATE bot_control SET paused=true WHERE singleton=true")
+        conn.execute("""INSERT INTO feed_health(symbol,topic,status)
+            VALUES('ETHUSDT','connection','connected')""")
+        conn.execute("""INSERT INTO trades(
+            symbol,ts,trade_id,price,qty,side,notional,source)
+            VALUES('ETHUSDT',clock_timestamp()-interval '1 second',
+                   'e9-confirmed-stop',96,1,'Sell',96,'websocket')""")
+    assert engine_tick(simulated_pg)==f"closed_{ident}"
+    with connection(simulated_pg) as conn:
+        assert conn.execute("SELECT paused FROM bot_control").fetchone()["paused"] is True
+        trade=conn.execute("SELECT state,exit_reason FROM paper_trades WHERE id=%s",
+                           (ident,)).fetchone()
+        assert trade["state"]=="closed"
+        assert trade["exit_reason"].startswith("stop")
+        assert conn.execute("""SELECT count(*) AS n FROM paper_order_events
+            WHERE paper_trade_id=%s AND action='exit'""",(ident,)).fetchone()["n"]==1
+    assert engine_tick(simulated_pg)=="paused"
+
+
+def test_round9_entry_costs_are_frozen_across_service_config_changes(simulated_pg):
+    """Restart/config drift cannot rewrite the entry's taker-fee/slippage."""
+    at=start_time()
+    ident=open_paper(simulated_pg,"long",D(100),D(98),D(105),
+                     verified_reason(),observed_at=at)
+    with connection(simulated_pg) as conn:
+        reason=conn.execute("SELECT reason FROM paper_trades WHERE id=%s",
+                            (ident,)).fetchone()["reason"]
+        assert reason["paper_cost_policy"]["version"]=="paper_taker_cost_v1"
+        assert D(reason["paper_cost_policy"]["taker_fee_rate"])==simulated_pg.taker_fee_rate
+    mutated=simulated_pg.model_copy(update={
+        "taker_fee_rate":D(".02"),"slippage_bps":D("100")})
+    close_paper(mutated,D(101),"manual",observed_at=at+timedelta(seconds=2),
+                expected_id=ident)
+    with connection(simulated_pg) as conn:
+        outcome=conn.execute("SELECT exit,fee_paid FROM paper_trades WHERE id=%s",
+                            (ident,)).fetchone()
+        assert outcome["exit"]>D("100")
+        assert outcome["exit"]<D("101")
+        assert outcome["fee_paid"]<D("5")
+        provenance=conn.execute("""SELECT provenance FROM paper_order_events
+           WHERE paper_trade_id=%s AND action='exit'""",(ident,)).fetchone()["provenance"]
+        assert provenance["fee_quality"]=="entry_time_cost_policy_pinned"

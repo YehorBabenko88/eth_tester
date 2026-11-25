@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import nullcontext
 from decimal import Decimal
 from .simulation.execution import number, utc
+from .simulation.operations import conservative_exit_proxy
 from .simulation.live_evidence import (bind_live_paper_reference,
                                        verify_live_paper_row)
 from .simulation.identity import (bind_snapshot_reference,
@@ -98,6 +99,16 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
             raise ValueError("Future trade print cannot price a paper entry")
         if live_tier and event_at-market_event_at>timedelta(seconds=15):
             raise ValueError("Stale bounded live trade print")
+    # Freeze transaction economics at entry. Updating service settings during
+    # a multi-day paper position MUST NOT rewrite its historical exit PnL.
+    cost_policy={"version":"paper_taker_cost_v1",
+                 "taker_fee_rate":str(number(settings.taker_fee_rate)),
+                 "slippage_bps":str(number(settings.slippage_bps)),
+                 "notional_usd":str(number(settings.initial_notional_usd))}
+    if ("paper_cost_policy" in context and
+            context["paper_cost_policy"]!=cost_policy):
+        raise ValueError("Caller attempted to override entry cost policy")
+    context["paper_cost_policy"]=cost_policy
     context['execution_quality']='trade_print_proxy_no_executable_book_proof'
     strategy_version=context['strategy_version']
     # A supplied connection makes signal admission and paper settlement ONE
@@ -188,11 +199,41 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
             validate_transition(position_state,trade_id=trade['id'],
                                 at=event_at,action='close')
         sign=Decimal(1) if trade["direction"]=="long" else Decimal(-1)
-        fill=price*(1-sign*settings.slippage_bps/Decimal(10000))
+        policy=(trade["reason"].get("paper_cost_policy")
+                if isinstance(trade["reason"],dict) else None)
+        if policy is not None:
+            if (not isinstance(policy,dict)
+                    or policy.get("version")!="paper_taker_cost_v1"
+                    or number(policy.get("notional_usd"))!=number(trade["notional"])):
+                raise ValueError("Invalid original paper cost policy")
+            fee_rate=number(policy["taker_fee_rate"])
+            slip_bps=number(policy["slippage_bps"])
+            if not (Decimal(0)<=fee_rate<Decimal(1)
+                    and Decimal(0)<=slip_bps<Decimal(10000)):
+                raise ValueError("Invalid frozen paper cost parameters")
+            fee_quality="entry_time_cost_policy_pinned"
+        else:
+            # Old positions predate the immutable cost snapshot. They remain
+            # closable but cannot claim replay-deterministic entry economics.
+            fee_rate=number(settings.taker_fee_rate)
+            slip_bps=number(settings.slippage_bps)
+            fee_quality="legacy_unpinned_cost_policy"
+        # The BBO is as-of the crossing, never inferred from future ticks.
+        # These remain non-executable simulations with no order routing.
+        verified_quote=conn.execute("""SELECT exchange_ts,received_ts,
+                 bid_price,ask_price FROM market_ticker_events
+             WHERE symbol=%s AND exchange_ts<=%s AND received_ts<=%s
+               AND exchange_ts >= %s - interval '3 seconds'
+               AND bid_price>0 AND ask_price>0
+             ORDER BY exchange_ts DESC,received_ts DESC LIMIT 1""",
+             (settings.symbol,event_at,event_at,event_at)).fetchone()
+        proxy=conservative_exit_proxy(trade["direction"],price,event_at,
+                                      verified_quote)
+        fill=proxy["reference"]*(1-sign*slip_bps/Decimal(10000))
         if fill<=0:
             raise ValueError('Nonpositive exit fill')
         gross=sign*trade["qty"]*(fill-trade["entry"])
-        exit_fee=trade["qty"]*fill*settings.taker_fee_rate
+        exit_fee=trade["qty"]*fill*fee_rate
         verified_sum=Decimal(0)
         evidence=list(funding_evidence or ())
         for event in evidence:
@@ -207,15 +248,21 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
         conn.execute("""UPDATE paper_trades SET state='closed',closed_at=%s,exit=%s,
           fee_paid=fee_paid+%s,slippage_paid=slippage_paid+%s,funding_paid=%s,
           gross_pnl=%s,net_pnl=%s,exit_reason=%s WHERE id=%s AND state='open'""",
-          (event_at,fill,exit_fee,abs(fill-price)*trade["qty"],funding,gross,net,reason,trade["id"]))
+          (event_at,fill,exit_fee,abs(fill-proxy["reference"])*trade["qty"],funding,gross,net,reason,trade["id"]))
         record_fill(conn,trade_id=trade['id'],symbol=settings.symbol,
                     event_id=f"paper:{trade['id']}:exit:{event_at.isoformat()}",
                     at=event_at,observed_at=observation_time(event_at),
                     side='Sell' if trade['direction']=='long' else 'Buy',
                     action='exit',qty=trade['qty'],price=fill,fee=exit_fee,
-                    slippage_cost=abs(fill-price)*trade['qty'],
-                    quality='trade_print_proxy_no_liquidity',
-                    provenance={'exit_reason':reason,'funding_quality':'unverified'})
+                    slippage_cost=abs(fill-proxy["reference"])*trade['qty'],
+                    spread_cost=trade["qty"]*proxy["spread_reference_cost_per_unit"],
+                    quality=proxy["quality"],
+                    provenance={'exit_reason':reason,'funding_quality':'unverified',
+                                'spread_reference_cost_embedded_in_gross':True,
+                                'quote_asof_crossing':proxy["quality"].startswith(
+                                    "observed_bbo_proxy"),
+                                'paper_only':True,'exchange_fill_proven':False,
+                                'fee_quality':fee_quality})
         for event in evidence:
             mark_funding_event(conn,trade_id=trade['id'],funding_at=event['ts'],
                                observed_at=observation_time(event['ts']),
