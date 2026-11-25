@@ -1,5 +1,5 @@
 """Replay raw order book deltas; decreases cannot be attributed to fills vs cancellations."""
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from decimal import Decimal
 import json
 from .database import connection
