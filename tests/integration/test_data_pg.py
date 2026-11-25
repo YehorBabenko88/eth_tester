@@ -18,9 +18,12 @@ class ClosedCandleClient:
         if endpoint != "kline":
             raise AssertionError(f"Unexpected endpoint {endpoint}")
         start, end = kw["start"], kw["end"]
+        starts = list(range(start, end + 1, 86400000))
+        if kw.get("limit") == 1:
+            starts = starts[-1:]  # the availability probe requests one bar
         return {"list": [
             [str(ts), "100", "101", "99", "100", "1", "100"]
-            for ts in range(start, end + 1, 86400000)]}
+            for ts in starts]}
 
 
 class MissingCandleClient:
@@ -53,7 +56,7 @@ def test_data_candle_coverage_verified_and_missing(pg_settings):
         assert [x["status"] for x in states] == ["unavailable"]
         cursor = conn.execute("""SELECT status FROM ingestion_cursor
             WHERE source='kline:index' AND symbol='ETHUSDT' AND interval='D'""").fetchone()
-        assert cursor["status"] != "verified"
+        assert cursor is None  # never mark unavailable historic data as loaded
 
 
 def test_data_oi_period_conflict_is_not_overwritten(pg_settings):
