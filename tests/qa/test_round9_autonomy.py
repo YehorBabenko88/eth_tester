@@ -41,7 +41,7 @@ def test_independent_application_watchdog_restarts_only_stalled_owned_pid():
         _terminate=terminate,
     )
     watchdog = HealthWatchdog(clock=lambda: 500, checker=lambda _: {
-        "paper_engine": 999, "live_paper_window": 0,
+        "paper_engine": 999, "live_paper_window": 0, "analytics": 0,
     })
     assert asyncio.run(watchdog.check_once(fake, object())) == "checked"
     assert terminated == []

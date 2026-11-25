@@ -150,15 +150,16 @@ def test_watchdog_terminate_permission_error_does_not_stop_all_workers():
     )
     watchdog = HealthWatchdog(
         clock=lambda: 1000,
-        checker=lambda _: {"paper_engine": 999, "live_paper_window": 0},
+        checker=lambda _: {"paper_engine": 999, "live_paper_window": 0,
+                           "analytics": 0},
     )
     assert asyncio.run(watchdog.check_once(supervisor, object())) == "checked"
     assert asyncio.run(watchdog.check_once(supervisor, object())) == "checked"
     assert calls == ["engine"]
-    assert any(args[:2] == ("watchdog", "repair_failed") for args, _ in records)
+    assert any(args[:2] == ("watchdog", "recovery_failed") for args, _ in records)
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX directory-swap injection")
+@pytest.mark.skipif(os.name != "posix", reason="POSIX-only dirfd replacement test")
 def test_owned_temp_root_replacement_never_deletes_foreign_file(monkeypatch, tmp_path):
     """Rename+symlink root after marker validation must not cross ownership."""
     from eth_tester.storage.maintenance import (
@@ -172,23 +173,39 @@ def test_owned_temp_root_replacement_never_deletes_foreign_file(monkeypatch, tmp
     victim = foreign / ("eth-tester-stage-" + "a" * 32 + ".part")
     victim.write_bytes(b"FOREIGN: never delete")
     os.utime(victim, (1, 1))
-    real_iterdir = Path.iterdir
+    # B's cleanup pins its directory with os.open(...O_DIRECTORY|O_NOFOLLOW)
+    # and enters the actual file iteration with os.scandir(dirfd). Inject the
+    # rename->symlink substitution AT THAT FD BOUNDARY, not at Path.iterdir
+    # (the latter is never called and made the old QA test false-green).
+    owned = own / ("eth-tester-stage-" + "b" * 32 + ".part")
+    owned.write_bytes(b"OWNED: eligible for cleanup")
+    os.utime(owned, (1, 1))
+    real_scandir = os.scandir
     did_swap = False
 
-    def swap_at_iteration(path):
+    def swap_at_fd_scandir(dirfd):
         nonlocal did_swap
-        if path == own and not did_swap:
+        if isinstance(dirfd, int) and not did_swap:
             did_swap = True
             own.rename(saved)
             own.symlink_to(foreign, target_is_directory=True)
-        return real_iterdir(path)
+        return real_scandir(dirfd)
 
-    monkeypatch.setattr(Path, "iterdir", swap_at_iteration)
+    monkeypatch.setattr(os, "scandir", swap_at_fd_scandir)
     try:
+        # A secure implementation may either complete on its pinned original
+        # directory handle or reject after noticing a root identity change.
         try:
-            cleanup_owned_temp(own, now=7200, older_than_seconds=3600)
+            result = cleanup_owned_temp(
+                own, now=7200, older_than_seconds=3600
+            )
         except RuntimeError:
-            pass
+            result = None
+        assert did_swap is True, "QA race hook did not actually run"
+        if result is not None:
+            assert result["raw_market_data_deleted"] == 0
+            assert result["deleted_owned_temp_files"] == 1
+            assert not (saved / owned.name).exists()
         assert victim.is_file(), "TOCTOU deleted a foreign QA fixture"
         assert victim.read_bytes() == b"FOREIGN: never delete"
     finally:
