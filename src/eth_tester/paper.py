@@ -115,6 +115,10 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
     # A supplied connection makes signal admission and paper settlement ONE
     # transaction. Do not commit a 'candidate' before the paper entry.
     with (nullcontext(conn) if conn is not None else connection(settings)) as conn:
+        # Direct/manual openings must not hold GLOBAL indefinitely. Runner
+        # already sets the same limits before acquiring its nonblocking lease.
+        conn.execute("SET LOCAL lock_timeout = '2000ms'")
+        conn.execute("SET LOCAL statement_timeout = '5000ms'")
         conn.execute("SELECT pg_advisory_xact_lock(20991991)")
         position_state=lock_state(conn)
         validate_transition(position_state,trade_id=None,at=event_at,action='open')
@@ -140,6 +144,14 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
             raise RuntimeError("Paused")
         if conn.execute("SELECT 1 FROM paper_trades WHERE state='open'").fetchone():
             raise RuntimeError("One trade only")
+        # Closed paper net cash is provisional until independently attested
+        # funding schedule, fees and execution. Do not compound unverified
+        # profits/losses into the risk budget of future LIVE paper entries.
+        # Manual QA/backtest fixtures remain unverified and separate.
+        if live_candidate and conn.execute("""SELECT 1 FROM paper_trades
+              WHERE state='closed' AND funding_verified IS NOT TRUE
+              LIMIT 1""").fetchone():
+            raise RuntimeError("Unreconciled provisional paper equity; admission blocked")
         account=conn.execute("SELECT equity FROM paper_account WHERE id=1 FOR UPDATE").fetchone()
         daily=conn.execute("""SELECT coalesce(sum(net_pnl),0) AS pnl FROM paper_trades
           WHERE state='closed' AND closed_at>=%s""",(event_at.replace(hour=0,minute=0,second=0,microsecond=0),)).fetchone()["pnl"]
@@ -181,10 +193,11 @@ def _canonical_funding_rows(conn,symbol,opened,closed):
       (SELECT m.mark_price FROM market_ticker_events m
        WHERE m.symbol=f.symbol AND m.exchange_ts<=f.ts
          AND m.exchange_ts>=f.ts-interval '1 second'
+         AND m.received_ts<=%s
          AND m.mark_price>0 ORDER BY m.exchange_ts DESC,m.id DESC
        LIMIT 1) AS mark_price
       FROM funding f WHERE f.symbol=%s AND f.ts>%s AND f.ts<=%s
-      ORDER BY f.ts""",(symbol,opened,closed)).fetchall()
+      ORDER BY f.ts""",(closed,symbol,opened,closed)).fetchall()
 
 
 def _require_live_exit_source(conn,trade,event_at,price,reason):
@@ -241,6 +254,11 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
         raise ValueError('Invalid exit price')
     event_at=utc(observed_at) if observed_at is not None else datetime.now(timezone.utc)
     with connection(settings) as conn:
+        # A stuck engine/session holding GLOBAL or source cannot indefinitely
+        # suspend 24/7 monitoring. Timeout means no synthetic exit or ledger
+        # mutation: the whole transaction rolls back and supervisor retries.
+        conn.execute("SET LOCAL lock_timeout = '2000ms'")
+        conn.execute("SET LOCAL statement_timeout = '5000ms'")
         conn.execute("SELECT pg_advisory_xact_lock(20991991)")
         position_state=lock_state(conn)
         trade=conn.execute("SELECT * FROM paper_trades WHERE state='open' FOR UPDATE").fetchone()

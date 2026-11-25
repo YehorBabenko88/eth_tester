@@ -90,6 +90,115 @@ def _try_paper_admission_mutex(conn):
     return result is not None and result["acquired"] is True
 
 
+_INDEPENDENT_SHADOW_VERSION = "eth_observed_minute_shadow_v1"
+
+
+def record_closed_bar_research(settings):
+    """One prospective shadow observation per actual closed UTC minute.
+
+    Independent of v3 paper candidates, bot_control, an open paper position,
+    or whether an incumbent signal exists. An immutable primary-keyed
+    diagnostic is NOT B-authenticated source evidence or certified ML cohort.
+    Missing/degraded current minutes are recorded unavailable, never
+    retrospectively replayed as originally observed data after recovery.
+    """
+    from .strategies.ensemble import evaluate_closed_bar_research
+    with connection(settings) as conn:
+        conn.execute("SET LOCAL lock_timeout = '2000ms'")
+        conn.execute("SET LOCAL statement_timeout = '5000ms'")
+        clock = conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
+        if (clock.tzinfo is None or clock.utcoffset() != timedelta(0)):
+            raise RuntimeError("Untrusted prospective research DB clock")
+        bar_ts = clock.replace(second=0, microsecond=0) - timedelta(minutes=1)
+        if not timedelta(0) <= clock-(bar_ts+timedelta(minutes=1)) <= timedelta(seconds=90):
+            return "research_expired_no_replay"
+        # Independent research lease has NO edge to paper GLOBAL/SOURCE locks.
+        lease = conn.execute(
+            "SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS acquired",
+            (f"eth_research_observe:{settings.symbol}:1:{bar_ts.isoformat()}",)
+        ).fetchone()
+        if not lease or lease["acquired"] is not True:
+            return "research_busy"
+        seen = conn.execute("""SELECT 1 FROM strategy_signals WHERE symbol=%s
+          AND tf='1' AND bar_ts=%s AND version=%s""",
+          (settings.symbol,bar_ts,_INDEPENDENT_SHADOW_VERSION)).fetchone()
+        if seen:
+            return "research_already_observed"
+        bars = conn.execute("""SELECT ts,open,high,low,close,volume,closed
+            FROM candles WHERE symbol=%s AND kind='trade' AND tf='1'
+            AND ts>=%s AND ts<=%s ORDER BY ts DESC LIMIT 180""",
+            (settings.symbol,bar_ts-timedelta(minutes=179),bar_ts)).fetchall()
+        bars = list(reversed(bars))
+        health = conn.execute("""SELECT status FROM feed_health WHERE symbol=%s
+            AND topic='connection' AND ts<=%s ORDER BY ts DESC LIMIT 1""",
+            (settings.symbol,clock)).fetchone()
+        unavailable = None
+        if not bars or bars[-1]["ts"] != bar_ts:
+            unavailable = "current_minute_candle_not_observed"
+        elif any(bar.get("closed") is not True for bar in bars):
+            unavailable = "unavailable_or_invalid_closed_bar_window"
+        elif health is None or health["status"] != "connected":
+            unavailable = "source_not_connected_at_observation"
+        else:
+            gap = conn.execute("""SELECT 1 FROM data_gaps
+                WHERE symbol=%s AND source IN ('publicTrade','orderbook')
+                AND start_ts<=%s
+                AND coalesce(end_ts,resolved_at,'infinity'::timestamptz)>=%s
+                LIMIT 1""",
+                (settings.symbol,clock,bars[0]["ts"])).fetchone()
+            if gap:
+                unavailable = "source_gap_in_observed_window"
+        shadow = None
+        if unavailable is None:
+            shadow = evaluate_closed_bar_research(
+                bars,observed_at=clock,
+                taker_fee_rate=settings.taker_fee_rate,
+                slippage_bps=settings.slippage_bps)
+            if (not isinstance(shadow,dict)
+                or shadow.get("independent_of_incumbent") is not True
+                or shadow.get("paper_entry_authorized") is not False
+                or shadow.get("ml_eligible") is not False):
+                raise ValueError("Noncanonical independent research envelope")
+            if (shadow.get("bar_ts") != bar_ts.isoformat()
+                or shadow.get("input_bar_count",0) < 60):
+                unavailable = "unavailable_or_invalid_closed_bar_window"
+        if unavailable is not None:
+            decision = "research_unavailable"
+        elif shadow.get("status") == "shadow_candidates":
+            decision = "research_candidates_unverified"
+        else:
+            decision = "research_no_trade"
+        # The original PostgreSQL observation time and unique strategy key
+        # are durable. The feature bars/source session are NOT an immutable
+        # independently attested B exchange receipt, even after a successful
+        # closed=True SQL read.
+        report = {
+            "contract": _INDEPENDENT_SHADOW_VERSION,
+            "bar_ts":bar_ts.isoformat(), "observed_at":clock.isoformat(),
+            "observation_time_source":"postgres_clock_timestamp",
+            "independent_of_incumbent":True,
+            "paper_only":True, "paper_entry_authorized":False,
+            "ml_eligible":False, "funding_verified":False,
+            "exchange_complete":False, "prospective_source_certified":False,
+            "research_cohort_complete":False, "source_identity_authoritative":False,
+            "source_quality":"db_closed_minute_unverified_source_membership",
+            "no_historical_backfill":True,
+            "unavailable_reason":unavailable,
+            "shadow":shadow
+        }
+        committed = conn.execute("""SELECT clock_timestamp() AS ts""").fetchone()["ts"]
+        if committed > bar_ts + timedelta(seconds=150):
+            return "research_expired_no_replay"
+        row = conn.execute("""INSERT INTO strategy_signals(
+            symbol,tf,bar_ts,version,decision,reason)
+            VALUES(%s,'1',%s,%s,%s,%s::jsonb)
+            ON CONFLICT(symbol,tf,bar_ts,version) DO NOTHING
+            RETURNING decision""",
+            (settings.symbol,bar_ts,_INDEPENDENT_SHADOW_VERSION,
+             decision,json.dumps(report,sort_keys=True,default=str))).fetchone()
+        return decision if row else "research_already_observed"
+
+
 def engine_tick(settings):
     """Single-shot paper admission: evidence and entry commit atomically.
 
@@ -150,7 +259,7 @@ def engine_tick(settings):
                 return "paused"
             # Preserve historical outage evidence without permanently
             # blocking a future, independently observed clean bar.
-            bars=conn.execute("""SELECT ts,open,high,low,close,volume FROM candles
+            bars=conn.execute("""SELECT ts,open,high,low,close,volume,closed FROM candles
               WHERE symbol=%s AND kind='trade' AND tf='1' AND closed
               AND ts<=%s ORDER BY ts DESC LIMIT 180""",
               (settings.symbol,now-timedelta(minutes=1))).fetchall()
@@ -300,6 +409,16 @@ async def run_engine(settings):
     Research reviews are restart-safe and cannot change simulated settlements.
     """
     while True:
+        # Independent every-closed-minute research MUST run even when the
+        # incumbent v3 has no signal, paper position is open, or bot paused.
+        # This never trains, changes the paper position or contacts exchange.
+        try:
+            await asyncio.to_thread(record_closed_bar_research,settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.warning("Independent shadow observation unavailable (%s)",
+                           type(exc).__name__)
         try:
             state=await asyncio.to_thread(engine_tick,settings)
         except asyncio.CancelledError:

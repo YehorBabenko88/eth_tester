@@ -134,10 +134,12 @@ def test_funding_mark_breakdown_is_atomic(simulated_pg):
     with connection(simulated_pg) as conn:
         conn.execute("""INSERT INTO funding(symbol,ts,rate)
            VALUES('ETHUSDT',%s,%s)""",(event['ts'],event['rate']))
+        # Test-only historical receipt, NOT evidence that the exchange
+        # actually published a complete funding schedule.
         conn.execute("""INSERT INTO market_ticker_events(
-           symbol,exchange_ts,event_type,mark_price,raw)
-           VALUES('ETHUSDT',%s,'snapshot',%s,'{}'::jsonb)""",
-           (event['ts'],event['mark_price']))
+           symbol,exchange_ts,received_ts,event_type,mark_price,raw)
+           VALUES('ETHUSDT',%s,%s,'snapshot',%s,'{}'::jsonb)""",
+           (event['ts'],event['ts'],event['mark_price']))
     with pytest.raises(ValueError, match='breakdown'):
         close_paper(simulated_pg, 105, 'take', funding_paid=amount + D(1),
                     observed_at=stamp + timedelta(seconds=30), expected_id=ident,
@@ -627,9 +629,9 @@ def test_round11_canonical_funding_rate_mark_mismatch_fails_closed(simulated_pg)
         conn.execute("""INSERT INTO funding(symbol,ts,rate)
              VALUES('ETHUSDT',%s,.001)""",(rate_at,))
         conn.execute("""INSERT INTO market_ticker_events(
-             symbol,exchange_ts,event_type,mark_price,raw)
-             VALUES('ETHUSDT',%s,'snapshot',100,'{}'::jsonb)""",
-             (rate_at,))
+             symbol,exchange_ts,received_ts,event_type,mark_price,raw)
+             VALUES('ETHUSDT',%s,%s,'snapshot',100,'{}'::jsonb)""",
+             (rate_at,rate_at))
         qty=conn.execute("SELECT qty FROM paper_trades WHERE id=%s",
                          (ident,)).fetchone()["qty"]
     forged={"ts":rate_at,"rate":D(".002"),"mark_price":D("100")}
@@ -804,3 +806,75 @@ def test_round12_pg_source_wait_times_out_and_global_recovers(simulated_pg):
         # An aborted opener cannot poison the global mutex.
         with connection(simulated_pg) as closer:
             assert _try_paper_admission_mutex(closer) is True
+
+
+def test_round14_late_received_mark_cannot_rewrite_asof_funding(simulated_pg):
+    """A funding-time mark acquired only AFTER the exit cannot certify
+    historical cash economics. No exchange network or user DB is accessed.
+    """
+    from eth_tester.paper import _canonical_funding_rows
+    at=start_time()+timedelta(seconds=20)
+    closed=at+timedelta(seconds=5)
+    with connection(simulated_pg) as conn:
+        conn.execute("INSERT INTO funding(symbol,ts,rate) VALUES('ETHUSDT',%s,.001)",(at,))
+        conn.execute("""INSERT INTO market_ticker_events(
+            symbol,exchange_ts,received_ts,event_type,mark_price,raw)
+            VALUES('ETHUSDT',%s,%s,'snapshot',100,'{}'::jsonb)""",
+            (at,closed+timedelta(seconds=1)))
+        rows=_canonical_funding_rows(conn,'ETHUSDT',at-timedelta(seconds=1),closed)
+        assert len(rows)==1 and rows[0]["mark_price"] is None
+
+
+def test_round14_independent_minute_research_pg_idempotent(simulated_pg):
+    """Actual durable PostgreSQL unique key, original DB clock and no-entry
+    independent D shadow. This test is NOT a verified B exchange receipt.
+    """
+    from eth_tester.runner import record_closed_bar_research,_INDEPENDENT_SHADOW_VERSION
+    with connection(simulated_pg) as conn:
+        clock=conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
+        if clock.second>50:
+            pytest.skip("Live wall-clock minute rollover too near for deterministic fixture")
+        target=clock.replace(second=0,microsecond=0)-timedelta(minutes=1)
+        # Complete aligned three-hour history for D's 5m/15m MTF checks.
+        for i in range(180):
+            ts=target-timedelta(minutes=179-i)
+            conn.execute("""INSERT INTO candles(
+                symbol,kind,tf,ts,open,high,low,close,volume,closed,source,quality)
+                VALUES('ETHUSDT','trade','1',%s,100,101,99,100,7,true,
+                'test_synthetic','unverified')""",(ts,))
+        conn.execute("""INSERT INTO feed_health(symbol,topic,ts,status,detail)
+            VALUES('ETHUSDT','connection',%s,'connected',
+                   '{"session_id":"qa_only_unverified"}'::jsonb)""",
+                     (clock-timedelta(seconds=1),))
+    first=record_closed_bar_research(simulated_pg)
+    assert first in ("research_no_trade","research_candidates_unverified")
+    assert record_closed_bar_research(simulated_pg)=="research_already_observed"
+    with connection(simulated_pg) as conn:
+        rows=conn.execute("""SELECT decision,reason FROM strategy_signals
+            WHERE symbol='ETHUSDT' AND tf='1' AND bar_ts=%s AND version=%s""",
+            (target,_INDEPENDENT_SHADOW_VERSION)).fetchall()
+        assert len(rows)==1
+        assert rows[0]["decision"]==first
+        reason=rows[0]["reason"]
+        assert reason["independent_of_incumbent"] is True
+        assert reason["research_cohort_complete"] is False
+        assert reason["paper_entry_authorized"] is False
+        assert reason["prospective_source_certified"] is False
+        assert conn.execute("SELECT count(*) AS n FROM paper_trades").fetchone()["n"]==0
+
+
+def test_round14_shadow_lease_contention_does_not_write(simulated_pg):
+    """Concurrency cannot write duplicate source-unverified research rows."""
+    from eth_tester.runner import record_closed_bar_research,_INDEPENDENT_SHADOW_VERSION
+    with connection(simulated_pg) as holder:
+        clock=holder.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
+        if clock.second>50:
+            pytest.skip("Minute boundary too near for deterministic advisory lock key")
+        target=clock.replace(second=0,microsecond=0)-timedelta(minutes=1)
+        holder.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+          (f"eth_research_observe:ETHUSDT:1:{target.isoformat()}",))
+        assert record_closed_bar_research(simulated_pg)=="research_busy"
+        found=holder.execute("""SELECT count(*) AS n FROM strategy_signals
+          WHERE symbol='ETHUSDT' AND version=%s""",
+          (_INDEPENDENT_SHADOW_VERSION,)).fetchone()["n"]
+        assert found==0
