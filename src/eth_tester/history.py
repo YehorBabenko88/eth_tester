@@ -61,11 +61,15 @@ async def collect_funding(settings,client):
     now=toms(datetime.now(UTC))
     while pos<now:
         end=min(now-1,pos+30*86400000-1)
-        data=await client.get("funding/history",category=settings.category,symbol=settings.symbol,
-                               startTime=pos,endTime=end,limit=200)
-        items=data.get("list",[])
-        if len(items)>=200:
-            raise RuntimeError("Funding at API page limit; refuse to skip records")
+        while True:
+            data=await client.get("funding/history",category=settings.category,symbol=settings.symbol,
+                                   startTime=pos,endTime=end,limit=200)
+            items=data.get("list",[])
+            if len(items)<200:
+                break
+            if end-pos<60000:
+                raise RuntimeError("Funding page still saturated at 1-minute window")
+            end=pos+max(1,(end-pos)//2)
         with connection(settings) as conn:
             for row in items:
                 ts=int(row["fundingRateTimestamp"])
