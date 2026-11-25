@@ -106,3 +106,30 @@ def test_stale_settlement_rejected_and_open_unchanged(simulated_pg):
         state = conn.execute('SELECT version,paper_trade_id FROM paper_position_state').fetchone()
         assert row['state'] == 'open'
         assert state['version'] == 1 and state['paper_trade_id'] == ident
+
+
+def test_funding_mark_breakdown_is_atomic(simulated_pg):
+    stamp = start_time()
+    ident = open_paper(simulated_pg, 'long', 100, 98, 105,
+                       {'strategy_version': 'eth_rules_v2'}, observed_at=stamp)
+    with connection(simulated_pg) as conn:
+        qty = conn.execute('SELECT qty FROM paper_trades WHERE id=%s',
+                           (ident,)).fetchone()['qty']
+    event = {'ts': stamp + timedelta(seconds=20), 'rate': D('0.001'),
+             'mark_price': D(100)}
+    amount = qty * D('0.1')
+    with pytest.raises(ValueError, match='breakdown'):
+        close_paper(simulated_pg, 105, 'take', funding_paid=amount + D(1),
+                    observed_at=stamp + timedelta(seconds=30), expected_id=ident,
+                    funding_evidence=[event])
+    with connection(simulated_pg) as conn:
+        assert conn.execute('SELECT count(*) AS n FROM paper_funding_events').fetchone()['n'] == 0
+        assert conn.execute('SELECT version FROM paper_position_state').fetchone()['version'] == 1
+    assert close_paper(simulated_pg, 105, 'take', funding_paid=amount,
+                       observed_at=stamp + timedelta(seconds=30), expected_id=ident,
+                       funding_evidence=[event]) == ident
+    with connection(simulated_pg) as conn:
+        row = conn.execute('SELECT amount,mark_price,quality FROM paper_funding_events').fetchone()
+        assert row['amount'] == amount and row['mark_price'] == D(100)
+        assert 'unverified' in row['quality']
+        assert conn.execute('SELECT version FROM paper_position_state').fetchone()['version'] == 2
