@@ -1,4 +1,4 @@
-"""Real, isolated PostgreSQL 17 integration; never touches user databases."""
+"""Real, isolated PostgreSQL 17/18 integration; never touches user databases."""
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal as D
 import os
@@ -12,6 +12,8 @@ import pytest
 from eth_tester.analytics import build_footprint
 from eth_tester.database import connection, init_database, save_cursor, cursor_ts
 from eth_tester.live import ingest_ws
+from eth_tester.data_quality import DataIntegrityError
+from eth_tester.strategies import Parameters
 from eth_tester.paper import open_paper
 from eth_tester.rollups import rollup_day
 from eth_tester.config import Settings
@@ -42,10 +44,14 @@ def test_schema_and_one_open_position_guard(pg_settings):
         row = conn.execute("SELECT equity FROM paper_account WHERE id=1").fetchone()
         assert row["equity"] == pg_settings.initial_equity_usd
         conn.execute("UPDATE bot_control SET enabled=true,paused=false WHERE singleton=true")
-    first_id = open_paper(pg_settings, "long", D(100), D("99.5"), D(104), {"qa": True})
+    first_id = open_paper(pg_settings, "long", D(100), D("99.5"), D(104),
+                       {"qa": True, "strategy_version": Parameters().version,
+                        **Parameters().identity()})
     assert first_id > 0
     with pytest.raises(RuntimeError, match="One trade only"):
-        open_paper(pg_settings, "short", D(100), D(102), D(96), {"qa": True})
+        open_paper(pg_settings, "short", D(100), D(102), D(96),
+                   {"qa": True, "strategy_version": Parameters().version,
+                    **Parameters().identity()})
     with pytest.raises(psycopg.errors.UniqueViolation):
         with connection(pg_settings) as conn:
             conn.execute("""INSERT INTO paper_trades
@@ -160,7 +166,6 @@ def test_partial_archive_cannot_close_multiday_gap(pg_settings):
     assert remaining == 1
 
 
-@pytest.mark.xfail(strict=False, reason="DATA Issue #10: differing trade_id replay is silently dropped")
 def test_conflicting_duplicate_trade_is_explicitly_rejected(pg_settings):
     stamp = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
     first = {"topic": "publicTrade.ETHUSDT", "data": [
@@ -169,6 +174,65 @@ def test_conflicting_duplicate_trade_is_explicitly_rejected(pg_settings):
         {"i": "same-id", "T": stamp, "p": "100", "v": "2", "S": "Buy"}]}
     with connection(pg_settings) as conn:
         ingest_ws(conn, "ETHUSDT", first)
-    with pytest.raises((ValueError, RuntimeError, psycopg.Error)):
+    with pytest.raises(DataIntegrityError, match="Conflicting WS trade ID"):
         with connection(pg_settings) as conn:
             ingest_ws(conn, "ETHUSDT", changed)
+    with connection(pg_settings) as conn:
+        original = conn.execute(
+            "SELECT price,qty FROM trades WHERE symbol='ETHUSDT' AND trade_id='same-id'"
+        ).fetchone()
+    assert (original["price"], original["qty"]) == (D(100), D(1))
+
+
+def test_new_paper_admission_rejects_missing_or_tampered_identity(pg_settings):
+    """MASTER round 2: no new admission with unknown version/hash."""
+    with connection(pg_settings) as conn:
+        conn.execute("UPDATE bot_control SET enabled=true,paused=false WHERE singleton=true")
+    valid = {"strategy_version": Parameters().version, **Parameters().identity()}
+    invalid = (
+        {"source": "unversioned"},
+        {**valid, "parameter_sha256": "0" * 64},
+        {**valid, "strategy_version": ""},
+    )
+    for reason in invalid:
+        with pytest.raises((ValueError, RuntimeError), match="(?i)version|hash|parameter"):
+            open_paper(pg_settings, "long", D(100), D("99.5"), D(104), reason)
+    with connection(pg_settings) as conn:
+        count = conn.execute(
+            "SELECT count(*) AS n FROM paper_trades WHERE state='open'"
+        ).fetchone()["n"]
+    assert count == 0
+
+
+def test_no_signal_persists_full_versioned_engine_identity(pg_settings, monkeypatch):
+    """MASTER contract: no_signal records must carry the same identity as signals."""
+    import importlib
+
+    engine = importlib.import_module("eth_tester.runner")
+    monkeypatch.setattr(engine, "price_signal", lambda *_args, **_kwargs: None)
+    current = datetime.now(timezone.utc)
+    last = current.replace(second=0, microsecond=0) - timedelta(minutes=2)
+    with connection(pg_settings) as conn:
+        conn.execute("UPDATE bot_control SET enabled=true,paused=false WHERE singleton=true")
+        conn.execute("""INSERT INTO feed_health(symbol,topic,status)
+            VALUES('ETHUSDT','connection','connected')""")
+        conn.execute("""INSERT INTO trades(symbol,ts,trade_id,price,qty,side,
+            notional,source) VALUES('ETHUSDT',%s,'qa-recent',100,1,'Buy',100,'websocket')""",
+            (current - timedelta(seconds=1),))
+        for offset in range(35):
+            stamp = last - timedelta(minutes=34-offset)
+            conn.execute("""INSERT INTO candles(symbol,kind,tf,ts,open,high,
+                low,close,volume,turnover,source)
+                VALUES('ETHUSDT','trade','1',%s,100,101,99,100,1,100,'qa')""",
+                (stamp,))
+    assert engine.engine_tick(pg_settings) == "no_signal"
+    with connection(pg_settings) as conn:
+        saved = conn.execute("""SELECT version,reason FROM strategy_signals
+            WHERE symbol='ETHUSDT' AND tf='1' AND bar_ts=%s""", (last,)).fetchone()
+    assert saved is not None
+    parameters = Parameters()
+    expected_hash = parameters.identity()["parameter_sha256"]
+    assert saved["version"].startswith(parameters.version + ":")
+    assert expected_hash[:12] in saved["version"]
+    assert saved["reason"]["strategy_version"] == parameters.version
+    assert saved["reason"]["parameter_sha256"] == expected_hash

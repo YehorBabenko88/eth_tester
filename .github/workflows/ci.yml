@@ -3,6 +3,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "Exact pinned main commit SHA (40 hexadecimal characters)"
+        required: true
+        type: string
+concurrency:
+  group: eth-tester-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 permissions:
   contents: read
 jobs:
@@ -16,6 +25,11 @@ jobs:
         python: ['3.11', '3.12']
     steps:
       - uses: actions/checkout@v4
+      - name: Verify pinned checkpoint commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: python -c "import os,subprocess,re; expected=os.environ['EXPECTED_SHA'].lower(); actual=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip().lower(); assert re.fullmatch('[0-9a-f]{40}',expected) and actual==expected, f'Checkpoint SHA mismatch or invalid: expected={expected}, actual={actual}'"
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -38,8 +52,14 @@ jobs:
             }
           }
         continue-on-error: false
-      - run: python -m pytest -q -m "not postgres"
+      - run: python -m pytest -q -ra -m "not postgres" --junitxml=qa-unit.xml
         if: always()
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa-unit-${{ matrix.os }}-py${{ matrix.python }}
+          path: qa-unit.xml
+          if-no-files-found: warn
   postgres-integration:
     name: real PostgreSQL ${{ matrix.postgres }} integration
     runs-on: ubuntu-latest
@@ -63,9 +83,20 @@ jobs:
       ETH_TEST_PG_DSN: postgresql://postgres:postgres@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v4
+      - name: Verify pinned checkpoint commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: python -c "import os,subprocess,re; expected=os.environ['EXPECTED_SHA'].lower(); actual=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip().lower(); assert re.fullmatch('[0-9a-f]{40}',expected) and actual==expected, f'Checkpoint SHA mismatch or invalid: expected={expected}, actual={actual}'"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest -q -m postgres tests/integration
-      - run: python -m pytest -q tests/test_storage_postgres.py
+      - name: Real PostgreSQL - Data, Storage, Analytics, Simulation and ML
+        run: python -m pytest -q -ra tests/integration tests/test_storage_postgres.py tests/test_learning_postgres.py --junitxml=qa-postgres-${{ matrix.postgres }}.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa-postgresql-${{ matrix.postgres }}
+          path: qa-postgres-${{ matrix.postgres }}.xml
+          if-no-files-found: warn

@@ -113,3 +113,16 @@ def test_archive_timestamps_and_reject_invalid_side():
     assert (trade_id, price * qty, side) == ("test-1", D("4200.300"), "Buy")
     with pytest.raises(ValueError, match="aggressor"):
         parse_trade({**value, "side": "Unknown"})
+
+
+def test_telegram_partial_update_fails_closed(monkeypatch):
+    """Missing top-level Telegram objects must never grant control."""
+    monkeypatch.setenv("ETH_TESTER_TG_USER_ID", "456")
+    config = SimpleNamespace(tg_chat_id="123")
+    person = SimpleNamespace(id=456, is_bot=False)
+    chat = SimpleNamespace(id=123, type="private")
+    assert not authorise(config, SimpleNamespace())
+    assert not authorise(config, SimpleNamespace(effective_user=person))
+    assert not authorise(config, SimpleNamespace(effective_chat=chat))
+    assert not authorise(config, SimpleNamespace(
+        effective_user=None, effective_chat=chat))
