@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from eth_tester.orderflow import _matches_volume, _valid_oi, confirm_rejection, _certified_snapshot
 from eth_tester.ml import FEATURE_NAMES
+from eth_tester.strategies import strategy_identity
 from eth_tester.strategy import Signal
 
 
@@ -39,20 +40,39 @@ class FakeConn:
                      "updated_at": NOW - timedelta(seconds=1), "valid": True}
         self.recent = {"ts": NOW - timedelta(seconds=1), "price": D(102)}
         self.liquidations = [{"side": "Sell", "qty": D(2)}]
+        end_ms = int((START + timedelta(minutes=1)).timestamp() * 1000)
+        event_ms = end_ms - 1000
+        receipt_ms = end_ms + 1000
+        checked_ms = end_ms + 2000
+        available_ms = end_ms + 3000
+        proof = {
+            "source": "validated_market_data", "instrument": "linear",
+            "interval": "", "checksum": "c" * 64,
+            "coverage_status": "verified",
+            "source_event_ms": event_ms,
+            "source_receipt_ms": receipt_ms,
+            "source_checked_at_ms": checked_ms,
+            "evidence_ref": "immutable-verification",
+        }
         self.snapshot = {
-            "snapshot_key": "verified-1m-bar", "bar_ts": START,
-            "available_at": START + timedelta(minutes=1),
-            "observed_at": NOW - timedelta(seconds=8),
-            "computed_at": NOW - timedelta(seconds=5),
+            "snapshot_key": "a" * 64, "bar_ts": START,
+            "available_at": START + timedelta(minutes=1, seconds=3),
+            "observed_at": START + timedelta(minutes=1, seconds=7),
+            "computed_at": START + timedelta(minutes=1, seconds=9),
             "source": "verified_causal_analytics", "source_checksum": "b" * 64,
             "quality": "complete", "is_causal": True,
             "values_json": {name: "1" for name in FEATURE_NAMES},
             "provenance": {
+                "contract": "eth_feature_snapshot_v2",
+                "certified_by": "independent_source_proof",
+                "source_coverage_verified": True,
                 "coverage_status": "verified",
-                "source_checked_at_ms": int((START + timedelta(minutes=1)).timestamp() * 1000),
+                "complete_trade_ids_proven": False,
+                "source_receipt_ms": receipt_ms,
+                "source_checked_at_ms": checked_ms,
+                "feature_sources": {name: dict(proof) for name in FEATURE_NAMES},
                 "feature_available_ms": {
-                    name: int((START + timedelta(minutes=1)).timestamp() * 1000)
-                    for name in FEATURE_NAMES
+                    name: available_ms for name in FEATURE_NAMES
                 },
             },
         }
@@ -89,7 +109,7 @@ def evaluate(conn, bar_volume=D(50), now=NOW):
     bar = {"ts": START, "open": D(101), "high": D(103),
            "low": D(100), "close": D(102), "volume": bar_volume}
     signal = Signal("long", D(100), D(100), D(110),
-                    {"strategy": "breakout", "strategy_version": "eth_rules_v2"})
+                    {"strategy": "breakout", "strategy_version": strategy_identity()})
     return confirm_rejection(conn, settings, signal, bar, observed_at=now)
 
 
@@ -99,7 +119,7 @@ def test_positive_path_checks_all_required_gates():
     assert evidence["score"] == 100
     assert evidence["mtf"]["5"] and evidence["mtf"]["15"] and evidence["mtf"]["60"]
     assert evidence["baseline"] == "five_closed_1m_candles_volume_matched"
-    assert evidence["immutable_feature_snapshot"]["snapshot_key"] == "verified-1m-bar"
+    assert evidence["immutable_feature_snapshot"]["snapshot_key"] == "a" * 64
     assert evidence["liquidations_observed_unverified"]["Sell"] == "2"
     assert D(evidence["economics_at_observed_entry"]["net_reward_risk"]) >= 2
 
@@ -156,8 +176,48 @@ def test_missing_or_late_snapshot_denies_strong_signal():
 def test_causal_snapshot_requires_complete_feature_availability():
     conn = FakeConn()
     assert _certified_snapshot(conn, "ETHUSDT", START, START + timedelta(minutes=1),
-                               NOW)["snapshot_key"] == "verified-1m-bar"
+                               NOW)["snapshot_key"] == "a" * 64
     conn.snapshot["values_json"].pop("volatility")
     assert _certified_snapshot(conn, "ETHUSDT", START, START + timedelta(minutes=1),
                                NOW) is None
 
+
+def test_v1_or_unverified_source_cannot_unlock_paper():
+    for field, value in (
+        ("contract", "eth_feature_snapshot_v1"),
+        ("certified_by", "none"),
+        ("source_coverage_verified", False),
+        ("complete_trade_ids_proven", True),
+        ("source_checked_at_ms", 0),
+        ("source_receipt_ms", int((START + timedelta(minutes=1, seconds=5))
+                                  .timestamp() * 1000)),
+    ):
+        conn = FakeConn()
+        conn.snapshot["provenance"][field] = value
+        assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+
+
+def test_per_feature_receipt_and_checksum_enforced():
+    for field, value in (
+        ("coverage_status", "partial"),
+        ("source_receipt_ms", 0),
+        ("source_checked_at_ms", 0),
+        ("source_event_ms", int((START + timedelta(minutes=1, seconds=5))
+                                 .timestamp() * 1000)),
+        ("checksum", "fake"),
+    ):
+        conn = FakeConn()
+        conn.snapshot["provenance"]["feature_sources"]["oi"][field] = value
+        assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    conn = FakeConn()
+    del conn.snapshot["provenance"]["feature_sources"]["volatility"]
+    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+
+
+def test_snapshot_is_asof_actual_decision_and_never_selected_by_hindsight():
+    conn = FakeConn()
+    conn.snapshot["available_at"] = NOW + timedelta(seconds=1)
+    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    conn = FakeConn()
+    conn.snapshot["snapshot_key"] = "not-a-hash"
+    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"

@@ -9,13 +9,24 @@ END = START + timedelta(minutes=1)
 
 
 def verified_provenance(count=3, checked_at=None):
-    return {"source": "trades_archive", "symbol": "ETHUSDT",
-            "instrument": "linear", "status": "verified", "quality": "complete",
-            "start_ts": START, "end_ts": END,
-            "observed_rows": count, "expected_rows": count,
-            "checksum": "a" * 64,
-            "checked_at": checked_at if checked_at is not None
-            else END + timedelta(seconds=5)}
+    """Fixture shaped like B daily ingestion_coverage + minute comparison."""
+    archive = {
+        "source": "trades_archive", "symbol": "ETHUSDT",
+        "instrument": "linear", "interval": "", "status": "verified",
+        "quality": "complete", "start_ts": START,
+        "end_ts": START + timedelta(days=1),
+        "observed_rows": count, "expected_rows": count, "checksum": "a" * 64,
+        "checked_at": checked_at if checked_at is not None
+        else END + timedelta(seconds=5),
+    }
+    minute = {
+        "symbol": "ETHUSDT", "instrument": "linear",
+        "minute_ts": START, "archive_source": "trades_archive",
+        "archive_sha256": "a" * 64, "status": "match", "trade_count": count,
+        "trade_base_qty": "8", "candle_base_volume": "8",
+        "checked_at": END + timedelta(seconds=6),
+    }
+    return {"archive": archive, "minute_checks": [minute]}
 
 
 def samples():
@@ -184,11 +195,23 @@ def test_only_database_attestation_can_authorize_paper_volume():
 
 
 def test_tampered_archive_provenance_and_off_tick_prices_rejected():
-    for change in ({"status": "partial"}, {"quality": "partial_unverified"},
-                   {"checksum": "not-a-sha"}, {"instrument": "inverse"},
-                   {"observed_rows": 2}, {"end_ts": END + timedelta(seconds=1)},
-                   {"checked_at": START}):
-        source = {**verified_provenance(), **change}
+    for change in (
+        {"status": "partial"}, {"quality": "partial_unverified"},
+        {"checksum": "not-a-sha"}, {"instrument": "inverse"},
+        {"end_ts": END}, {"checked_at": START},
+    ):
+        source = verified_provenance()
+        source["archive"].update(change)
+        assert build_profile(samples(), START, END, D(1),
+                             coverage_verified=True, expected_trade_count=3,
+                             provenance=source) is None
+    for change in (
+        {"status": "mismatch"}, {"archive_sha256": "b" * 64},
+        {"trade_count": 2}, {"trade_base_qty": "6"},
+        {"minute_ts": END}, {"checked_at": START},
+    ):
+        source = verified_provenance()
+        source["minute_checks"][0].update(change)
         assert build_profile(samples(), START, END, D(1),
                              coverage_verified=True, expected_trade_count=3,
                              provenance=source) is None
@@ -198,8 +221,36 @@ def test_tampered_archive_provenance_and_off_tick_prices_rejected():
                          coverage_verified=True, expected_trade_count=3,
                          provenance=verified_provenance()) is None
     without_id = samples()
-    without_id[1] = {k: v for k, v in without_id[1].items() if k != "trade_id"}
+    without_id[1] = {k: v for k, v in without_id[1].items()
+                     if k != "trade_id"}
     assert build_profile(without_id, START, END, D(1),
                          coverage_verified=True, expected_trade_count=3,
                          provenance=verified_provenance()) is None
 
+
+def test_daily_archive_requires_every_minute_and_matching_checksum():
+    trades = samples() + [{
+        "ts": END + timedelta(seconds=1), "price": "100",
+        "qty": "1", "trade_id": "4",
+    }]
+    valid = verified_provenance()
+    valid["minute_checks"].append({
+        **valid["minute_checks"][0], "minute_ts": END,
+        "trade_count": 1, "trade_base_qty": "1",
+        "candle_base_volume": "1",
+        "checked_at": END + timedelta(minutes=1, seconds=6),
+    })
+    candidate = build_profile(trades, START, END + timedelta(minutes=1),
+                              D(1), coverage_verified=True,
+                              expected_trade_count=4, provenance=valid)
+    assert candidate is not None and candidate.coverage == "externally_verified"
+    incomplete = verified_provenance()
+    assert build_profile(trades, START, END + timedelta(minutes=1),
+                         D(1), coverage_verified=True, expected_trade_count=4,
+                         provenance=incomplete) is None
+    replaced = verified_provenance()
+    replaced["minute_checks"].append(dict(
+        valid["minute_checks"][0], checked_at=END + timedelta(minutes=1, seconds=6)))
+    assert build_profile(trades, START, END + timedelta(minutes=1),
+                         D(1), coverage_verified=True, expected_trade_count=4,
+                         provenance=replaced) is None

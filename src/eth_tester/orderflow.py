@@ -101,11 +101,11 @@ def _mtf(conn, symbol, end, sign):
 
 
 def _certified_snapshot(conn, symbol, start, end, observed_at):
-    """Require B's immutable C/F as-of feature snapshot before paper admission.
+    """Admit only B-v2 independently verified, immutable, as-of snapshots.
 
-    A complete snapshot must be computed and genuinely observed by decision
-    time, with per-feature availability and certified source coverage.
-    This intentionally denies trading while producers remain unverified.
+    Source events, actual receipts, independently checked evidence and server
+    publication times are different clocks. A self-attested boolean or mutable
+    historical feature cannot unlock a paper entry.
     """
     from .ml import FEATURE_NAMES
 
@@ -119,49 +119,98 @@ def _certified_snapshot(conn, symbol, start, end, observed_at):
     if not row:
         return None
     try:
-        timestamps = [row[key] for key in ("bar_ts", "available_at",
-                                          "observed_at", "computed_at")]
-        if any(value.tzinfo is None or value.utcoffset() != timedelta(0)
-               for value in timestamps):
+        from collections.abc import Mapping
+        from re import fullmatch
+
+        if not all(isinstance(ts, datetime) and ts.tzinfo is not None
+                   and ts.utcoffset() == timedelta(0)
+                   for ts in (start, end, observed_at)):
             return None
-        bar, available, received, computed = timestamps
-        checksum = row["source_checksum"]
-        provenance = row["provenance"]
-        values = row["values_json"]
-        if (bar != start or not end <= available <= received <= computed <= observed_at
+        if not isinstance(row, Mapping):
+            return None
+        available, received, computed = (row[key] for key in
+                                         ("available_at", "observed_at", "computed_at"))
+        if not all(isinstance(ts, datetime) and ts.tzinfo is not None
+                   and ts.utcoffset() == timedelta(0)
+                   for ts in (available, received, computed)):
+            return None
+        if (row["bar_ts"] != start
+                or not end <= available <= received <= computed <= observed_at
                 or row["quality"] != "complete" or row["is_causal"] is not True
                 or not isinstance(row["source"], str) or not row["source"]
-                or not isinstance(row["snapshot_key"], str) or not row["snapshot_key"]
-                or not isinstance(checksum, str) or len(checksum) != 64
-                or any(c not in "0123456789abcdef" for c in checksum)
-                or not isinstance(provenance, dict)
+                or not isinstance(row["snapshot_key"], str)
+                or not fullmatch("[0-9a-f]{64}", row["snapshot_key"])
+                or not isinstance(row["source_checksum"], str)
+                or not fullmatch("[0-9a-f]{64}", row["source_checksum"])):
+            return None
+        provenance = row["provenance"]
+        values = row["values_json"]
+        if (not isinstance(provenance, Mapping)
+                or provenance.get("contract") != "eth_feature_snapshot_v2"
+                or provenance.get("certified_by") != "independent_source_proof"
+                or provenance.get("source_coverage_verified") is not True
                 or provenance.get("coverage_status") != "verified"
-                or not isinstance(values, dict)):
+                or provenance.get("complete_trade_ids_proven") is True
+                or not isinstance(values, Mapping)
+                or set(values) != set(FEATURE_NAMES)):
             return None
-        times = provenance["feature_available_ms"]
-        checked_ms = provenance["source_checked_at_ms"]
-        if not isinstance(times, dict) or type(checked_ms) is not int:
+        feature_times = provenance.get("feature_available_ms")
+        sources = provenance.get("feature_sources")
+        if (not isinstance(feature_times, Mapping)
+                or set(feature_times) != set(FEATURE_NAMES)
+                or not isinstance(sources, Mapping)
+                or set(sources) != set(FEATURE_NAMES)):
             return None
-        end_ms = int(end.timestamp() * 1000)
+        close_ms = int(end.timestamp() * 1000)
         available_ms = int(available.timestamp() * 1000)
-        if not end_ms <= checked_ms <= available_ms:
+        observed_ms = int(received.timestamp() * 1000)
+        computed_ms = int(computed.timestamp() * 1000)
+        checked = provenance.get("source_checked_at_ms")
+        receipt = provenance.get("source_receipt_ms")
+        if (type(checked) is not int or type(receipt) is not int
+                or not close_ms <= receipt <= checked <= available_ms
+                or available_ms > observed_ms
+                or computed_ms > int(observed_at.timestamp() * 1000)):
             return None
-        feature_availability = {}
-        for name in FEATURE_NAMES:
-            t = times[name]
-            if type(t) is not int or not 0 <= t <= available_ms:
+        for feature in FEATURE_NAMES:
+            feature_available = feature_times[feature]
+            proof = sources[feature]
+            if (type(feature_available) is not int
+                    or not close_ms <= feature_available <= available_ms
+                    or not isinstance(proof, Mapping)
+                    or proof.get("coverage_status") != "verified"
+                    or not isinstance(proof.get("source"), str)
+                    or not proof["source"]
+                    or proof.get("instrument") != "linear"
+                    or not isinstance(proof.get("interval"), str)
+                    or not isinstance(proof.get("evidence_ref"), str)
+                    or not proof["evidence_ref"]
+                    or not isinstance(proof.get("checksum"), str)
+                    or not fullmatch("[0-9a-f]{64}", proof["checksum"])):
                 return None
-            _decimal(values[name])
-            feature_availability[name] = t
-        return {"snapshot_key": row["snapshot_key"],
-                "source_checksum": checksum,
-                "available_at": available.isoformat(),
-                "computed_at": computed.isoformat(),
-                "coverage_checked_at_ms": checked_ms,
-                "feature_available_ms": feature_availability}
+            event_ms = proof.get("source_event_ms")
+            seen_ms = proof.get("source_receipt_ms")
+            verified_ms = proof.get("source_checked_at_ms")
+            if any(type(t) is not int for t in (event_ms, seen_ms, verified_ms)):
+                return None
+            if not (0 <= event_ms <= seen_ms <= verified_ms <= feature_available
+                    and seen_ms <= receipt and verified_ms <= checked):
+                return None
+            _decimal(values[feature])
+        return {
+            "snapshot_key": row["snapshot_key"],
+            "source_checksum": row["source_checksum"],
+            "contract": "eth_feature_snapshot_v2",
+            "available_at": available.isoformat(),
+            "computed_at": computed.isoformat(),
+            "source_checked_at_ms": checked,
+            "source_receipt_ms": receipt,
+            "feature_available_ms": dict(feature_times),
+        }
     except (AttributeError, InvalidOperation, KeyError, TypeError,
             ValueError, OverflowError):
         return None
+
 
 def confirm_rejection(conn, settings, signal, bar, *, observed_at=None):
     """Return (admissible, JSON-compatible evidence) at the observed instant."""

@@ -97,34 +97,76 @@ class VolumeProfile:
 
 
 def _coverage_attestation(record, start, end, observed_count):
-    """Validate B-owned ingestion_coverage evidence, not a caller's boolean.
+    """Verify a full UTC-day archive plus every matching minute check.
 
-    The record must describe this exact interval and be recorded after it
-    closed; older backfills become available only at checked_at, never
-    retroactively at exchange event time.
+    The source coverage window describes exchange event time; the archive and
+    minute-check timestamps describe real observation. Matching volume alone
+    never proves the exchange published every public trade ID.
     """
     if not isinstance(record, dict):
         return None
     try:
-        stamp = record["checked_at"]
-        checksum = record["checksum"]
-        if (record.get("source") != "trades_archive"
-                or record.get("symbol") != "ETHUSDT"
-                or record.get("instrument") != "linear"
-                or record.get("status") != "verified"
-                or record.get("quality") not in ("verified", "complete")
-                or record.get("start_ts") != start or record.get("end_ts") != end
-                or type(record.get("observed_rows")) is not int
-                or type(record.get("expected_rows")) is not int
-                or record["observed_rows"] != observed_count
-                or record["expected_rows"] != observed_count
-                or not isinstance(checksum, str) or len(checksum) != 64
-                or any(ch not in "0123456789abcdef" for ch in checksum)
-                or not isinstance(stamp, datetime) or stamp.tzinfo is None
-                or stamp.utcoffset() != timedelta(0) or stamp < end):
+        archive = record["archive"]
+        minutes = record["minute_checks"]
+        if (not isinstance(archive, dict) or not isinstance(minutes, (list, tuple))
+                or not isinstance(start, datetime) or not isinstance(end, datetime)
+                or start.utcoffset() != timedelta(0)
+                or end.utcoffset() != timedelta(0) or start >= end
+                or start.second or start.microsecond or end.second or end.microsecond
+                or (end - start) % timedelta(minutes=1) != timedelta(0)):
             return None
-        return stamp, checksum
-    except (KeyError, TypeError, ValueError):
+        day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        if not (day <= start < end <= day + timedelta(days=1)):
+            return None
+        source_checksum = archive["checksum"]
+        checked = archive["checked_at"]
+        if (archive.get("source") != "trades_archive"
+                or archive.get("symbol") != "ETHUSDT"
+                or archive.get("instrument") != "linear"
+                or archive.get("interval") != ""
+                or archive.get("status") != "verified"
+                or archive.get("start_ts") != day
+                or archive.get("end_ts") != day + timedelta(days=1)
+                or not isinstance(source_checksum, str)
+                or len(source_checksum) != 64
+                or any(char not in "0123456789abcdef" for char in source_checksum)
+                or not isinstance(checked, datetime) or checked.tzinfo is None
+                or checked.utcoffset() != timedelta(0) or checked < end
+                or archive.get("quality") == "partial_unverified"):
+            return None
+        expected_minutes = int((end - start) / timedelta(minutes=1))
+        if len(minutes) != expected_minutes:
+            return None
+        proof_at = checked
+        total_trades = 0
+        for index, minute in enumerate(minutes):
+            expected = start + index * timedelta(minutes=1)
+            stamp = minute["minute_ts"]
+            proof_time = minute["checked_at"]
+            if (stamp != expected or minute.get("symbol") != "ETHUSDT"
+                    or minute.get("instrument") != "linear"
+                    or minute.get("archive_source") != "trades_archive"
+                    or minute.get("archive_sha256") != source_checksum
+                    or minute.get("status") != "match"
+                    or not isinstance(proof_time, datetime)
+                    or proof_time.tzinfo is None
+                    or proof_time.utcoffset() != timedelta(0)
+                    or proof_time < expected + timedelta(minutes=1)):
+                return None
+            qty = number(minute["trade_base_qty"])
+            official = number(minute["candle_base_volume"])
+            count = minute["trade_count"]
+            if (type(count) is not int or count <= 0
+                    or qty <= 0 or official <= 0
+                    or abs(qty - official) > max(
+                        Decimal("0.001"), official * Decimal("0.0005"))):
+                return None
+            total_trades += count
+            proof_at = max(proof_at, proof_time)
+        if total_trades != observed_count:
+            return None
+        return proof_at, source_checksum
+    except (KeyError, TypeError, InvalidOperation, ValueError, OverflowError):
         return None
 
 
