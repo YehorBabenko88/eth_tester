@@ -11,6 +11,8 @@ from shutil import disk_usage
 import httpx
 from .database import connection
 from .data_quality import DataIntegrityError, reconcile_minute_volume
+from .data_coverage import write_coverage
+from .archive_quality import persist_minute_evidence
 
 def parse_trade(row):
     timestamp=row.get("timestamp") or row.get("timestamp_ms") or row.get("time")
@@ -34,7 +36,7 @@ async def download_archive(settings,day,client):
     symbol=settings.symbol
     url=f"https://public.bybit.com/trading/{symbol}/{symbol}{day.isoformat()}.csv.gz"
     with connection(settings) as conn:
-        state=conn.execute("""SELECT state FROM ingestion_job
+        state=conn.execute("""SELECT state,sha256 FROM ingestion_job
          WHERE source='trades_archive' AND symbol=%s AND day=%s""",
           (symbol,day)).fetchone()
         if state and state["state"]=="complete":
@@ -102,11 +104,40 @@ async def download_archive(settings,day,client):
                 if conflict:
                     raise DataIntegrityError(
                         f"Archive/live trade identity conflict: {conflict['trade_id']}")
-                cur.execute("""INSERT INTO trades(symbol,ts,trade_id,price,qty,side,notional,source,raw)
-                    SELECT DISTINCT ON (trade_id)
-                       symbol,ts,trade_id,price,qty,side,notional,source,raw
-                    FROM eth_stage ORDER BY trade_id
-                    ON CONFLICT(symbol,trade_id) DO NOTHING""")
+                written = cur.execute("""
+                    WITH imported AS (
+                      INSERT INTO trades(symbol,ts,trade_id,price,qty,side,notional,source,raw)
+                      SELECT DISTINCT ON (trade_id)
+                        symbol,ts,trade_id,price,qty,side,notional,source,raw
+                      FROM eth_stage ORDER BY trade_id
+                      ON CONFLICT(symbol,trade_id)
+                      DO UPDATE SET price=EXCLUDED.price
+                      WHERE trades.ts=EXCLUDED.ts
+                        AND trades.price=EXCLUDED.price
+                        AND trades.qty=EXCLUDED.qty AND trades.side=EXCLUDED.side
+                      RETURNING trade_id
+                    )
+                    SELECT (SELECT count(*) FROM imported) AS saved,
+                           (SELECT count(DISTINCT trade_id) FROM eth_stage) AS expected
+                    """).fetchone()
+                if written["saved"] != written["expected"]:
+                    raise DataIntegrityError(
+                        "Concurrent archive/live trade conflict; import rolled back")
+            day_start=datetime.combine(day,datetime.min.time(),timezone.utc)
+            write_coverage(
+                conn, source="trades_archive", symbol=symbol, interval="",
+                start_ms=int(day_start.timestamp()*1000),
+                end_exclusive_ms=int((day_start+timedelta(days=1)).timestamp()*1000),
+                status="partial", observed_rows=count, expected_rows=None,
+                checksum=checksum.hexdigest(),
+                quality="archive_bytes_rechecked_trade_completeness_unproven",
+                evidence={"url": url, "gzip_crc_checked": True,
+                          "download_sha256": checksum.hexdigest(),
+                          "compressed_bytes": size, "csv_rows": count,
+                          "volume_verified": False},
+                instrument=settings.category)
+            persist_minute_evidence(
+                conn, symbol, day, checksum.hexdigest(), settings.category)
             conn.execute("""UPDATE ingestion_job SET state='complete',bytes_downloaded=%s,
               row_count=%s,sha256=%s,error=NULL,updated_at=now()
               WHERE source='trades_archive' AND symbol=%s AND day=%s""",
@@ -148,14 +179,15 @@ def resolve_archived_gaps(settings):
             end = gap["end_ts"].date()
             total = (end - start).days + 1
             jobs = conn.execute(
-                """SELECT day FROM ingestion_job WHERE source='trades_archive'
+                """SELECT day,sha256 FROM ingestion_job WHERE source='trades_archive'
                    AND symbol=%s AND day BETWEEN %s AND %s AND state='complete'""",
                 (settings.symbol, start, end)).fetchall()
-            downloaded = {row["day"] for row in jobs}
+            downloaded = {row["day"]: row["sha256"] for row in jobs}
             if len(downloaded) != total:
                 continue
-            if all(reconcile_archive_day(
-                    conn, settings.symbol, start + timedelta(days=i)
+            if all(persist_minute_evidence(
+                    conn, settings.symbol, start + timedelta(days=i),
+                    downloaded[start + timedelta(days=i)], settings.category
                     )["status"] == "verified" for i in range(total)):
                 conn.execute(
                     "UPDATE data_gaps SET resolved_at=now() WHERE id=%s", (gap["id"],))
