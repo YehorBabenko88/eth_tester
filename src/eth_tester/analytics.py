@@ -99,3 +99,49 @@ def build_footprint(settings,tf="1",hours=24):
               (settings.symbol,tf,bucket,peak,buy-sell,buy+sell,
                sum(v["trades"] for v in bins.values())/span))
     return len(buckets)
+
+
+def enrich_features(settings,tf="1",hours=24):
+    """Windowed CVD and quality-flagged OI, funding, book snapshot and tick volume."""
+    if tf not in TF_SECONDS:
+        raise ValueError("Unsupported interval")
+    with connection(settings) as conn:
+        rows=conn.execute("""SELECT ts,delta,volume FROM features WHERE symbol=%s AND
+          tf=%s AND ts>=now()-(%s || ' hours')::interval ORDER BY ts""",
+          (settings.symbol,tf,hours)).fetchall()
+        cvd=Decimal(0)
+        for item in rows:
+            ts=item["ts"]
+            cvd+=item["delta"] or Decimal(0)
+            candle=conn.execute("""SELECT volume FROM candles WHERE symbol=%s
+              AND kind='trade' AND tf=%s AND ts=%s AND closed""",
+              (settings.symbol,tf,ts)).fetchone()
+            oi=conn.execute("""SELECT value FROM open_interest WHERE symbol=%s
+              AND interval='5min' AND ts<=%s ORDER BY ts DESC LIMIT 1""",
+              (settings.symbol,ts)).fetchone()
+            funding=conn.execute("""SELECT rate FROM funding WHERE symbol=%s
+              AND ts<=%s ORDER BY ts DESC LIMIT 1""",
+              (settings.symbol,ts)).fetchone()
+            book=conn.execute("""SELECT bids,asks FROM book_events WHERE symbol=%s
+              AND event_type='snapshot' AND recv_ts<=%s ORDER BY recv_ts DESC LIMIT 1""",
+              (settings.symbol,ts)).fetchone()
+            imbalance=None
+            if book:
+                b=sum((Decimal(str(x[1])) for x in book["bids"]),Decimal(0))
+                a=sum((Decimal(str(x[1])) for x in book["asks"]),Decimal(0))
+                if b+a:
+                    imbalance=(b-a)/(b+a)
+            archive=conn.execute("""SELECT state FROM ingestion_job WHERE
+              source='trades_archive' AND symbol=%s AND day=%s""",
+              (settings.symbol,ts.date())).fetchone()
+            quality="partial_unverified"
+            if archive and archive["state"]=="complete" and candle and candle["volume"] is not None:
+                err=abs(Decimal(item["volume"])-Decimal(candle["volume"]))
+                tolerance=max(Decimal("0.001"),Decimal(candle["volume"])*Decimal("0.0005"))
+                quality="verified_volume" if err<=tolerance else "volume_mismatch"
+            conn.execute("""UPDATE features SET cvd=%s,oi=%s,funding_rate=%s,imbalance=%s,
+              quality=%s,metadata=%s::jsonb WHERE symbol=%s AND tf=%s AND ts=%s""",
+              (cvd,oi["value"] if oi else None,funding["rate"] if funding else None,
+               imbalance,quality,'{"cvd_baseline":"window_start","orderbook":"last_snapshot"}',
+               settings.symbol,tf,ts))
+    return len(rows)
