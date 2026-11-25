@@ -22,7 +22,7 @@ async def child(command,recurring_seconds=None):
 async def supervise(settings):
     init_database(settings)
     tasks=[("live",None),("analyse",None),("engine",None),
-           ("backfill",86400),("archives",86400)]
+           ("backfill",86400),("archives",86400),("aggregate",21600)]
     if settings.tg_bot_token and settings.tg_chat_id:
         tasks.append(("telegram",None))
     await asyncio.gather(*(child(name,interval) for name,interval in tasks))
