@@ -1,72 +1,304 @@
+"""Paper-only ETH Tester control: private Telegram, Russian buttons and audit.
+
+Remote database deletion is fail-closed until Storage Guardian #2 approves a contract.
+"""
+
 import asyncio
-from telegram import Update
-from telegram.ext import Application,CommandHandler,ContextTypes
+import json
+import logging
+import os
+from pathlib import Path
+import shutil
+
+from telegram import ReplyKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
 from .database import connection
 
-def authorise(settings,update):
-    return bool(update.effective_chat and settings.tg_chat_id
-      and str(update.effective_chat.id)==settings.tg_chat_id)
+LOGGER = logging.getLogger(__name__)
+MENU = (
+    ("▶️ Запуск", "⏸ Пауза", "⏯ Продолжить", "⏹ Стоп"),
+    ("📈 Позиция", "📜 Сделки", "📊 Статистика"),
+    ("📥 Загрузка", "💾 Диск", "🖥 Система"),
+    ("⚙️ Процессы", "🔌 WebSocket", "⚠️ Ошибки", "🕳 Пропуски"),
+    ("📉 График", "🧱 Уровни", "❓ Помощь"),
+)
+ALIASES = {
+    "▶️ Запуск": "startsim", "⏸ Пауза": "pause", "⏯ Продолжить": "resume",
+    "⏹ Стоп": "stop", "📈 Позиция": "position", "📜 Сделки": "history",
+    "📊 Статистика": "stats", "📥 Загрузка": "progress", "💾 Диск": "disk",
+    "🖥 Система": "system", "⚙️ Процессы": "processes", "🔌 WebSocket": "ws",
+    "⚠️ Ошибки": "errors", "🕳 Пропуски": "gaps", "📉 График": "chart",
+    "🧱 Уровни": "levels", "❓ Помощь": "help",
+}
+COMMANDS = (
+    "start", "help", "startsim", "pause", "resume", "stop", "position",
+    "history", "trade", "stats", "progress", "disk", "system", "processes",
+    "ws", "errors", "gaps", "chart", "levels", "delete",
+)
+
+
+def authorise(settings, update):
+    """Fail closed: match chat ID, human user ID AND private chat."""
+    user, chat = update.effective_user, update.effective_chat
+    owner = os.environ.get("ETH_TESTER_TG_USER_ID", "").strip()
+    return bool(
+        user and not user.is_bot and chat and chat.type == "private"
+        and settings.tg_chat_id and owner
+        and str(chat.id) == str(settings.tg_chat_id).strip()
+        and str(user.id) == owner
+    )
+
+
+def _audit(settings, update, name, accepted, outcome):
+    """Only IDs, command names and outcomes are stored; no text or token."""
+    detail = {
+        "command": name[:48], "accepted": accepted, "outcome": outcome[:48],
+        "chat_id": str(update.effective_chat.id) if update.effective_chat else None,
+        "user_id": str(update.effective_user.id) if update.effective_user else None,
+    }
+    try:
+        with connection(settings) as conn:
+            conn.execute(
+                """INSERT INTO bot_events(severity,event,data)
+                   VALUES(%s,'telegram_command',%s::jsonb)""",
+                ("info" if accepted else "warning", json.dumps(detail)),
+            )
+    except Exception:
+        LOGGER.exception("Telegram command audit unavailable")
+        if accepted:
+            raise RuntimeError("Refusing command without audit") from None
+
+
+def _control(settings, name):
+    states = {
+        "startsim": (True, False, "Бумажная симуляция запущена"),
+        "resume": (True, False, "Бумажная симуляция продолжена"),
+        "pause": (True, True, "Новые входы приостановлены; позиция остаётся под наблюдением"),
+        "stop": (False, True, "Новые входы остановлены; позиция остаётся под наблюдением"),
+    }
+    enabled, paused, result = states[name]
+    with connection(settings) as conn:
+        conn.execute(
+            """UPDATE bot_control SET enabled=%s,paused=%s,updated_at=now()
+               WHERE singleton=true""",
+            (enabled, paused),
+        )
+    return result + ". Реальные ордера не отправляются."
+
+
+def _read(settings, name):
+    with connection(settings) as conn:
+        if name == "position":
+            row = conn.execute(
+                """SELECT id,direction,entry,qty,stop,take,opened_at,reason
+                   FROM paper_trades WHERE state='open' ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+            return (
+                f"Бумажная позиция #{row['id']} {row['direction']}\n"
+                f"Вход {row['entry']}, qty {row['qty']}, stop {row['stop']}, take {row['take']}\n"
+                f"Открыта {row['opened_at']}\nПричина: {str(row['reason'])[:900]}"
+                if row else "Открытых позиций нет"
+            )
+        if name in ("history", "trade"):
+            rows = conn.execute(
+                """SELECT id,state,direction,entry,exit,net_pnl,exit_reason,reason
+                   FROM paper_trades ORDER BY id DESC LIMIT 8"""
+            ).fetchall()
+            return "\n".join(
+                f"#{r['id']} {r['direction']} ({r['state']}) {r['entry']} → {r['exit']} "
+                f"net {r['net_pnl']} | {r['exit_reason'] or '-'} | {str(r['reason'])[:110]}"
+                for r in rows
+            ) or "Сделок пока нет"
+        if name == "stats":
+            acc = conn.execute(
+                "SELECT equity FROM paper_account WHERE id=1"
+            ).fetchone()
+            r = conn.execute(
+                """SELECT count(*) n,count(*) FILTER (WHERE net_pnl>0) wins,
+                   coalesce(sum(gross_pnl),0) gross,coalesce(sum(net_pnl),0) net,
+                   coalesce(sum(fee_paid),0) fees,coalesce(sum(funding_paid),0) funding,
+                   coalesce(sum(slippage_paid),0) slippage
+                   FROM paper_trades WHERE state='closed'"""
+            ).fetchone()
+            rate = 100 * r["wins"] / r["n"] if r["n"] else 0
+            return (
+                f"Закрыто {r['n']}, прибыльных {r['wins']} ({rate:.1f}%)\n"
+                f"Gross {r['gross']}, Net {r['net']}, Equity {acc['equity'] if acc else '-'}\n"
+                f"Комиссии {r['fees']}, funding {r['funding']}, slippage {r['slippage']}"
+            )
+        if name == "progress":
+            jobs = conn.execute(
+                """SELECT source,state,count(*) n,coalesce(sum(bytes_downloaded),0) bytes,
+                   coalesce(sum(row_count),0) rows FROM ingestion_job
+                   GROUP BY source,state ORDER BY source,state"""
+            ).fetchall()
+            cursors = conn.execute(
+                """SELECT source,interval,status,cursor_ts FROM ingestion_cursor
+                   ORDER BY source,interval LIMIT 60"""
+            ).fetchall()
+            lines = [
+                f"{r['source']}: {r['state']}: {r['n']} дней, {r['rows']} строк, {r['bytes']} B"
+                for r in jobs
+            ] + [
+                f"{r['source']}/{r['interval']}: {r['status']} до {r['cursor_ts']}"
+                for r in cursors
+            ]
+            return "Загрузка по источникам:\n" + "\n".join(lines) if lines else "Нет загрузок"
+        if name == "disk":
+            row = conn.execute(
+                """SELECT current_database() db,
+                   pg_size_pretty(pg_database_size(current_database())) size"""
+            ).fetchone()
+            disk = shutil.disk_usage(Path.cwd())
+            return (
+                f"PostgreSQL {row['db']}: {row['size']}\n"
+                f"Свободно {disk.free / 1024**3:.2f} из {disk.total / 1024**3:.2f} GiB "
+                "(архивы не входят в размер БД)"
+            )
+        if name == "processes":
+            rows = conn.execute(
+                """SELECT component,status,updated_at FROM bot_heartbeat
+                   ORDER BY component LIMIT 30"""
+            ).fetchall()
+            lines = [f"{r['component']}: {r['status']} ({r['updated_at']})" for r in rows]
+            path = Path(os.environ.get("ETH_TESTER_RUNTIME_DIR", "runtime")) / "supervisor.json"
+            if path.is_file():
+                try:
+                    state = json.loads(path.read_text(encoding="utf-8"))
+                    lines += [
+                        f"Supervisor {key}: {value.get('state')} pid={value.get('pid', '-')}"
+                        for key, value in state.items()
+                    ]
+                except (ValueError, OSError):
+                    lines.append("Состояние Supervisor недоступно")
+            return "\n".join(lines) or "Heartbeat отсутствует"
+        if name == "ws":
+            rows = conn.execute(
+                """SELECT topic,status,ts FROM feed_health WHERE symbol=%s
+                   ORDER BY ts DESC LIMIT 12""", (settings.symbol,)
+            ).fetchall()
+            return "\n".join(
+                f"{r['topic']}: {r['status']} ({r['ts']})" for r in rows
+            ) or "Телеметрия WebSocket отсутствует"
+        if name == "errors":
+            rows = conn.execute(
+                """SELECT ts,severity,event FROM bot_events
+                   WHERE severity IN ('error','warning') ORDER BY ts DESC LIMIT 12"""
+            ).fetchall()
+            return "\n".join(
+                f"{r['ts']}: {r['severity']} {r['event']}" for r in rows
+            ) or "Ошибок не отмечено"
+        if name == "gaps":
+            rows = conn.execute(
+                """SELECT source,start_ts,end_ts FROM data_gaps
+                   WHERE resolved_at IS NULL ORDER BY start_ts DESC LIMIT 12"""
+            ).fetchall()
+            return "\n".join(
+                f"{r['source']}: {r['start_ts']} — {r['end_ts']}" for r in rows
+            ) or "Открытых пропусков нет"
+        if name == "levels":
+            rows = conn.execute(
+                """SELECT tf,side,level_price FROM levels WHERE symbol=%s
+                   AND status='unbroken' ORDER BY origin_ts DESC LIMIT 12""",
+                (settings.symbol,)
+            ).fetchall()
+            return "\n".join(
+                f"{r['tf']} {r['side']} {r['level_price']}" for r in rows
+            ) or "Нет уровней"
+    return "Неизвестная команда"
+
+
+def _system():
+    try:
+        import psutil  # optional: dependency coordination belongs to MASTER
+    except ImportError:
+        return "CPU/RAM недоступны: установите необязательный пакет psutil"
+    ram = psutil.virtual_memory()
+    cpu = psutil.cpu_percent(interval=0.1)
+    return (
+        f"CPU {cpu:.1f}% | RAM {ram.percent:.1f}%\n"
+        f"Доступно RAM {ram.available / 1024**3:.2f} из {ram.total / 1024**3:.2f} GiB"
+    )
+
+
+async def dispatch(settings, update, context, name):
+    if not authorise(settings, update):
+        _audit(settings, update, name, False, "denied")
+        return
+    if name not in COMMANDS:
+        _audit(settings, update, name, False, "unknown")
+        return
+    if name == "start":
+        name = "help"  # /start displays help, never starts a simulation
+    try:
+        _audit(settings, update, name, True, "requested")
+        if name == "help":
+            answer = (
+                "ETH Tester — бумажная симуляция, без реальных ордеров.\n"
+                "/startsim /pause /resume /stop — управление входами\n"
+                "/position /history /stats — позиция, сделки, расходы\n"
+                "/chart ID — график сделки\n"
+                "/progress /disk /system /processes /ws /errors /gaps /levels\n"
+                "/delete — отключено до согласования Storage #2"
+            )
+        elif name in ("startsim", "pause", "resume", "stop"):
+            answer = await asyncio.to_thread(_control, settings, name)
+        elif name == "delete":
+            answer = "Удаление БД по Telegram заблокировано до согласования со Storage Guardian."
+        elif name == "system":
+            answer = await asyncio.to_thread(_system)
+        elif name == "chart":
+            args = context.args or []
+            if not args or not args[0].isdigit() or int(args[0]) <= 0:
+                answer = "Укажите ID сделки: /chart 123. Список: /history"
+            else:
+                from .charts import render_trade
+                path = await asyncio.to_thread(render_trade, settings, int(args[0]))
+                with open(path, "rb") as photo:
+                    await update.effective_message.reply_photo(
+                        photo=photo, caption=f"Бумажная сделка #{args[0]}"
+                    )
+                _audit(settings, update, name, True, "completed")
+                return
+        else:
+            answer = await asyncio.to_thread(_read, settings, name)
+        await update.effective_message.reply_text(
+            answer[:3900], reply_markup=ReplyKeyboardMarkup(MENU, resize_keyboard=True)
+        )
+        _audit(settings, update, name, True, "completed")
+    except Exception:
+        LOGGER.exception("Telegram command %s failed", name)
+        try:
+            _audit(settings, update, name, True, "failed")
+        except RuntimeError:
+            pass
+        await update.effective_message.reply_text(
+            "Не удалось выполнить запрос. Проверьте журнал ошибок."
+        )
+
 
 async def run_telegram(settings):
-    if not settings.tg_bot_token or not settings.tg_chat_id:
-        raise RuntimeError("Missing Telegram token/chat ID")
-    async def command(update:Update,context:ContextTypes.DEFAULT_TYPE):
-        if not authorise(settings,update):
-            return
-        name=update.message.text.split()[0].split("@")[0].lower()
-        with connection(settings) as conn:
-            if name=="/pause":
-                conn.execute("UPDATE bot_control SET paused=true,updated_at=now() WHERE singleton=true")
-                msg="Paper bot paused, existing position remains open"
-            elif name=="/resume":
-                conn.execute("UPDATE bot_control SET enabled=true,paused=false,updated_at=now() WHERE singleton=true")
-                msg="Paper bot enabled (no real orders)"
-            elif name=="/stop":
-                conn.execute("UPDATE bot_control SET enabled=false,paused=true,updated_at=now() WHERE singleton=true")
-                msg="Paper bot disabled; data retained"
-            elif name=="/stats":
-                acc=conn.execute("SELECT * FROM paper_account WHERE id=1").fetchone()
-                row=conn.execute("""SELECT count(*) n,count(*) FILTER (WHERE net_pnl>0) wins,
-                   coalesce(sum(net_pnl),0) pnl FROM paper_trades WHERE state='closed'""").fetchone()
-                msg=f"Closed: {row['n']}; wins: {row['wins']}; net: {row['pnl']}; equity: {acc['equity']}"
-            elif name=="/disk":
-                size=conn.execute("SELECT pg_size_pretty(pg_database_size(current_database())) AS size").fetchone()
-                msg=f"PostgreSQL: {size['size']} (excluding external archives)"
-            elif name=="/progress":
-                rows=conn.execute("SELECT state,count(*) n FROM ingestion_job GROUP BY state").fetchall()
-                msg=", ".join(f"{r['state']}: {r['n']}" for r in rows) or "No jobs"
-            elif name=="/levels":
-                rows=conn.execute("""SELECT tf,side,level_price FROM levels WHERE symbol=%s
-                  AND status='unbroken' ORDER BY origin_ts DESC LIMIT 12""",(settings.symbol,)).fetchall()
-                msg="\n".join(f"{r['tf']} {r['side']} {r['level_price']}" for r in rows) or "No levels"
-            elif name=="/trade":
-                rows=conn.execute("""SELECT id,direction,entry,exit,net_pnl FROM paper_trades
-                  ORDER BY id DESC LIMIT 5""").fetchall()
-                msg="\n".join(str(dict(r)) for r in rows) or "No trades"
-            elif name=="/chart":
-                if not context.args or not context.args[0].isdigit():
-                    msg="Usage: /chart 123"
-                else:
-                    from .charts import render_trade
-                    try:
-                        image_path=await asyncio.to_thread(render_trade,settings,int(context.args[0]))
-                        with open(image_path,"rb") as photo:
-                            await update.message.reply_photo(photo=photo,caption="Paper trade chart")
-                        return
-                    except (ValueError,RuntimeError) as exc:
-                        msg=f"Chart unavailable: {exc}"
-            elif name=="/gaps":
-                gaps=conn.execute("SELECT source,start_ts FROM data_gaps WHERE resolved_at IS NULL LIMIT 5").fetchall()
-                msg=str([dict(g) for g in gaps]) if gaps else "No marked data gaps"
-            elif name=="/delete":
-                msg="Safety restriction: no remote database erasure; use a local administrator"
-            else:
-                msg="/pause /resume /stop /stats /disk /progress /levels /trade /delete"
-        await update.message.reply_text(msg[:4000])
-    app=Application.builder().token(settings.tg_bot_token).build()
-    for cmd in ("start","help","pause","resume","stop","stats","disk",
-                "progress","levels","trade","chart","gaps","delete"):
-        app.add_handler(CommandHandler(cmd,command))
+    if not settings.tg_bot_token or not settings.tg_chat_id or not os.environ.get(
+        "ETH_TESTER_TG_USER_ID"
+    ):
+        raise RuntimeError("Telegram requires TG_BOT_TOKEN, TG_CHAT_ID and ETH_TESTER_TG_USER_ID")
+    app = Application.builder().token(settings.tg_bot_token).build()
+
+    async def command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        name = update.effective_message.text.split()[0].split("@")[0].lstrip("/").lower()
+        await dispatch(settings, update, context, name)
+
+    async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        name = ALIASES.get(update.effective_message.text)
+        if name:
+            await dispatch(settings, update, context, name)
+        elif not authorise(settings, update):
+            _audit(settings, update, "unknown_text", False, "denied")
+
+    for item in COMMANDS:
+        app.add_handler(CommandHandler(item, command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu))
     async with app:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
