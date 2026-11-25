@@ -82,6 +82,36 @@ def _issued_live_reason(settings):
             (event, ident, json.dumps({"i": ident})),
         )
         record_trade_receipts(conn, "ETHUSDT", session, [ident])
+        # B requires a genuine current-minute source EVENT as well as the
+        # sealed previous 1m trade receipts. This separate test-only print
+        # never enters the prior minute's 0.02 ETH / 60 USDT candle totals.
+        current_event = conn.execute(
+            "SELECT clock_timestamp() AS ts"
+        ).fetchone()["ts"]
+        fresh_ident = "H8-CURRENT-" + uuid4().hex[:9]
+        conn.execute(
+            """INSERT INTO trades(
+                symbol,ts,trade_id,price,qty,side,notional,source,raw)
+               VALUES('ETHUSDT',%s,%s,3000,0.001,'Buy',3,
+                      'websocket',%s::jsonb)""",
+            (current_event, fresh_ident, json.dumps({"i": fresh_ident})),
+        )
+        record_trade_receipts(conn, "ETHUSDT", session, [fresh_ident])
+        # C's fast publisher demands a separate closed-REST-kline witness.
+        # QA inserts an explicitly synthetic SQL-contract receipt here;
+        # this is NEVER proof of exchange-wide completeness or ML eligibility.
+        from eth_tester.data_coverage import write_coverage
+        write_coverage(
+            conn, source="kline:trade", symbol="ETHUSDT", interval="1",
+            start_ms=int(bar.timestamp() * 1000),
+            end_exclusive_ms=int((bar + timedelta(minutes=1)).timestamp() * 1000),
+            status="verified", observed_rows=1, expected_rows=1,
+            checksum="c" * 64, quality="exchange_closed_grid_checked",
+            evidence={"closed_bar_only": True, "proves_all_trade_ids": False,
+                      "ml_snapshot_eligible": False,
+                      "fixture": "qa_sql_contract_only"},
+            instrument="linear",
+        )
         conn.execute(
             """INSERT INTO feed_health(symbol,topic,ts,status,detail)
                VALUES('ETHUSDT','connection',clock_timestamp(),
