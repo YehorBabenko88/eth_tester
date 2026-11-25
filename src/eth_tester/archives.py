@@ -78,7 +78,7 @@ async def download_archive(settings,day,client):
                             count+=1
                 cur.execute("""INSERT INTO trades(symbol,ts,trade_id,price,qty,side,notional,source,raw)
                     SELECT symbol,ts,trade_id,price,qty,side,notional,source,raw FROM eth_stage
-                    ON CONFLICT(symbol,ts,trade_id) DO NOTHING""")
+                    ON CONFLICT(symbol,trade_id) DO NOTHING""")
             conn.execute("""UPDATE ingestion_job SET state='complete',bytes_downloaded=%s,
               row_count=%s,sha256=%s,error=NULL,updated_at=now()
               WHERE source='trades_archive' AND symbol=%s AND day=%s""",
