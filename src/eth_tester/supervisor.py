@@ -122,7 +122,11 @@ class Supervisor:
         specs = [(cmd, None) for cmd in PERMANENT]
         specs.extend(PERIODIC.items())
         if settings.tg_bot_token and settings.tg_chat_id:
-            specs.append(("telegram", None))
+            if os.environ.get("ETH_TESTER_TG_USER_ID", "").strip():
+                specs.append(("telegram", None))
+            else:
+                LOGGER.error("Telegram disabled: ETH_TESTER_TG_USER_ID not configured")
+                self._record("telegram", "disabled_missing_owner_user_id")
         tasks = [
             asyncio.create_task(self.child(name, interval), name=name)
             for name, interval in specs
