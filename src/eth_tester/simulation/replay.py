@@ -3,6 +3,7 @@
 Tick replay accepts executable Quote objects only, not trade prints pretending
 there was bid/ask liquidity. Funding is mandatory for complete cost coverage.
 """
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -61,6 +62,7 @@ def replay_ticks(quotes, signals=(), *, funding_events=None, engine=None):
     next_signal = next(signals, None)
     next_funding = next(funding, None)
     rejected = []
+    rejected_funding = []
     n_quotes = 0
     previous_ts = None
     for quote in _ordered(quotes):
@@ -75,10 +77,14 @@ def replay_ticks(quotes, signals=(), *, funding_events=None, engine=None):
         while next_funding is not None and utc(next_funding.ts) <= ts:
             if next_funding.mark_price is None:
                 raise ValueError('missing historical funding mark')
-            if engine.last_ts is not None and utc(next_funding.ts) >= engine.last_ts:
+            if engine.last_ts is not None:
+                if utc(next_funding.ts) < engine.last_ts:
+                    raise ValueError('out-of-order funding event')
                 engine.funding(event_id='fund:' + next_funding.event_id,
                                ts=next_funding.ts, rate=next_funding.rate,
                                mark_price=next_funding.mark_price)
+            else:
+                rejected_funding.append((next_funding.ts, 'no_prior_market_quote'))
             next_funding = next(funding, None)
         while next_signal is not None and utc(next_signal.ts) < ts:
             if engine.position is not None or engine.order is not None:
@@ -100,6 +106,7 @@ def replay_ticks(quotes, signals=(), *, funding_events=None, engine=None):
         'metrics': equity_metrics(engine.history),
         'quotes_seen': n_quotes,
         'signals_rejected': rejected,
+        'funding_rejected': rejected_funding,
         'open_at_end': engine.position is not None,
         'outstanding_order': engine.order is not None,
         'gap_blocked': engine.blocked,
@@ -118,8 +125,8 @@ def walk_forward_splits(records, train_size, test_size, *, purge=0, embargo=0, s
     if min(train_size, test_size) < 1 or min(purge, embargo) < 0:
         raise ValueError('invalid window configuration')
     stride = step if step is not None else test_size + embargo
-    if stride < 1:
-        raise ValueError('step must be positive')
+    if stride < test_size + embargo:
+        raise ValueError('step must prevent overlapping OOS test windows')
     count = len(records)
     for i in range(1, count):
         if utc(records[i]['ts']) <= utc(records[i - 1]['ts']):
@@ -149,8 +156,8 @@ def walk_forward_evaluate(records, *, train_size, test_size, fit, evaluate,
                                       purge=purge, embargo=embargo, step=step):
         lo, hi = window['train']
         tl, th = window['test']
-        trained = fit(records[lo:hi])
-        score = evaluate(records[tl:th], trained)
+        trained = fit(deepcopy(records[lo:hi]))
+        score = evaluate(deepcopy(records[tl:th]), deepcopy(trained))
         folds.append({**window, 'parameters': trained, 'oos': score})
     return folds
 
