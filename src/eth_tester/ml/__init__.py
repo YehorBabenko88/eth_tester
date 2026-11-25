@@ -146,7 +146,8 @@ def fit(train, *, steps=240, learning_rate=0.035):
     payoffs = tuple(sum(r.net_return for r in ordered if r.outcome == label) /
                     sum(r.outcome == label for r in ordered) for label in CLASSES)
     fingerprint = sha256(json.dumps(
-        [(r.event_id, r.decision_ms, r.exit_ms, r.values, r.available_ms,\n          r.outcome, r.gross_return, r.costs) for r in ordered],
+        [(r.event_id, r.decision_ms, r.exit_ms, r.values, r.available_ms,
+          r.outcome, r.gross_return, r.costs) for r in ordered],
         separators=(",", ":")).encode()).hexdigest()[:16]
     return Model("softmax3-" + fingerprint, tuple(means), tuple(stds),
                  tuple(tuple(w) for w in weights), payoffs, max(r.exit_ms for r in ordered))
