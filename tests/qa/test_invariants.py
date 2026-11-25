@@ -85,13 +85,24 @@ def test_backtest_signal_sees_only_prior_closed_bars(monkeypatch):
     assert deals[0]["outcome"] == "stop"
 
 
-def test_telegram_requires_exact_chat_id():
+def test_telegram_requires_private_chat_and_human_owner(monkeypatch):
     cfg = SimpleNamespace(tg_chat_id="123")
-    for chat in (None, SimpleNamespace(id=124), SimpleNamespace(id=0)):
-        assert not authorise(cfg, SimpleNamespace(effective_chat=chat))
-    assert authorise(cfg, SimpleNamespace(effective_chat=SimpleNamespace(id=123)))
+    user = SimpleNamespace(id=456, is_bot=False)
+    chat = SimpleNamespace(id=123, type="private")
+    update = SimpleNamespace(effective_chat=chat, effective_user=user)
+    assert not authorise(cfg, update)
+    monkeypatch.setenv("ETH_TESTER_TG_USER_ID", "456")
+    assert authorise(cfg, update)
+    assert not authorise(cfg, SimpleNamespace(
+        effective_chat=SimpleNamespace(id=124, type="private"), effective_user=user))
+    assert not authorise(cfg, SimpleNamespace(
+        effective_chat=SimpleNamespace(id=123, type="group"), effective_user=user))
+    assert not authorise(cfg, SimpleNamespace(
+        effective_chat=chat, effective_user=SimpleNamespace(id=457, is_bot=False)))
+    assert not authorise(cfg, SimpleNamespace(
+        effective_chat=chat, effective_user=SimpleNamespace(id=456, is_bot=True)))
     cfg.tg_chat_id = ""
-    assert not authorise(cfg, SimpleNamespace(effective_chat=SimpleNamespace(id=123)))
+    assert not authorise(cfg, update)
 
 
 def test_archive_timestamps_and_reject_invalid_side():
