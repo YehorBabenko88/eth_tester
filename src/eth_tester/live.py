@@ -7,6 +7,7 @@ import websockets
 from .bybit import MarketClient
 from .data_quality import DataIntegrityError
 from .database import connection
+from .history_integrity import record_gap
 from .history import (
     KIND_ENDPOINTS, INTERVAL_MS, OI_INTERVALS, collect_klines,
     collect_funding, collect_oi, collect_account_ratios,
@@ -100,6 +101,7 @@ async def live_feed(settings):
         pending=conn.execute("SELECT id FROM data_gaps WHERE symbol=%s AND source='publicTrade' AND end_ts IS NULL ORDER BY id DESC LIMIT 1",(settings.symbol,)).fetchone()
     last_trade=last['ts'] if last else None
     pending_id=pending['id'] if pending else None
+    last_book_ts=None
     while True:
         connected_at=datetime.now(timezone.utc)
         try:
@@ -125,6 +127,9 @@ async def live_feed(settings):
                             raise DataIntegrityError("Orderbook delta before snapshot")
                         book_seq, book_update = validate_book_sequence(
                             book_seq, book_update, payload)
+                        last_book_ts = (stamp_ms(payload["ts"])
+                                        if payload.get("ts")
+                                        else datetime.now(timezone.utc))
                     if topic.startswith(("publicTrade.","orderbook.","tickers.","allLiquidation.")):
                         with connection(settings) as conn:
                             ingest_ws(conn,settings.symbol,payload)
@@ -151,6 +156,16 @@ async def live_feed(settings):
                         item=conn.execute("INSERT INTO data_gaps(source,symbol,start_ts,explanation) VALUES('publicTrade',%s,%s,'websocket interrupted') RETURNING id",
                                           (settings.symbol,start_gap)).fetchone()
                         pending_id=item['id']
+                    if last_book_ts is not None:
+                        outage_end=datetime.now(timezone.utc)
+                        if outage_end > last_book_ts:
+                            record_gap(
+                                conn, settings.symbol, "orderbook",
+                                int(last_book_ts.timestamp()*1000),
+                                int(outage_end.timestamp()*1000),
+                                "WebSocket L2 deltas lost; snapshot cannot restore "
+                                "intermediate add/cancel events")
+                        last_book_ts=None
             except Exception as log_error:
                 print(f'Failed to persist outage: {log_error}',flush=True)
             attempt+=1
