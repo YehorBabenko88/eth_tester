@@ -65,7 +65,7 @@ def train_shadow(settings,minimum=100,epochs=20):
     return result["id"],stats
 
 
-def train_causal_shadow(settings, as_of_ms, *, source="backtest",
+def train_causal_shadow(settings, as_of_ms, *, source="snapshots",
                         min_rows=180, min_new=100, previous_count=0,
                         embargo_ms=0):
     """Retrain only when enough independently labeled, point-in-time data exist.
@@ -74,17 +74,20 @@ def train_causal_shadow(settings, as_of_ms, *, source="backtest",
     periods are reserved for validation and independent shadow evaluation.
     """
     from .ml import chronological, fit, should_retrain
-    from .ml.extract import load_backtest_examples, load_paper_examples
+    from .ml.extract import (load_backtest_examples, load_paper_examples,
+                             load_causal_feature_examples)
     from .ml.lifecycle import store_shadow
 
     if min_rows < 30 or embargo_ms < 0:
         raise ValueError("invalid training policy")
-    if source == "backtest":
+    if source == "snapshots":
+        rows, rejected = load_causal_feature_examples(settings, as_of_ms)
+    elif source == "backtest":
         rows, rejected = load_backtest_examples(settings, as_of_ms)
     elif source == "paper":
         rows, rejected = load_paper_examples(settings, as_of_ms)
     else:
-        raise ValueError("source must be backtest or paper")
+        raise ValueError("source must be snapshots, backtest or paper")
     if len(rows) < min_rows or not should_retrain(previous_count, len(rows), min_new):
         return {"status": "insufficient_new_verified_data", "usable": len(rows),
                 "rejections": rejected, "approved": False}
