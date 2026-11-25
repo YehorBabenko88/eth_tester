@@ -20,11 +20,11 @@ class Parameters:
 
 def pattern(side, level, prior, bar, broken):
     """Return direction and pattern using only already closed bars."""
-    p, c, o, h, l = map(D, (prior["close"], bar["close"], bar["open"], bar["high"], bar["low"]))
+    p, c, o, h, low = map(D, (prior["close"], bar["close"], bar["open"], bar["high"], bar["low"]))
     if side == "resistance":
         if not broken and p <= level < c:
             return "long", "breakout"
-        if broken and p > level and l <= level < c:
+        if broken and p > level and low <= level < c:
             return "long", "retest"
         if broken and p > level > c:
             return "short", "false_breakout"
@@ -37,6 +37,6 @@ def pattern(side, level, prior, bar, broken):
             return "short", "retest"
         if broken and p < level < c:
             return "long", "false_breakout"
-        if not broken and l < level < c and c > o:
+        if not broken and low < level < c and c > o:
             return "long", "rejection"
     return None
