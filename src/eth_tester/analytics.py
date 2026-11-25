@@ -67,24 +67,34 @@ def build_footprint(settings, tf="1", hours=24):
     if tf not in TF_SECONDS:
         raise ValueError("Live footprint supports the 11 fixed intervals; W/M use archive rollups")
     span = TF_SECONDS[tf]
-    now = datetime.now(timezone.utc)
     with connection(settings) as conn:
-        # Same advisory lock as rollup_day, protecting archive-vs-live writes.
+        # Database clock, not a host clock (Windows time jumps must not
+        # manufacture future closed buckets).
+        now = conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
         conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                      (f"{settings.symbol}:{tf}:cluster",))
-        # Align start to the earliest complete bucket, preventing the
-        # sliding lookback from silently truncating an old bucket.
         start = floor_time(now - timedelta(hours=hours), span)
-        rows = conn.execute("""SELECT ts,price,qty,side FROM trades WHERE
-            symbol=%s AND ts >= %s AND ts < %s ORDER BY ts,trade_id""",
-            (settings.symbol, start, now)).fetchall()
+        # Aggregate NUMERIC/COUNT on the server, never fetch millions of raw
+        # prints into Python; exact archive-owned dates are excluded by job
+        # membership rather than by the mutable source='archive' tag.
+        rows = conn.execute("""SELECT
+            date_bin((%s || ' seconds')::interval,t.ts,
+                     '1970-01-01 00:00+00'::timestamptz) AS bucket,
+            t.price,t.side,sum(t.qty) AS qty,count(*) AS prints
+            FROM trades t
+            WHERE t.symbol=%s AND t.ts >= %s AND t.ts < %s
+              AND NOT EXISTS (SELECT 1 FROM aggregation_job a
+                WHERE a.symbol=t.symbol AND a.tf=%s
+                  AND a.day=(t.ts AT TIME ZONE 'UTC')::date)
+            GROUP BY 1,2,3 ORDER BY 1,2,3""",
+            (span, settings.symbol, start, now, tf)).fetchall()
         buckets = {}
         for row in rows:
-            ts = floor_time(row["ts"], span)
-            values = buckets.setdefault(ts, {}).setdefault(
-                row["price"], {"buy": Decimal(0), "sell": Decimal(0), "trades": 0})
+            values = buckets.setdefault(row["bucket"], {}).setdefault(
+                row["price"], {"buy": Decimal(0),
+                               "sell": Decimal(0), "trades": 0})
             values[row["side"].lower()] += row["qty"]
-            values["trades"] += 1
+            values["trades"] += row["prints"]
         completed = 0
         for stamp, bins in sorted(buckets.items()):
             # Archive has priority, including a corrected archive with zero rows.
@@ -118,7 +128,8 @@ def build_footprint(settings, tf="1", hours=24):
                 tape_tps=EXCLUDED.tape_tps,quality=EXCLUDED.quality,
                 metadata=features.metadata || EXCLUDED.metadata""",
               (settings.symbol, tf, stamp, peak, buy - sell, buy + sell,
-               sum(v["trades"] for v in bins.values()) / span, meta))
+               Decimal(sum(v["trades"] for v in bins.values())) /
+               Decimal(span), meta))
             completed += 1
     return completed
 

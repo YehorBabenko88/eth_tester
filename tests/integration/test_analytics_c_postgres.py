@@ -471,6 +471,18 @@ def test_round7_fast_c_actual_b_publisher_source_receipts_l2_and_oi(c_pg):
                    'websocket',%s::jsonb)""",
             (trade_event, json.dumps({"i": "R7-PUBLIC-1"})))
         record_trade_receipts(conn, "ETHUSDT", session, ["R7-PUBLIC-1"])
+        # B's prospective decision requires a genuinely current public
+        # trade, not a late receipt of an older bar's print. This current
+        # print is deliberately OUTSIDE the original closed minute and
+        # therefore cannot inflate its official base/quote reconciliation.
+        newest_trade = conn.execute(
+            "SELECT clock_timestamp() AS now").fetchone()["now"]
+        conn.execute("""INSERT INTO trades(
+            symbol,ts,trade_id,price,qty,side,notional,source,raw)
+            VALUES('ETHUSDT',%s,'R7-CURRENT-PRINT',3000,0.001,
+                   'Buy',3,'websocket',%s::jsonb)""",
+            (newest_trade, json.dumps({"i":"R7-CURRENT-PRINT"})))
+        record_trade_receipts(conn, "ETHUSDT", session, ["R7-CURRENT-PRINT"])
         conn.execute("""INSERT INTO feed_health(
             symbol,topic,ts,status,detail)
             VALUES('ETHUSDT','connection',clock_timestamp(),'connected',
@@ -576,3 +588,121 @@ def test_round7_aggregate_pending_rechecks_already_complete_legacy_jobs(c_pg):
         bins = conn.execute("""SELECT price,buy_qty FROM footprint_daily
             WHERE symbol='ETHUSDT' AND tf='1' ORDER BY price""").fetchall()
     assert bins == [{"price": Decimal(100), "buy_qty": Decimal(2)}]
+
+
+def test_round9_concurrent_first_start_l2_replay_never_regresses_cursor(c_pg):
+    """Two real PostgreSQL connections race from *no* market_book_state row."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from eth_tester.book_analysis import replay_orderbook
+    gate = Barrier(3)
+    with connection(c_pg) as conn:
+        snap = conn.execute("""INSERT INTO book_events(
+            symbol,exchange_ts,recv_ts,update_id,sequence_no,event_type,
+            bids,asks,valid)
+            VALUES('ETHUSDT',clock_timestamp(),clock_timestamp(),20,20,
+                   'snapshot','[["100","5"]]'::jsonb,
+                   '[["101","5"]]'::jsonb,true)
+            RETURNING id""").fetchone()["id"]
+        delta = conn.execute("""INSERT INTO book_events(
+            symbol,exchange_ts,recv_ts,update_id,sequence_no,event_type,
+            bids,asks,valid)
+            VALUES('ETHUSDT',clock_timestamp(),clock_timestamp(),21,21,
+                   'delta','[["100","7"]]'::jsonb,'[]'::jsonb,true)
+            RETURNING id""").fetchone()["id"]
+    def one():
+        gate.wait(timeout=20)
+        return replay_orderbook(c_pg, batch=1, max_batches=1)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(one), pool.submit(one)]
+        gate.wait(timeout=20)
+        assert sum(f.result(timeout=30) for f in jobs) == 2
+    with connection(c_pg) as conn:
+        state = conn.execute("""SELECT last_event_id,bids,asks,valid
+            FROM market_book_state WHERE symbol='ETHUSDT'""").fetchone()
+        gaps = conn.execute("""SELECT count(*) AS n FROM data_gaps
+            WHERE symbol='ETHUSDT' AND source='orderbook'""").fetchone()["n"]
+    assert state["last_event_id"] == delta > snap
+    assert state["bids"]["100"] == "7"
+    assert state["asks"]["101"] == "5"
+    assert state["valid"] is True
+    assert gaps == 0
+    assert replay_orderbook(c_pg,batch=1,max_batches=1) == 0
+
+
+def test_round9_corrupt_l2_writes_gap_and_recovers_only_from_new_snapshot(c_pg):
+    from eth_tester.book_analysis import replay_orderbook
+    with connection(c_pg) as conn:
+        first = conn.execute("""INSERT INTO book_events(
+            symbol,exchange_ts,recv_ts,update_id,sequence_no,event_type,
+            bids,asks,valid)
+            VALUES('ETHUSDT',clock_timestamp(),clock_timestamp(),10,10,
+                   'snapshot','[["100","3"]]'::jsonb,
+                   '[["101","5"]]'::jsonb,true)
+            RETURNING id""").fetchone()["id"]
+        poison = conn.execute("""INSERT INTO book_events(
+            symbol,exchange_ts,recv_ts,update_id,sequence_no,event_type,
+            bids,asks,valid)
+            VALUES('ETHUSDT',clock_timestamp(),clock_timestamp(),11,11,
+                   'delta','[["100","-10"]]'::jsonb,'[]'::jsonb,true)
+            RETURNING id""").fetchone()["id"]
+        recovered = conn.execute("""INSERT INTO book_events(
+            symbol,exchange_ts,recv_ts,update_id,sequence_no,event_type,
+            bids,asks,valid)
+            VALUES('ETHUSDT',clock_timestamp(),clock_timestamp(),20,20,
+                   'snapshot','[["100","2"]]'::jsonb,
+                   '[["101","6"]]'::jsonb,true)
+            RETURNING id""").fetchone()["id"]
+    assert replay_orderbook(c_pg,batch=1,max_batches=1) == 1
+    with connection(c_pg) as conn:
+        assert conn.execute("""SELECT valid FROM market_book_state
+            WHERE symbol='ETHUSDT'""").fetchone()["valid"] is True
+    assert replay_orderbook(c_pg,batch=1,max_batches=1) == 1
+    with connection(c_pg) as conn:
+        state = conn.execute("""SELECT last_event_id,valid,bids FROM
+            market_book_state WHERE symbol='ETHUSDT'""").fetchone()
+        gap = conn.execute("""SELECT count(*) AS n FROM data_gaps
+            WHERE symbol='ETHUSDT' AND source='orderbook'
+              AND explanation LIKE 'invalid L2 source event:%'""").fetchone()["n"]
+    assert state["last_event_id"] == poison > first
+    assert state["valid"] is False
+    assert state["bids"] == {}
+    assert gap == 1
+    assert replay_orderbook(c_pg,batch=1,max_batches=1) == 1
+    with connection(c_pg) as conn:
+        state = conn.execute("""SELECT last_event_id,valid,bids FROM
+            market_book_state WHERE symbol='ETHUSDT'""").fetchone()
+        gap = conn.execute("""SELECT count(*) AS n FROM data_gaps
+            WHERE symbol='ETHUSDT' AND source='orderbook'""").fetchone()["n"]
+    assert state["last_event_id"] == recovered
+    assert state["valid"] is True
+    assert state["bids"]["100"] == "2"
+    assert gap >= 1  # The real interruption is not silently erased.
+
+
+def test_round9_live_footprint_server_side_aggregates_many_small_ticks(c_pg):
+    """No Python materialization of every trade in the real PG aggregate path."""
+    from eth_tester.analytics import build_footprint
+    moment = datetime.now(UTC).replace(second=0, microsecond=0)
+    stamp = moment-timedelta(minutes=1)
+    with connection(c_pg) as conn:
+        conn.execute("""INSERT INTO trades(
+            symbol,ts,trade_id,price,qty,side,notional,source)
+            SELECT 'ETHUSDT',%s, 'dense-'||g::text,100,0.00000001,
+              CASE WHEN g%%2=0 THEN 'Buy' ELSE 'Sell' END,
+              0.000001,'websocket'
+            FROM generate_series(1,5000) g""", (stamp,))
+    assert build_footprint(c_pg,tf="1",hours=1) == 1
+    with connection(c_pg) as conn:
+        result = conn.execute("""SELECT buy_qty,sell_qty,trades FROM footprint
+            WHERE symbol='ETHUSDT' AND tf='1' AND bucket=%s""",
+            (stamp,)).fetchone()
+        feature = conn.execute("""SELECT volume,delta,quality
+            FROM features WHERE symbol='ETHUSDT' AND tf='1' AND ts=%s""",
+            (stamp,)).fetchone()
+    assert result["buy_qty"] == Decimal("0.00002500")
+    assert result["sell_qty"] == Decimal("0.00002500")
+    assert result["trades"] == 5000
+    assert feature["volume"] == Decimal("0.00005000")
+    assert feature["delta"] == 0
+    assert feature["quality"] == "partial_unverified"

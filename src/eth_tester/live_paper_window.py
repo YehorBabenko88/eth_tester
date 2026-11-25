@@ -123,6 +123,18 @@ def publish_latest_bounded_live(settings, *, replay_batch=1500,
         conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                      (f"bounded_paper:{settings.symbol}:1",))
         now = conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
+        # Replay may hit its per-pass budget under heavy L2 traffic. Never
+        # publish from an apparently fresh book with unprocessed raw deltas.
+        state = conn.execute("""SELECT last_event_id,valid FROM market_book_state
+            WHERE symbol=%s""", (settings.symbol,)).fetchone()
+        newest = conn.execute("""SELECT id FROM book_events WHERE symbol=%s
+            ORDER BY id DESC LIMIT 1""", (settings.symbol,)).fetchone()
+        if (not state or state["valid"] is not True or not newest
+                or state["last_event_id"] < newest["id"]):
+            return {"status": "pending",
+                    "reason": "l2_replay_backlog_or_invalid",
+                    "l2_replayed": replayed,
+                    "paper_only": True, "ml_eligible": False}
         bar = conn.execute("""SELECT ts FROM candles
             WHERE symbol=%s AND kind='trade' AND tf='1'
               AND source='bybit_v5' AND closed=true

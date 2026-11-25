@@ -128,7 +128,8 @@ def test_live_window_never_writes_a_snapshot(monkeypatch):
 
 
 def _mock_fast_publisher(monkeypatch, *, now, bar, has_book=True,
-                         has_oi=True, has_rest=True, sessions=1, b_reject=False):
+                         has_oi=True, has_rest=True, sessions=1, b_reject=False,
+                         l2_backlog=False, l2_valid=True):
     """Source selectors are mocked; B alone supplies authoritative publication."""
     from contextlib import nullcontext
     class DB:
@@ -147,6 +148,10 @@ def _mock_fast_publisher(monkeypatch, *, now, bar, has_book=True,
                 row = {"ts": now}
             elif "FROM candles" in query:
                 row = {"ts": bar}
+            elif "SELECT last_event_id,valid FROM market_book_state" in query:
+                row = {"last_event_id": 12, "valid": l2_valid}
+            elif "FROM book_events" in query:
+                row = {"id": 13 if l2_backlog else 12}
             elif "FROM ingestion_coverage" in query:
                 row = {"checked_at": now} if has_rest else None
             elif "FROM paper_live_evidence" in query:
@@ -258,3 +263,18 @@ def test_round7_stale_fast_heartbeat_cannot_claim_current_publication(monkeypatc
     result = read_live_paper_status(settings)
     assert result["status"] == "pending"
     assert result["reason"] == "fast_lane_heartbeat_stale"
+
+
+@pytest.mark.parametrize("backlog,valid", [(True,True),(False,False)])
+def test_round9_c_paper_never_issues_from_backlogged_or_invalid_l2(
+        monkeypatch, backlog, valid):
+    from eth_tester.live_paper_window import publish_latest_bounded_live
+    moment = BAR + timedelta(minutes=1, seconds=11)
+    settings, db, calls = _mock_fast_publisher(
+        monkeypatch, now=moment, bar=BAR, l2_backlog=backlog, l2_valid=valid)
+    result = publish_latest_bounded_live(settings)
+    assert result["status"] == "pending"
+    assert result["reason"] == "l2_replay_backlog_or_invalid"
+    assert result["paper_only"] is True and result["ml_eligible"] is False
+    assert calls == []
+    assert all("INSERT INTO feature_snapshots" not in q for q in db.statements)
