@@ -85,7 +85,7 @@ def value_profile(volume_at_price, fraction=Decimal("0.70")):
 
 
 def footprint(trades, *, imbalance_ratio=Decimal("3"), min_quantity=ZERO,
-              min_stack=3):
+              min_stack=3, tick_size=None, coverage_verified=False):
     """Aggressor-side volume at exact prices and diagonal stacked imbalance.
 
     Source side must be aggressor Buy/Sell; no maker-side inference.
@@ -115,17 +115,21 @@ def footprint(trades, *, imbalance_ratio=Decimal("3"), min_quantity=ZERO,
     if ratio <= 1 or threshold < 0 or min_stack < 1:
         raise ValueError("Invalid imbalance parameters")
     flags = {"buy": [], "sell": []}
-    for idx, p in enumerate(prices):
-        row = levels[p]
-        if idx > 0:
-            other = levels[prices[idx - 1]]["sell"]
+    tick = decimal(tick_size) if tick_size is not None else None
+    if tick is not None and tick <= 0:
+        raise ValueError("Tick size must be positive")
+    # Adjacent *observed* prices are not necessarily adjacent exchange ticks.
+    # Never claim a diagonal imbalance without tick metadata and coverage.
+    if tick is not None and coverage_verified:
+        for p in prices:
+            row = levels[p]
+            previous = levels.get(p - tick, {"sell": ZERO})
+            following = levels.get(p + tick, {"buy": ZERO})
             if row["buy"] >= threshold and row["buy"] > 0 and (
-                    other == 0 or row["buy"] >= other * ratio):
+                    previous["sell"] == 0 or row["buy"] >= previous["sell"] * ratio):
                 flags["buy"].append(p)
-        if idx + 1 < len(prices):
-            other = levels[prices[idx + 1]]["buy"]
             if row["sell"] >= threshold and row["sell"] > 0 and (
-                    other == 0 or row["sell"] >= other * ratio):
+                    following["buy"] == 0 or row["sell"] >= following["buy"] * ratio):
                 flags["sell"].append(p)
     stack = {}
     for side, marked in flags.items():
@@ -134,6 +138,10 @@ def footprint(trades, *, imbalance_ratio=Decimal("3"), min_quantity=ZERO,
         run = []
         for price in prices:
             if price in marked_set:
+                if run and (tick is None or price != run[-1] + tick):
+                    if len(run) >= min_stack:
+                        runs.append(run)
+                    run = []
                 run.append(price)
             else:
                 if len(run) >= min_stack:
@@ -145,7 +153,8 @@ def footprint(trades, *, imbalance_ratio=Decimal("3"), min_quantity=ZERO,
     profile = value_profile({p: v["buy"] + v["sell"] for p, v in levels.items()})
     return {"levels": levels, "buy": buy, "sell": sell, "delta": buy - sell,
             "volume": buy + sell, "trades": count, "profile": profile,
-            "imbalance": flags, "stacked_imbalance": stack}
+            "imbalance": flags, "stacked_imbalance": stack,
+            "imbalance_verified": bool(tick is not None and coverage_verified)}
 
 
 def market_indicators(bars, *, previous_close=None, atr_period=14):
