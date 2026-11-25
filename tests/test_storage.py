@@ -25,7 +25,7 @@ def test_drop_requires_explicit_backup_and_phrase():
 
 
 def test_migration_inventory():
-    assert MIGRATIONS == ("0001_partitioned_archive.sql",)
+    assert MIGRATIONS == ("0001_partitioned_archive.sql", "0002_quality_and_provenance.sql")
 
 
 def test_disk_guard_threshold(tmp_path):
