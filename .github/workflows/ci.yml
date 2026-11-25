@@ -22,7 +22,9 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m ruff check .
       - run: python -m compileall -q src tests
+        if: always()
       - run: python -m pytest -q -m "not postgres"
+        if: always()
   postgres-integration:
     name: real PostgreSQL 17 integration
     runs-on: ubuntu-latest
