@@ -86,6 +86,9 @@ def price_signal(closed_candles,fee_rate=D("0.00055"),slip_bps=D("2"),
     if len(candles)<12:
         return None
     try:
+        if any(b["ts"].tzinfo is None or b.get("closed", True) is not True
+               for b in candles):
+            return None
         step=candles[1]["ts"]-candles[0]["ts"]
         if step.total_seconds()<=0 or any(b["ts"]-a["ts"]!=step for a,b in zip(candles,candles[1:])):
             return None
@@ -124,7 +127,9 @@ def price_signal(closed_candles,fee_rate=D("0.00055"),slip_bps=D("2"),
             reason={"strategy":name,"strategy_version":params.version,**params.identity(),
                     "origin":origin.isoformat(),"confirmed":confirmed.isoformat(),
                     "side":side,"level":str(level),"atr":str(atr),"reference_price":str(price),
-                    "source":"closed_candles","economics":costs,"requires_live_confirmation":True}
+                    "source":"closed_candles","signal_bar_ts":last["ts"].isoformat(),
+                    "bar_seconds":str(step.total_seconds()),"economics":costs,
+                    "requires_live_confirmation":True}
             candidates.append((abs(price-level),name,Signal(direction,level,stop,take,reason)))
         if volume_profiles:
             from .strategies.volume import volume_signal
