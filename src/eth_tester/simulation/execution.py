@@ -140,6 +140,10 @@ class PaperEngine:
             raise ValueError('invalid side or protection')
         if order_type not in ('market', 'limit') or (order_type == 'limit') != (limit is not None):
             raise ValueError('invalid order type')
+        if not isinstance(reason or {}, dict):
+            raise ValueError('signal reason must be mapping')
+        if not (stop < take if side == 'long' else take < stop):
+            raise ValueError('stop must be adverse and take favorable')
         if limit is not None:
             limit = number(limit)
             if limit <= 0:
@@ -202,8 +206,16 @@ class PaperEngine:
                 self.rejections.append(('invalid_entry_price', quote.event_id))
                 return fills
             max_qty = order['remaining_notional'] / price
-            risk = max_qty * abs(price - order['stop'])
-            if risk > self.equity * self.max_risk_fraction:
+            worst_entry = price * (D(1) + self.costs.slippage_bps / D(10000)) if order['side'] == 'long' else price * (D(1) - self.costs.slippage_bps / D(10000))
+            if worst_entry <= 0:
+                raise ValueError('invalid slippage execution')
+            # Existing partial fills keep their own cost basis; reserve fee
+            # exposure on both existing and as-yet-unfilled entry units.
+            extra_risk = max_qty * abs(worst_entry - order['stop'])
+            extra_fee = max_qty * (worst_entry + order['stop']) * self.costs.taker
+            existing_risk = (self.position.qty * abs(self.position.entry - order['stop'])
+                             if self.position is not None else D(0))
+            if existing_risk + extra_risk + extra_fee > self.equity * self.max_risk_fraction:
                 self.rejections.append(('risk_cap', quote.event_id))
                 self.order = None
                 return fills
@@ -232,6 +244,8 @@ class PaperEngine:
                                 * self.costs.slippage_bps / D(10000))
             fee_rate = self.costs.taker
             slippage = abs(execution - best)
+        if execution <= 0:
+            raise ValueError('invalid execution price')
         qty = min(requested, liquidity)
         if action == 'entry':
             qty = min(qty, self.order['remaining_notional'] / execution)
