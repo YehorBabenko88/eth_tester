@@ -107,6 +107,8 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
         verified_sum=Decimal(0)
         evidence=list(funding_evidence or ())
         for event in evidence:
+            if not utc(trade['opened_at']) < utc(event['ts']) <= event_at:
+                raise ValueError('Funding event outside position lifetime')
             verified_sum+=sign*number(trade['qty'])*number(event['mark_price'])*number(event['rate'])
         if evidence and verified_sum!=funding:
             raise ValueError('Funding event breakdown does not match settlement')
