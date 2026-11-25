@@ -5,7 +5,11 @@ paper positions, changes bot_control, promotes a model, or deletes data.
 """
 
 import json
+import os
+import re
+import stat
 import time
+from pathlib import Path
 
 from .database import connection
 
@@ -13,11 +17,93 @@ COMMANDS = frozenset(("trade", "signals", "models", "research", "risk",
                       "health", "coverage", "maintenance"))
 
 
+_SECRET_KEY = re.compile(r"token|secret|password|passwd|credential|api.?key|private.?key|"
+                         r"authorization|cookie|session.?key|database.?url|dsn", re.I)
+_BEARER = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_INLINE_SECRET = re.compile(r"(?i)\b(password|secret|token|api_key)\s*[:=]\s*[^\s,;]+")
+_DATABASE_URL = re.compile(r"(?i)\b(postgresql?://)[^\s]+")
+
+
+def _redact(value, depth=0):
+    if depth >= 8:
+        return "[nested content omitted]"
+    if isinstance(value, dict):
+        result = {}
+        for index, (key, item) in enumerate(list(value.items())[:256]):
+            key = str(key)[:100]
+            if _SECRET_KEY.search(key):
+                result[f"[redacted field {index}]"] = "[REDACTED]"
+            else:
+                result[key] = _redact(item, depth+1)
+        if len(value) > 256:
+            result["_truncated"] = True
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_redact(item, depth+1) for item in value[:256]]
+    if isinstance(value, str):
+        text = _BEARER.sub("Bearer [REDACTED]", value)
+        text = _INLINE_SECRET.sub(lambda m: m.group(1)+"=[REDACTED]", text)
+        return _DATABASE_URL.sub(r"\1[REDACTED]", text)[:4000]
+    if isinstance(value, (bool, type(None), int, float)):
+        return value
+    return str(value)[:100]
+
+
 def _json(value, limit=900):
-    # JSON is for the authenticated operator only; cap output to avoid huge
-    # exchange/raw provenance objects, and prevent hidden formatting surprises.
-    raw = json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
+    raw = json.dumps(_redact(value), ensure_ascii=False, default=str, sort_keys=True)
     return raw if len(raw) <= limit else raw[:limit] + " [truncated: query specific record]"
+
+
+def sanitize_message(message):
+    """A last-resort output filter, including legacy /history and /position."""
+    if not isinstance(message, str):
+        raise ValueError("Invalid Telegram output")
+    value = _BEARER.sub("Bearer [REDACTED]", message)
+    value = _INLINE_SECRET.sub(lambda m: m.group(1) + "=[REDACTED]", value)
+    return _DATABASE_URL.sub(r"\1[REDACTED]", value)
+
+
+def existing_trade_chart(settings, trade_id, *, root=None):
+    """Read only a previously stored chart from an exact local owned directory.
+
+    In particular NEVER call charts.render_trade: that function changes the
+    paper_trades ledger and overwrites PNG bytes when Telegram merely reads.
+    """
+    if type(trade_id) is not int or not 0 < trade_id < 2**63:
+        raise ValueError("Valid positive paper trade ID required")
+    with connection(settings) as conn:
+        row = conn.execute("""SELECT id,closed_at,entry_chart,exit_chart
+            FROM paper_trades WHERE id=%s AND symbol=%s""",
+            (trade_id, settings.symbol)).fetchone()
+    if row is None:
+        raise FileNotFoundError("Paper trade not found")
+    stage = "exit" if row.get("closed_at") is not None else "entry"
+    recorded = row.get(stage + "_chart")
+    trusted = Path(root) if root is not None else Path.cwd() / "runtime" / "charts"
+    if not trusted.is_dir() or trusted.is_symlink():
+        raise FileNotFoundError("Owned paper chart root unavailable")
+    expected = trusted / f"paper_trade_{trade_id}_{stage}.png"
+    if not recorded or expected.is_symlink() or not expected.is_file():
+        raise FileNotFoundError("Previously stored paper chart unavailable")
+    # The recorded path must match the exact predetermined trade/stage name.
+    if Path(recorded).resolve(strict=True) != expected.resolve(strict=True):
+        raise FileNotFoundError("Unexpected paper chart identity")
+    # No FOLLOW on the leaf, and verify PNG signature on the opened descriptor.
+    # The trusted parent must be ACL-protected against path substitution.
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(expected, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise FileNotFoundError("Paper chart is not a regular file")
+        if os.read(fd, 8) != b"\x89PNG\r\n\x1a\n":
+            raise FileNotFoundError("Stored paper chart has invalid PNG header")
+        os.lseek(fd, 0, os.SEEK_SET)
+        # Keep the SAME verified descriptor through Telegram send; never
+        # reopen by pathname after a race-prone check.
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def detail_trade(settings, trade_id):
@@ -93,7 +179,7 @@ def read_view(settings, name):
                 FROM bot_heartbeat WHERE component IN
                 ('control_label_horizons','control_train_causal_shadow')
                 ORDER BY component""").fetchall()
-            return "Только проверенные исторические метки, paper-live не ML:\n" + (
+            return "Исследовательская выборка НЕПОЛНАЯ: нет всех no_signal/no_trade bars; это не OOS и не сертификат ML.\n" + (
                 "\n".join(f"{r['component']}: {r['status']} {r['updated_at']} "
                           f"{_json(r['detail'], 400)}" for r in rows) or "нет")
         if name == "coverage":
@@ -105,7 +191,9 @@ def read_view(settings, name):
                           f"{r['quality']} ({r['checked_at']})" for r in rows) or "нет")
         if name == "maintenance":
             rows = conn.execute("""SELECT count(*) AS n FROM bot_events
-                WHERE ts < clock_timestamp()-interval '180 days'""").fetchone()
+                WHERE ts < clock_timestamp()-interval '180 days'
+                AND event <> 'paper_trade_review_v1'
+                AND coalesce(data->>'retention','') <> 'preserve'""").fetchone()
             feed = conn.execute("""SELECT count(*) AS n FROM feed_health
                 WHERE ts < clock_timestamp()-interval '90 days'""").fetchone()
             return ("Обслуживание: ТОЛЬКО диагностика\n"
@@ -117,28 +205,34 @@ def read_view(settings, name):
 
 
 def pages(message, *, chunk_limit=3500, max_chunks=8):
-    """Bounded Telegram pagination with explicit truncation, never silent loss."""
+    """Telegram UTF-16 safe paging, explicit omission marker, never silent loss."""
     if not isinstance(message, str):
         raise ValueError("Invalid Telegram output")
     if not 400 <= chunk_limit <= 3900 or not 1 <= max_chunks <= 32:
         raise ValueError("Unsafe Telegram page limits")
+    # Reserve UTF-16 units for page labels and truncation indicator.
+    budget = chunk_limit - 90
     chunks = []
-    text = message
-    while text and len(chunks) < max_chunks:
-        if len(text) <= chunk_limit:
-            chunks.append(text)
-            text = ""
-            break
-        pivot = text.rfind("\n", 1, chunk_limit)
-        if pivot < chunk_limit // 2:
-            pivot = chunk_limit
-        chunks.append(text[:pivot])
-        text = text[pivot:].lstrip("\n")
-    if text:
+    position = 0
+    while position < len(message) and len(chunks) < max_chunks:
+        units = 0
+        end = position
+        while end < len(message):
+            needed = 2 if ord(message[end]) > 0xffff else 1
+            if units + needed > budget:
+                break
+            units += needed
+            end += 1
+        chunks.append(message[position:end])
+        position = end
+    if position < len(message):
         chunks[-1] += "\n[Ответ ограничен: запросите конкретную запись]"
     total = len(chunks)
-    return [f"({i}/{total})\n{part}" if total > 1 else part
-            for i, part in enumerate(chunks, 1)] or ["Нет данных"]
+    result = [f"({i}/{total})\n{part}" if total > 1 else part
+              for i, part in enumerate(chunks, 1)] or ["Нет данных"]
+    assert all(len(value.encode("utf-16-le"))//2 <= chunk_limit for value in result)
+    return result
+
 
 # Per-process *admission* throttle. B owns the durable alert/outbox ledger;
 # this map is not presented as a durable or cross-process rate limit.

@@ -100,6 +100,7 @@ def _control(settings, name):
 
 
 def _read(settings, name):
+    from .telegram_views import _json
     with connection(settings) as conn:
         if name == "position":
             row = conn.execute(
@@ -109,7 +110,7 @@ def _read(settings, name):
             return (
                 f"Бумажная позиция #{row['id']} {row['direction']}\n"
                 f"Вход {row['entry']}, qty {row['qty']}, stop {row['stop']}, take {row['take']}\n"
-                f"Открыта {row['opened_at']}\nПричина: {str(row['reason'])[:900]}"
+                f"Открыта {row['opened_at']}\nПричина: {_json(row['reason'], 900)}"
                 if row else "Открытых позиций нет"
             )
         if name in ("history", "trade"):
@@ -119,7 +120,7 @@ def _read(settings, name):
             ).fetchall()
             return "\n".join(
                 f"#{r['id']} {r['direction']} ({r['state']}) {r['entry']} → {r['exit']} "
-                f"net {r['net_pnl']} | {r['exit_reason'] or '-'} | {str(r['reason'])[:110]}"
+                f"net {r['net_pnl']} | {r['exit_reason'] or '-'} | {_json(r['reason'], 110)}"
                 for r in rows
             ) or "Сделок пока нет"
         if name == "stats":
@@ -135,6 +136,7 @@ def _read(settings, name):
             ).fetchone()
             rate = 100 * r["wins"] / r["n"] if r["n"] else 0
             return (
+                f"Бумажные результаты предварительные, не подтверждённая доходность.\n"
                 f"Закрыто {r['n']}, прибыльных {r['wins']} ({rate:.1f}%)\n"
                 f"Gross {r['gross']}, Net {r['net']}, Equity {acc['equity'] if acc else '-'}\n"
                 f"Комиссии {r['fees']}, funding {r['funding']}, slippage {r['slippage']}"
@@ -247,14 +249,17 @@ def _system():
 
 
 async def dispatch(settings, update, context, name):
-    from .telegram_views import allow_message, pages
+    from .telegram_views import allow_message, pages, sanitize_message
     chat = getattr(update, "effective_chat", None)
     user = getattr(update, "effective_user", None)
+    if not authorise(settings, update):
+        # All unauthorized callers share one bounded audit-rate bucket.
+        # Do not let attacker-selected IDs evict the owner from rate tracking.
+        if allow_message(("unauthorised", "global")):
+            _audit(settings, update, name, False, "denied")
+        return
     if not allow_message((str(getattr(chat, "id", "")),
                           str(getattr(user, "id", "")))):
-        return  # Per-process burst limit, including unauthenticated requests.
-    if not authorise(settings, update):
-        _audit(settings, update, name, False, "denied")
         return
     if name not in COMMANDS:
         _audit(settings, update, name, False, "unknown")
@@ -293,20 +298,26 @@ async def dispatch(settings, update, context, name):
             answer = await asyncio.to_thread(read_view, settings, name)
         elif name == "chart":
             args = context.args or []
-            if not args or not args[0].isdigit() or int(args[0]) <= 0:
+            if len(args) != 1 or not args[0].isdecimal() or not 0 < int(args[0]) < 2**63:
                 answer = "Укажите ID сделки: /chart 123. Список: /history"
             else:
-                from .charts import render_trade
-                path = await asyncio.to_thread(render_trade, settings, int(args[0]))
-                with open(path, "rb") as photo:
-                    await update.effective_message.reply_photo(
-                        photo=photo, caption=f"Бумажная сделка #{args[0]}"
-                    )
-                _audit(settings, update, name, True, "completed")
-                return
+                from .telegram_views import existing_trade_chart
+                try:
+                    chart_file = await asyncio.to_thread(existing_trade_chart, settings, int(args[0]))
+                except (FileNotFoundError, OSError):
+                    answer = ("Проверенный ранее сохранённый PNG недоступен. "
+                              "Команда /chart ничего не генерирует и не изменяет историю.")
+                else:
+                    with chart_file as photo:
+                        await update.effective_message.reply_photo(
+                            photo=photo,
+                            caption=f"Бумажная иллюстрация #{args[0]}; не доказательство исполнения"
+                        )
+                    _audit(settings, update, name, True, "completed")
+                    return
         else:
             answer = await asyncio.to_thread(_read, settings, name)
-        for page_number, page in enumerate(pages(answer)):
+        for page_number, page in enumerate(pages(sanitize_message(answer))):
             await update.effective_message.reply_text(
                 page, reply_markup=(ReplyKeyboardMarkup(MENU, resize_keyboard=True)
                                     if page_number == 0 else None)
@@ -339,7 +350,9 @@ async def run_telegram(settings):
         if name:
             await dispatch(settings, update, context, name)
         elif not authorise(settings, update):
-            _audit(settings, update, "unknown_text", False, "denied")
+            from .telegram_views import allow_message
+            if allow_message(("unauthorised", "global")):
+                _audit(settings, update, "unknown_text", False, "denied")
 
     for item in COMMANDS:
         app.add_handler(CommandHandler(item, command))

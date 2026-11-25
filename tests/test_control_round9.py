@@ -33,7 +33,7 @@ def test_watchdog_restarts_hung_engine_after_two_misses_only():
     w = service_health.HealthWatchdog(clock=lambda: 500,
                                       checker=lambda _: {
                                           'paper_engine': 1000,
-                                          'live_paper_window': 5})
+                                          'live_paper_window': 5, 'analytics': 5})
     assert asyncio.run(w.check_once(sup, object())) == 'checked'
     assert sup.stopped == []
     assert asyncio.run(w.check_once(sup, object())) == 'checked'
@@ -93,7 +93,7 @@ def test_cooldown_rejects_repeat_restarts():
 def test_fresh_engine_and_analytics_do_not_restart_on_absent_live_feed():
     sup = FakeSupervisor()
     w = service_health.HealthWatchdog(clock=lambda: 500,
-         checker=lambda _: {'paper_engine': 8, 'live_paper_window': 3})
+         checker=lambda _: {'paper_engine': 8, 'live_paper_window': 3, 'analytics': 3})
     for _ in range(10):
         asyncio.run(w.check_once(sup, object()))
     assert not sup.stopped

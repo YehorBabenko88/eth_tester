@@ -54,11 +54,17 @@ class Supervisor:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             **extra,
         }
-        self.path.mkdir(parents=True, exist_ok=True)
-        target = self.path / "supervisor.json"
-        temp = self.path / f".supervisor.{os.getpid()}.tmp"
-        temp.write_text(json.dumps(self.status, ensure_ascii=False), encoding="utf-8")
-        os.replace(temp, target)
+        try:
+            self.path.mkdir(parents=True, exist_ok=True)
+            target = self.path / "supervisor.json"
+            temp = self.path / f".supervisor.{os.getpid()}.tmp"
+            temp.write_text(json.dumps(self.status, ensure_ascii=False), encoding="utf-8")
+            os.replace(temp, target)
+        except OSError as exc:
+            # Loss of diagnostic storage is not permission to halt the paper
+            # service. Worker lifetimes and bot_control remain authoritative.
+            LOGGER.error("Supervisor status write unavailable (%s)",
+                         type(exc).__name__)
 
     async def _terminate(self, name, proc):
         """Gracefully stop only the child spawned by this supervisor.
@@ -178,11 +184,12 @@ class Supervisor:
         LOGGER.info("Verified existing ETH Tester schema: %s", verification)
         specs = [(cmd, None) for cmd in PERMANENT]
         specs.extend(PERIODIC.items())
-        # Existing B retention still purges all bot_events, including E's
-        # durable paper_trade_review_v1 markers. NEVER enable it by default.
-        # Only an explicit owner opt-in after B protection is accepted.
+        # Unattended deletion remains BLOCKED, even with the old opt-in flag:
+        # B currently has a feed_health 91-day state-loss failure and unsafe
+        # owned-temp root replacement. No G watchdog may trigger a purge.
         if os.environ.get("ETH_TESTER_SAFE_CLEANUP_APPROVED", "") == "1":
-            specs.append(("cleanup", 86400))
+            LOGGER.error("Automatic cleanup disabled: storage ownership/retention unverified")
+            self._record("cleanup", "disabled_unverified_retention")
         if settings.tg_bot_token and settings.tg_chat_id:
             if os.environ.get("ETH_TESTER_TG_USER_ID", "").strip().isdecimal():
                 specs.append(("telegram", None))
