@@ -330,3 +330,55 @@ paths; tests/test_storage_postgres.py requires a real disposable PostgreSQL
 server (ETH_TEST_PG_DSN) and a trusted installed PG binary directory. A
 skipped PG run is NOT an accepted backup/restore proof. This round contains
 no DB schema migration and never authorizes real trading.
+
+
+## Round 15 — immutable *provisional* cost observation and archive SHA rehydration
+
+Migration `0008_provisional_cost_observations.sql` adds only the
+append-only `paper_cost_observation_receipts` table. It does NOT mutate paper
+trades, equity or existing receipt records, does NOT change the one-position
+$1000 paper limit and does NOT certify economics. SQL CHECK constraints
+permanently forbid claiming schedule completeness, funding/economics
+verification, ML eligibility, finite safe reserve or actual exchange orders.
+An UPDATE/DELETE trigger prevents rewriting an older observation.
+Do not apply any existing migration with modified contents/checksum.
+
+`storage.cost_receipts.record_provisional_cost_observation(conn,trade_id)`
+can be called by a **separate post-settlement diagnostic transaction**, never
+as a condition that grants E a paper entry. It reads persisted closed
+`paper_trades` via FOR SHARE, the observed `funding` rows and as-of-exit
+`market_ticker_events` marks, with 2s lock/5s statement timeouts and
+at most 1000 events. It fingerprints all observed rows into an immutable
+receipt; conflicting hashes abort. If no rows were observed, the candidate
+funding amount is **NULL, NOT verified zero**. A complete mark list can be
+arithmetically consistent but is STILL NOT independent proof of the official
+funding schedule. The old funding source has no immutable official
+`received_at`, schedule version, interval exceptions or zero-event-window
+receipts; therefore `funding_verified=false`, `economics_verified=false`,
+`ml_eligible=false`, `reserve_usd=NULL`, and
+`reserve_status=unbounded_no_certified_capital_release` ALWAYS. E may apply
+a separately reviewed bounded *simulation* risk reserve, but must not use
+this diagnostic receipt to declare true risk bounded or to increase equity;
+F must never treat it as a certified cost/return label.
+
+`storage.rehydration.require_original_archive_sha(conn,symbol,day,sha,
+instrument='linear')` is B's read-only preflight for A's same-gzip
+rehydration. It only accepts a previously COMPLETE archive with an exact
+original `ingestion_job.sha256` (and positive original row count); any
+different downloaded gzip SHA, conflicting stage SHA, mismatched stage scalar
+row count or missing expected source-price bins fails closed. A calls the
+preflight under the SAME transaction before restoring B source bins, and
+must never overwrite the original gzip SHA, original first-observation
+time, trades, or completed-day identity. An original completed day whose
+immutable bins are entirely absent can be marked
+`rehydration_needed=true`; this does **not** claim exchange completeness or
+permit ML certification. A remains sole owner of actual downloader retry,
+adaptive 24/7 catch-up, and all rehydration state transitions.
+
+Unit tests `tests/test_storage_round15_cost_archive.py` use the exact
+Python modules with fake DB adapters; `tests/test_storage_postgres.py`
+expects migration 0008 and must run on a real throwaway PostgreSQL 17/18
+server before any CODE/RUNTIME/PRODUCTION GO. No tests may touch an existing
+user database. Backup/restore still additionally requires a successful
+full-data restore against a new dedicated DB; original archive gzip SHA must
+be preserved verbatim, not recalculated from restored market rows.

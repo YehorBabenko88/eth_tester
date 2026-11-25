@@ -58,7 +58,7 @@ def test_migrations_and_reinitialization_preserve_rows(postgres_lab):
             "0001_partitioned_archive.sql", "0002_quality_and_provenance.sql",
             "0003_retention_indexes.sql", "0004_trade_identity_guard.sql",
             "0005_paper_settlement_ledger.sql", "0006_paper_ml_labels.sql",
-            "0007_bounded_live_and_archive_bins.sql"
+            "0007_bounded_live_and_archive_bins.sql", "0008_provisional_cost_observations.sql"
         ]
         conn.execute(
             """INSERT INTO funding(symbol,ts,rate) VALUES(%s,%s,%s)
@@ -94,7 +94,7 @@ def test_concurrent_database_init_is_idempotent(postgres_lab):
     with connection(postgres_lab) as conn:
         assert conn.execute(
             "SELECT count(*) AS n FROM eth_schema_migrations"
-        ).fetchone()["n"] == 7
+        ).fetchone()["n"] == 8
 
 
 def test_copy_replay_and_conflict_rejection(postgres_lab):
