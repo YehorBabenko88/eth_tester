@@ -6,6 +6,7 @@ from psycopg.conninfo import conninfo_to_dict,make_conninfo
 from psycopg import sql
 from .config import Settings
 from .migrations import apply_migrations
+from .storage.partitions import ensure_current_partitions
 
 @contextmanager
 def connection(settings: Settings):
@@ -25,6 +26,7 @@ def init_database(settings: Settings):
     with connection(settings) as conn:
         conn.execute(files("eth_tester").joinpath("schema.sql").read_text())
         apply_migrations(conn)
+        ensure_current_partitions(conn)
         conn.execute("INSERT INTO paper_account(id,equity,initial_equity) VALUES(1,%s,%s) ON CONFLICT DO NOTHING",
                      (settings.initial_equity_usd, settings.initial_equity_usd))
 
