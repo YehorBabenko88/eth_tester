@@ -7,7 +7,7 @@
 - Public Bybit V5 history collectors: trade, mark, index and premium-index candles across available Bybit intervals; funding, six OI intervals and six long/short account-ratio intervals. Each source has a resume cursor.
 - Full-day public ETHUSDT gzip trade-archive downloader: streaming SHA-256, CSV/schema and UTC-date checks, atomic PostgreSQL COPY staging, resumable progress. Source availability is exchange-dependent.
 - Public WebSocket for raw trade prints, depth-configurable orderbook, ticker/mark/index/OI/funding snapshots and all-liquidation events. Exponential reconnection, persistent tick-gap records and REST refresh.
-- Local dedicated PostgreSQL database with indexed raw trades, OHLCV, funding, OI, ratios, tickers, liquidation, book messages, reconstructed L2 state, large wall changes, footprint, POC, delta, windowed CVD, tape speed, levels, models, signals, backtests and paper trades.
+- Local dedicated PostgreSQL database with indexed raw trades, OHLCV, funding, OI, ratios, tickers, liquidation, book messages, reconstructed L2 state, large wall changes, footprint, POC, delta, windowed CVD, tape speed, levels, models, signals, backtests and paper trades. Idempotent daily footprint contributions rebuild multi-day (W/M) clusters without double-counting.
 - Deterministic confirmed-pivot rejection signals; one simulated position at a time, $1,000 notional, TP/SL, risk cap, fees, slippage and approximate funding. Conservative OHLC backtests enter at the *next* bar and assume stop hit first when both TP/SL fit within the same bar.
 - Telegram allowlisted /pause /resume /stop /stats /disk /progress /levels /trade /chart ID /gaps; remote database deletion deliberately restricted.
 - Chronological training of experimental shadow logistic models from closed paper trades only. Model is **not** auto-deployed or used to promise profits.
@@ -33,7 +33,7 @@ eth-tester run
 
 ### Other commands
 
-- `eth-tester backfill` / `eth-tester archives` — historical exchange REST and dated gzip archives.
+- `eth-tester backfill` / `eth-tester archives` / `eth-tester aggregate` — exchange REST, dated gzip trades and all 13 time-frame tick-derived historical price-bin footprints. Aggregation can be storage-intensive and processes only fully downloaded UTC days.
 - `eth-tester --tf 60 levels` / `eth-tester --tf 1 footprint` / `eth-tester book-replay` — analytics.
 - `eth-tester --tf 5 backtest` / `eth-tester learn` — paper research and shadow learning.
 - `eth-tester --trade-id 1 chart` — local annotated paper-trade chart.
