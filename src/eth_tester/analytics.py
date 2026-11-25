@@ -164,9 +164,11 @@ def enrich_features(settings, tf="1", hours=24):
             candle = conn.execute("""SELECT volume FROM candles WHERE symbol=%s
                 AND kind='trade' AND tf=%s AND ts=%s AND closed""",
                 (settings.symbol, tf, ts)).fetchone()
-            oi = conn.execute("""SELECT value FROM open_interest WHERE symbol=%s
+            oi = conn.execute("""SELECT ts,value FROM open_interest WHERE symbol=%s
                 AND interval='5min' AND ts<=%s ORDER BY ts DESC LIMIT 1""",
                 (settings.symbol, as_of)).fetchone()
+            oi_value = (oi["value"] if oi and timedelta(0) <= as_of - oi["ts"]
+                        <= timedelta(minutes=10) else None)
             funding = conn.execute("""SELECT rate FROM funding WHERE symbol=%s
                 AND ts<=%s ORDER BY ts DESC LIMIT 1""",
                 (settings.symbol, as_of)).fetchone()
@@ -196,7 +198,7 @@ def enrich_features(settings, tf="1", hours=24):
                 imbalance=%s,quality=%s,
                 metadata=features.metadata || %s::jsonb
                 WHERE symbol=%s AND tf=%s AND ts=%s""",
-                (cvd, oi["value"] if oi else None,
+                (cvd, oi_value,
                  funding["rate"] if funding else None, imbalance, quality,
                  meta, settings.symbol, tf, ts))
     return len(rows)
