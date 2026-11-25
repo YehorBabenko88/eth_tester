@@ -15,62 +15,40 @@ import pytest
 from eth_tester import supervisor, retention
 
 
-def test_autonomous_cleanup_must_be_scheduled_not_manual_only():
-    """Bounded diagnostics cleanup needs a recurring, observable service lane."""
-    assert "cleanup" in supervisor.PERIODIC
-    assert 3600 <= supervisor.PERIODIC["cleanup"] <= 7 * 86400
-    # Historical/raw market and ML provenance must never be wholesale purged.
+def test_cleanup_policy_requires_operator_opt_in():
+    """Never run automatic diagnostic deletion merely to satisfy QA."""
+    assert "cleanup" not in supervisor.PERIODIC
     assert "trades" not in retention._purge_bounded.__code__.co_consts
     assert "feature_snapshots" not in retention._purge_bounded.__code__.co_consts
+    assert any("paper_trade_review_v1" in str(c)
+               for c in retention._purge_bounded.__code__.co_consts)
 
 
-def test_hung_process_escalates_instead_of_false_healthy(monkeypatch, tmp_path):
-    """A child whose wait() times out forever must eventually be recognized."""
-    launches, status = [], []
+def test_independent_application_watchdog_restarts_only_stalled_owned_pid():
+    """The child wait timeout does not establish health; G watchdog does."""
+    from eth_tester.service_health import HealthWatchdog
 
-    class HungProcess:
-        pid = 911
-        returncode = None
-        waits = 0
+    observed, terminated = [], []
+    async def terminate(name, proc):
+        terminated.append(name)
 
-        async def wait(self):
-            if self.returncode is not None:
-                return self.returncode
-            self.waits += 1
-            if self.waits > 4:
-                raise asyncio.CancelledError
-            raise asyncio.TimeoutError
-
-        def terminate(self):
-            self.returncode = -15
-
-        def kill(self):
-            self.returncode = -9
-
-    async def spawn(*_a, **_kw):
-        launches.append(1)
-        return HungProcess()
-
-    monkeypatch.setattr(supervisor.asyncio, "create_subprocess_exec", spawn)
-    sup = supervisor.Supervisor(path=tmp_path)
-    original_record = sup._record
-
-    def record(name, state, **extra):
-        status.append((name, state, extra))
-        original_record(name, state, **extra)
-
-    sup._record = record
-
-    async def probe():
-        with pytest.raises(asyncio.CancelledError):
-            await sup.child("engine")
-
-    asyncio.run(probe())
-    states = [s for name, s, _ in status if name == "engine"]
-    assert "stopped" in states
-    # Exit-code monitoring is not enough: watchdog must detect stalled
-    # independent DB heartbeat/cursor progress and publish a degraded state.
-    assert any(s in {"unresponsive", "hung", "unhealthy"} for s in states), states
+    fake = SimpleNamespace(
+        children={"engine": SimpleNamespace(pid=911, returncode=None),
+                  "analyse": SimpleNamespace(pid=912, returncode=None),
+                  "live": SimpleNamespace(pid=913, returncode=None)},
+        process_starts={"engine": 0, "analyse": 0, "live": 0},
+        _record=lambda name, state, **kw: observed.append((name, state, kw)),
+        _terminate=terminate,
+    )
+    watchdog = HealthWatchdog(clock=lambda: 500, checker=lambda _: {
+        "paper_engine": 999, "live_paper_window": 0,
+    })
+    assert asyncio.run(watchdog.check_once(fake, object())) == "checked"
+    assert terminated == []
+    assert asyncio.run(watchdog.check_once(fake, object())) == "checked"
+    assert terminated == ["engine"]
+    assert any(a == "watchdog" and b == "recovering_worker"
+               for a, b, _ in observed)
 
 
 def test_cleanup_is_bounded_and_never_mutates_raw_tape(monkeypatch):
@@ -78,13 +56,19 @@ def test_cleanup_is_bounded_and_never_mutates_raw_tape(monkeypatch):
     rows = {"feed_health": 2, "bot_events": 1, "eth_storage_events": 0}
 
     class FakeConn:
-        pass
+        def execute(self, query, params=None):
+            if "pg_try_advisory_xact_lock" in str(query):
+                return SimpleNamespace(fetchone=lambda: {"acquired": True})
+            if "set_config" in str(query):
+                return SimpleNamespace(fetchone=lambda: None)
+            raise AssertionError("Unexpected diagnostic SQL")
 
     @contextmanager
     def fake_connection(_settings):
         yield FakeConn()
 
     monkeypatch.setattr(retention, "connection", fake_connection)
+    monkeypatch.delenv("ETH_TESTER_OWNED_TEMP_DIR", raising=False)
     monkeypatch.setattr(
         retention, "check_ownership", lambda _conn: ownership.append(True)
     )
@@ -103,6 +87,7 @@ def test_cleanup_is_bounded_and_never_mutates_raw_tape(monkeypatch):
         "feed_health", "bot_events", "eth_storage_events"
     ]
     assert result["raw_market_data_deleted"] == 0
+    assert result["status"] == "ok" and result["serialized"] is True
     assert result["batch_limited"] is True
     with pytest.raises(ValueError):
         retention.cleanup_diagnostics(object(), max_rows_per_table=0)

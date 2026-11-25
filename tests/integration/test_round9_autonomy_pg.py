@@ -103,6 +103,21 @@ def test_bounded_diagnostic_clean_two_cycles_preserve_market_history(h9_pg):
                       'archive',%s::jsonb)""",
             (older, "H9-RETAIN-" + uuid4().hex[:10], json.dumps({"qa": True})),
         )
+    # B must preserve both immutable research reviews and explicitly marked
+    # audit records; ordinary old diagnostics still expire in bounded batches.
+    with connection(h9_pg) as conn:
+        conn.execute(
+            """INSERT INTO bot_events(ts,severity,event,data)
+               VALUES(%s,'info','paper_trade_review_v1',
+                      '{"trade_id":7,"retention":"preserve","paper_only":true}'::jsonb)""",
+            (older,),
+        )
+        conn.execute(
+            """INSERT INTO bot_events(ts,severity,event,data)
+               VALUES(%s,'info','qa_other_durable',
+                      '{"retention":"preserve"}'::jsonb)""",
+            (older,),
+        )
     first = cleanup_diagnostics(
         h9_pg, health_days=30, event_days=30, max_rows_per_table=2
     )
@@ -115,10 +130,19 @@ def test_bounded_diagnostic_clean_two_cycles_preserve_market_history(h9_pg):
     )
     assert second["feed_health_deleted"] == 1
     assert second["bot_events_deleted"] == 1
+    third = cleanup_diagnostics(
+        h9_pg, health_days=30, event_days=30, max_rows_per_table=2
+    )
+    assert third["bot_events_deleted"] == 0
     with connection(h9_pg) as conn:
         assert conn.execute(
             "SELECT count(*) AS n FROM trades"
         ).fetchone()["n"] == 1
+        assert conn.execute(
+            """SELECT count(*) AS n FROM bot_events
+               WHERE event='paper_trade_review_v1'
+                  OR data->>'retention'='preserve'"""
+        ).fetchone()["n"] == 2
         assert conn.execute(
             "SELECT count(*) AS n FROM feed_health WHERE topic='qa_retention'"
         ).fetchone()["n"] == 0

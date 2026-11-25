@@ -75,31 +75,38 @@ def main(argv=None):
     if not 1 <= args.interval <= 3600:
         parser.error("interval must be between 1 and 3600")
     deadline = time.monotonic() + args.seconds
-    with psycopg.connect(args.dsn, autocommit=True, connect_timeout=10) as conn:
+    conn = None
+    try:
         while True:
             try:
+                # Initial and mid-run PostgreSQL outages are the same degraded
+                # condition; never fake an intact 24/7 data stream.
+                if conn is None:
+                    conn = psycopg.connect(
+                        args.dsn, autocommit=True, connect_timeout=10
+                    )
                 result = sample(conn)
             except psycopg.Error as exc:
                 result = {
                     "observed_at": datetime.now(timezone.utc).isoformat(),
                     "quality": "sampling_degraded", "production_go": False,
+                    "real_orders_allowed": False,
                     "error_type": type(exc).__name__,
                 }
-                try:
-                    conn.close()
-                    conn = psycopg.connect(
-                        args.dsn, autocommit=True, connect_timeout=10
-                    )
-                except psycopg.Error:
-                    # The next bounded probe will retry without pretending
-                    # that market/DB processing remained healthy.
-                    pass
+                if conn is not None:
+                    try:
+                        conn.close()
+                    finally:
+                        conn = None
             print(json.dumps(result, sort_keys=True, default=str), flush=True)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             time.sleep(min(args.interval, remaining))
-
+    finally:
+        # Replacements have one owner, unlike rebinding a 'with' variable.
+        if conn is not None:
+            conn.close()
 
 if __name__ == "__main__":
     main()
