@@ -181,3 +181,18 @@ CREATE TABLE IF NOT EXISTS market_book_state (
  last_update_id bigint,valid boolean NOT NULL DEFAULT false,
  updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS footprint_daily (
+ symbol text NOT NULL,tf text NOT NULL,day date NOT NULL,
+ bucket timestamptz NOT NULL,price numeric NOT NULL,
+ buy_qty numeric NOT NULL,sell_qty numeric NOT NULL,
+ trades bigint NOT NULL,
+ PRIMARY KEY(symbol,tf,day,bucket,price)
+);
+CREATE INDEX IF NOT EXISTS footprint_daily_bucket ON footprint_daily(symbol,tf,bucket);
+CREATE TABLE IF NOT EXISTS aggregation_job (
+ symbol text NOT NULL,tf text NOT NULL,day date NOT NULL,
+ archive_sha256 text NOT NULL,completed_at timestamptz NOT NULL DEFAULT now(),
+ rows bigint NOT NULL DEFAULT 0,
+ PRIMARY KEY(symbol,tf,day)
+);
