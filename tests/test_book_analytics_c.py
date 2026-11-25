@@ -61,7 +61,7 @@ def _fake_replay_engine(monkeypatch, events):
     """Deterministic bounded DB model; real race acceptance is separate PG test."""
     from types import SimpleNamespace
     from eth_tester import book_analysis
-    state = {"row": None, "events": events, "gaps": [], "calls": []}
+    state = {"row": None, "events": events, "gaps": [], "calls": [], "leases": []}
     class Conn:
         def __enter__(self):
             return self
@@ -69,8 +69,14 @@ def _fake_replay_engine(monkeypatch, events):
             return False
         def execute(self, query, params=None):
             state["calls"].append(query)
+            if "SET LOCAL lock_timeout" in query:
+                assert "2000ms" in query
+                return _ReplayCursor()
             if "pg_advisory_xact_lock" in query:
-                assert params == ("eth_l2_replay:ETHUSDT",)
+                assert params in (
+                    ("eth_paper_admission_source:ETHUSDT",),
+                    ("eth_l2_replay:ETHUSDT",))
+                state["leases"].append(params[0])
                 return _ReplayCursor()
             if "FROM market_book_state" in query:
                 return _ReplayCursor(row=state["row"])
@@ -125,7 +131,18 @@ def test_round9_replay_is_bounded_restart_idempotent_and_serialized(monkeypatch)
     assert state["row"]["last_event_id"] == 2
     assert state["row"]["bids"]["100"] == "7"
     assert replay_orderbook(settings, batch=1, max_batches=1) == 0
-    assert sum("pg_advisory_xact_lock" in q for q in state["calls"]) == 3
+    assert sum("pg_advisory_xact_lock" in q for q in state["calls"]) == 6
+    # Before EVERY state read, the source fence precedes the L2 lease.
+    for i, query in enumerate(state["calls"]):
+        if "SET LOCAL lock_timeout" in query:
+            assert "pg_advisory_xact_lock" in state["calls"][i+1]
+            assert "pg_advisory_xact_lock" in state["calls"][i+2]
+            assert "FROM market_book_state" in state["calls"][i+3]
+    assert sum("SET LOCAL lock_timeout" in q for q in state["calls"]) == 3
+    assert state["leases"] == [
+        lease for _ in range(3) for lease in (
+            "eth_paper_admission_source:ETHUSDT",
+            "eth_l2_replay:ETHUSDT")]
     assert any("EXCLUDED.last_event_id >= market_book_state.last_event_id"
                in q for q in state["calls"])
     assert state["gaps"] == []

@@ -491,7 +491,7 @@ def test_round7_fast_c_actual_b_publisher_source_receipts_l2_and_oi(c_pg):
     # Trade only: actual C fast pipeline MUST stay pending without L2.
     before = publish_latest_bounded_live(c_pg)
     assert before["status"] == "pending", before
-    assert before["reason"] == "fresh_replayed_l2_receipt_missing"
+    assert before["reason"] == "l2_replay_backlog_or_invalid"
 
     with connection(c_pg) as conn:
         snapshot = conn.execute("""INSERT INTO book_events(
@@ -706,3 +706,98 @@ def test_round9_live_footprint_server_side_aggregates_many_small_ticks(c_pg):
     assert feature["volume"] == Decimal("0.00005000")
     assert feature["delta"] == 0
     assert feature["quality"] == "partial_unverified"
+
+
+
+def test_round11_paper_admission_fences_poison_l2_gap_state(c_pg):
+    """Real 2-connection PG admission gate vs C invalidating market book.
+
+    No paper trade is created. Simulates E holding the exact shared lease,
+    while C sees an invalid original raw delta. All effects are DB-atomic.
+    """
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+    from threading import Event
+    from eth_tester.book_analysis import replay_orderbook
+
+    with connection(c_pg) as conn:
+        base = conn.execute("""INSERT INTO book_events(
+            symbol,exchange_ts,recv_ts,update_id,sequence_no,event_type,
+            bids,asks,valid)
+            VALUES('ETHUSDT',clock_timestamp(),clock_timestamp(),10,10,
+                   'snapshot','[["100","4"]]'::jsonb,
+                   '[["101","5"]]'::jsonb,true)
+            RETURNING id""").fetchone()["id"]
+    assert replay_orderbook(c_pg,batch=1,max_batches=1) == 1
+    with connection(c_pg) as conn:
+        poison = conn.execute("""INSERT INTO book_events(
+            symbol,exchange_ts,recv_ts,update_id,sequence_no,event_type,
+            bids,asks,valid)
+            VALUES('ETHUSDT',clock_timestamp(),clock_timestamp(),11,11,
+                   'delta','[["100","-1"]]'::jsonb,
+                   '[]'::jsonb,true)
+            RETURNING id""").fetchone()["id"]
+    started = Event()
+    def reader():
+        started.set()
+        return replay_orderbook(c_pg,batch=1,max_batches=1)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with connection(c_pg) as admission:
+            admission.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                              ("eth_paper_admission_source:ETHUSDT",))
+            future = pool.submit(reader)
+            assert started.wait(timeout=2)
+            with pytest.raises(FutureTimeout):
+                future.result(timeout=0.15)
+            # Independent connection sees no uncommitted or unsafe state.
+            with connection(c_pg) as observer:
+                state = observer.execute("""SELECT last_event_id,valid
+                    FROM market_book_state WHERE symbol='ETHUSDT'""").fetchone()
+                gap = observer.execute("""SELECT count(*) AS n FROM data_gaps
+                    WHERE symbol='ETHUSDT' AND source='orderbook'""").fetchone()["n"]
+                assert state["last_event_id"] == base
+                assert state["valid"] is True
+                assert gap == 0
+        # Source lock was released by admission transaction COMMIT.
+        assert future.result(timeout=3) == 1
+    with connection(c_pg) as conn:
+        state = conn.execute("""SELECT last_event_id,valid,bids FROM
+            market_book_state WHERE symbol='ETHUSDT'""").fetchone()
+        gap = conn.execute("""SELECT count(*) AS n FROM data_gaps
+            WHERE symbol='ETHUSDT' AND source='orderbook'""").fetchone()["n"]
+    assert poison > base
+    assert state["last_event_id"] == poison
+    assert state["valid"] is False
+    assert state["bids"] == {}
+    assert gap == 1
+
+
+def test_round11_source_lock_timeout_preserves_cursor_and_gap(c_pg):
+    """2-second acquisition timeout fails closed and resumes exactly once."""
+    from eth_tester.book_analysis import replay_orderbook
+    with connection(c_pg) as conn:
+        first = conn.execute("""INSERT INTO book_events(
+            symbol,exchange_ts,recv_ts,update_id,sequence_no,event_type,
+            bids,asks,valid)
+            VALUES('ETHUSDT',clock_timestamp(),clock_timestamp(),10,10,
+                   'snapshot','[["100","4"]]'::jsonb,
+                   '[["101","5"]]'::jsonb,true)
+            RETURNING id""").fetchone()["id"]
+    with connection(c_pg) as admission:
+        admission.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                          ("eth_paper_admission_source:ETHUSDT",))
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            replay_orderbook(c_pg,batch=1,max_batches=1)
+    with connection(c_pg) as conn:
+        state = conn.execute("""SELECT last_event_id FROM market_book_state
+            WHERE symbol='ETHUSDT'""").fetchone()
+        gap = conn.execute("""SELECT count(*) AS n FROM data_gaps
+            WHERE symbol='ETHUSDT' AND source='orderbook'""").fetchone()["n"]
+        assert state is None
+        assert gap == 0
+    assert replay_orderbook(c_pg,batch=1,max_batches=1) == 1
+    assert replay_orderbook(c_pg,batch=1,max_batches=1) == 0
+    with connection(c_pg) as conn:
+        state = conn.execute("""SELECT last_event_id,valid FROM market_book_state
+            WHERE symbol='ETHUSDT'""").fetchone()
+        assert state["last_event_id"] == first
+        assert state["valid"] is True

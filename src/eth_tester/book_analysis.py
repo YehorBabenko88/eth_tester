@@ -83,6 +83,13 @@ def replay_orderbook(settings, batch=2000, *, max_batches=None):
     total, batches = 0, 0
     while True:
         with connection(settings) as conn:
+            # E/B admission and A WS writes share this exact source fence.
+            # Take source BEFORE replay to avoid source<->L2 lock inversion.
+            # A contention timeout rolls back the entire batch; no skipped
+            # cursor, forged source continuity or gap/state partial commit.
+            conn.execute("SET LOCAL lock_timeout = '2000ms'")
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                         (f"eth_paper_admission_source:{settings.symbol}",))
             # Must precede row FOR UPDATE: first boot has NO row to lock.
             conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                          (f"eth_l2_replay:{settings.symbol}",))
