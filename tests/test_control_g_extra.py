@@ -141,3 +141,30 @@ def test_windows_installer_scripts_parse_without_execution():
             text=True, capture_output=True, check=False, timeout=30,
         )
         assert completed.returncode == 0, completed.stderr
+
+def test_websocket_reports_stale_even_when_connection_once_was_connected(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from eth_tester import telegram_control as control
+    past = datetime.now(timezone.utc) - timedelta(minutes=3)
+    conn = FakeConn(rows=[
+        [{"topic": "connection", "status": "connected", "ts": past}],
+        {"ts": past},
+    ])
+    monkeypatch.setattr(control, "connection", lambda _: fake_connection(conn))
+    out = control._read(SimpleNamespace(symbol="ETHUSDT"), "ws")
+    assert "устарел" in out
+    assert "connected" in out
+
+
+def test_websocket_recent_trade_counts_as_active(monkeypatch):
+    from datetime import datetime, timezone
+    from eth_tester import telegram_control as control
+    now = datetime.now(timezone.utc)
+    conn = FakeConn(rows=[
+        [{"topic": "connection", "status": "connected", "ts": now}],
+        {"ts": now},
+    ])
+    monkeypatch.setattr(control, "connection", lambda _: fake_connection(conn))
+    assert "поток сделок активен" in control._read(
+        SimpleNamespace(symbol="ETHUSDT"), "ws"
+    )
