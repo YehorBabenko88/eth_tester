@@ -55,7 +55,7 @@ def test_schema_and_one_open_position_guard(pg_settings):
     first_id = open_paper(pg_settings, "long", D(100), D("99.5"), D(104),
                        {**qa_strategy_reason(), "qa": True})
     assert first_id > 0
-    with pytest.raises(RuntimeError, match="One trade only"):
+    with pytest.raises(RuntimeError, match="(?i)one trade|existing durable paper position"):
         open_paper(pg_settings, "short", D(100), D(102), D(96),
                    {**qa_strategy_reason(), "qa": True})
     with pytest.raises(psycopg.errors.UniqueViolation):
@@ -240,6 +240,6 @@ def test_no_signal_persists_full_versioned_engine_identity(pg_settings, monkeypa
     expected_hash = parameters.identity()["parameter_sha256"]
     engine_identity = f"{parameters.version}:{expected_hash[:12]}"
     assert saved["version"] == engine_identity
-    assert saved["reason"]["strategy_version"] == engine_identity
-    assert saved["reason"]["rules_version"] == parameters.version
-    assert saved["reason"]["parameter_sha256"] == expected_hash
+    assert saved["reason"]["engine_identity"] == engine_identity
+    assert saved["reason"]["engine_parameters"] == parameters.identity()["parameters"]
+    assert saved["reason"]["engine_parameter_sha256"] == expected_hash
