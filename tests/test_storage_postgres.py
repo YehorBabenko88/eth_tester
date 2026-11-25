@@ -57,7 +57,8 @@ def test_migrations_and_reinitialization_preserve_rows(postgres_lab):
         assert [r["version"] for r in versions] == [
             "0001_partitioned_archive.sql", "0002_quality_and_provenance.sql",
             "0003_retention_indexes.sql", "0004_trade_identity_guard.sql",
-            "0005_paper_settlement_ledger.sql", "0006_paper_ml_labels.sql"
+            "0005_paper_settlement_ledger.sql", "0006_paper_ml_labels.sql",
+            "0007_bounded_live_and_archive_bins.sql"
         ]
         conn.execute(
             """INSERT INTO funding(symbol,ts,rate) VALUES(%s,%s,%s)
@@ -93,7 +94,7 @@ def test_concurrent_database_init_is_idempotent(postgres_lab):
     with connection(postgres_lab) as conn:
         assert conn.execute(
             "SELECT count(*) AS n FROM eth_schema_migrations"
-        ).fetchone()["n"] == 6
+        ).fetchone()["n"] == 7
 
 
 def test_copy_replay_and_conflict_rejection(postgres_lab):
@@ -363,7 +364,7 @@ def test_round2_read_only_schema_startup(postgres_lab):
 
     report = verify_existing_schema(postgres_lab)
     assert report["verified"] is True
-    assert report["schema_version"] == "0006_paper_ml_labels.sql"
+    assert report["schema_version"] == "0007_bounded_live_and_archive_bins.sql"
 
 
 def _synthetic_verified_round4_snapshot(conn, *, tf="5"):
@@ -391,6 +392,8 @@ def _synthetic_verified_round4_snapshot(conn, *, tf="5"):
                RETURNING checked_at""",
             (name_source, tf, bar, bar + timedelta(minutes=1), checksum,
              json.dumps({"source_receipt_ms": receipt_ms,
+                         "receipt_is_independently_recorded": True,
+                         "evidence_ref": nonce + ":" + name,
                          "scope": "isolated_real_pg_synthetic_fixture"})),
         ).fetchone()
         sources[name] = {
@@ -518,7 +521,8 @@ def test_round4_post_horizon_label_ledger_rejects_hindsight(postgres_lab):
     bar = datetime(2026, 1, 1, 8, tzinfo=timezone.utc)
     decision = bar + timedelta(minutes=1)
     closed = bar + timedelta(minutes=2)
-    horizon = bar + timedelta(minutes=3)
+    horizon = bar + timedelta(minutes=5)
+    first_full_start = decision + timedelta(minutes=1)
     key = f"round4-label-{uuid4().hex}"
     snapshot_sha = "a" * 64
     horizon_sha = "c" * 64
@@ -546,8 +550,26 @@ def test_round4_post_horizon_label_ledger_rejects_hindsight(postgres_lab):
                RETURNING id""",
             (decision, decision, closed,
              json.dumps({"ml_snapshot_key": key,
-                         "ml_source_checksum": snapshot_sha})),
+                         "ml_source_checksum": snapshot_sha,
+                         "side": "resistance", "level": "100",
+                         "ml_label_policy": {
+                             "version": "utc_full_bars_v1",
+                             "method": "fixed_horizon_barrier_v1",
+                             "bar_interval_ms": 60000,
+                             "horizon_bars": 3, "barrier_bps": 20,
+                             "anchor": "first_full_bar_strictly_after_decision",
+                         }})),
         ).fetchone()["id"]
+        for minute in (2, 3, 4):
+            conn.execute(
+                """INSERT INTO candles(
+                   symbol,kind,tf,ts,open,high,low,close,volume,
+                   turnover,closed,source)
+                   VALUES('ETHUSDT','trade','1',%s,100,100,99.5,99.7,
+                          1,100,true,'bybit_v5')
+                   ON CONFLICT(symbol,kind,tf,ts) DO NOTHING""",
+                (bar+timedelta(minutes=minute),),
+            )
         receipt = datetime.now(timezone.utc) - timedelta(seconds=2)
         coverage = conn.execute(
             """INSERT INTO ingestion_coverage(
@@ -563,13 +585,21 @@ def test_round4_post_horizon_label_ledger_rejects_hindsight(postgres_lab):
             paper_trade_id=trade_id, snapshot_key=key,
             source_checksum=snapshot_sha, outcome="bounce",
             horizon_end_at=horizon, label_source="kline:trade",
-            label_interval="1", covered_from_at=bar,
+            label_interval="1", covered_from_at=decision,
             coverage_sha256=horizon_sha,
             source_receipt_at=receipt.replace(
                 microsecond=receipt.microsecond // 1000 * 1000
             ),
             coverage_checked_at=coverage["checked_at"],
-            source_evidence={"barrier_evidence_sha256": "d" * 64},
+            source_evidence={
+                "barrier_evidence_sha256": "d" * 64,
+                "first_full_bar_start_ms": int(first_full_start.timestamp()*1000),
+                "decision_ms": int(decision.timestamp()*1000),
+                "expected_bars": 3, "verified_bars": 3,
+                "complete_closed_bar_grid": True,
+                "receipt_is_independently_recorded": True,
+                "covered_from_decision": True,
+            },
         )
         assert record_paper_ml_label(conn, **label_args) == trade_id
         assert record_paper_ml_label(conn, **label_args) == trade_id

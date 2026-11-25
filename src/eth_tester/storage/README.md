@@ -85,3 +85,82 @@ lifecycle remains gated by the original ownership/backup/OID protocol.
 All PostgreSQL tests use randomized disposable test databases. Synthetic
 source certificates in those tests demonstrate SQL contract compatibility,
 NOT exchange-complete market evidence or production GO.
+
+
+## Round 6 — two separate evidence systems, never interchangeable
+
+**Historical/ML** remains strictly the existing immutable
+`eth_feature_snapshot_v2` with nine independently witnessed proofs, real
+publication clocks, exact original source digest, and certified_by
+`independent_source_proof`. Historical archive gzip SHA + 1440 matching
+minute base/quote totals are not an identity-complete exchange tape.
+No code may promote `ingestion_coverage.status='partial'` to verified
+merely because trade and candle volumes match. A's actual bounded live
+observations are NOT eligible for F training, post-horizon ML labels or a
+historical replay decision.
+
+**Archive source membership** — new additive migration
+`0007_bounded_live_and_archive_bins.sql` and B API
+`storage.archive_receipts.persist_archive_stage_bins(
+ conn,symbol,day,sha,expected_rows,stage_name='eth_stage')`.
+Call inside A's existing transaction, after
+`storage.bulk.merge_staged_trades`, while its validated
+`pg_temp.eth_stage` still exists and before the ingestion-job cursor
+is committed. The writer pins original gzip SHA and groups by
+UTC minute / exact price / side. An archive trade initially received
+over WS remains in the archive bins; a WS-only print absent from the
+gzip is excluded. Replays of the SAME SHA compare ALL price bins
+symmetrically and refuse conflicts; never silently overwrite provenance.
+The C rollup MUST select only `archive_source_price_bins` joined on
+actual `ingestion_job.sha256`, never global `trades` as if it were a
+downloaded gzip. If B bins are absent, reject SHA-bound aggregation.
+
+**Versioned revalidation:** `storage.archive_receipts.revalidate_archive_bins(
+conn,symbol,day,sha)` reads original immutable bins and independently
+closed official 1m candles, stores a new content-addressed
+`archive_validation_receipts` result when the candle grid improves.
+The original `archive_stage_receipts.captured_at` and first receipt
+never change. The best possible status is `volume_only_reconciled`;
+even perfect 1440-minute parity is NOT all-exchange trade-ID certification.
+`archive_validation_receipts.exchange_complete` is always false.
+
+**Bounded live paper evidence** is deliberately DIFFERENT:
+`paper_live_evidence`, contract `eth_paper_live_evidence_v1`,
+quality `live_observed_bounded`, `paper_only=true`,
+`ml_eligible=false`, `exchange_complete=false`,
+`is_ml_certified=false`. This matches D/E/H's already published
+one-batch interface. A writes actual first WS receipts and book
+snapshot/replay chronology through `storage.live_evidence.record_trade_receipts`
+and `record_book_lineage`; A records independently received near-live
+REST OI through `record_oi_observation` in the SAME transaction as
+raw source rows. B source receipts and paper evidence are append-only.
+C's source-triggered fast 1m path may call
+`publish_bounded_paper_evidence(conn,symbol,bar_ts,trade_session,
+book_receipt_id,oi_receipt_id)` only after original bybit_v5 CLOSED
+1m candle, no overlapping unresolved WS/L2 interruptions, matching
+observed ETH base + USDT quote, one actual WS session, fresh L2 replay
+and observed 5m OI, all inside the original 90-second window.
+The PostgreSQL trigger cross-checks underlying tables and sets
+`observed_at=computed_at=clock_timestamp()` on INSERT. E/D require
+actual independent paper decision time >= computed_at and <= expires_at.
+A late source receipt cannot resurrect a historical signal or paper order.
+`require_bounded_paper_evidence(conn,*,symbol,bar_ts,evidence_key,decision_at)`
+reads and checks exact immutable key/source checksum/quality/clock without
+converting live evidence to `eth_feature_snapshot_v2`. No exchange-wide
+trade completeness assertion is made. F must skip all bounded-live paper rows.
+
+**Post-horizon ML labels** — migration 0007 adds an independent INSERT
+guard to existing 0006 append-only `paper_ml_labels`. Only E's
+ORIGINAL precommitted historical-v2 label policy qualifies. F's
+`full_future_grid` leaves original decision clock unrounded and
+considers ONLY the next three entirely postdecision natural UTC minute
+candles; the B guard rechecks grid and structural outcome against actual
+persisted bybit_v5 closed OHLC. Both historical source receipt and
+source coverage must be real, never inferred from paper PnL or caller flags.
+All legacy labels stay untouched; old migrations remain checksum-pinned.
+
+All included PostgreSQL tests use newly generated disposable
+`eth_tester_...` databases and isolated synthetic fixtures to prove
+SQL safety and contract compatibility ONLY. They cannot replace
+actual Bybit observed source evidence, PG17/18 matrix PASS, native Windows
+acceptance, or MASTER production GO. No trading API is used.

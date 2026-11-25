@@ -1,0 +1,354 @@
+"""Round-6 Storage B real PostgreSQL 17/18 contract tests.
+
+Uses ONLY an explicitly supplied administrative DSN for a disposable,
+uniquely named eth_tester_... database. No orders, no external API requests,
+no shared user database and no synthetic exchange-completeness assertion.
+"""
+from datetime import datetime, timedelta, timezone, date
+from decimal import Decimal
+import json
+import os
+from types import SimpleNamespace
+from uuid import uuid4
+
+import psycopg
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
+import pytest
+
+from eth_tester.database import connection, init_database
+from eth_tester.storage.bulk import merge_staged_trades
+from eth_tester.storage.archive_receipts import (
+    persist_archive_stage_bins, revalidate_archive_bins,
+)
+from eth_tester.storage.live_evidence import (
+    record_trade_receipts, record_book_lineage,
+    record_oi_observation, publish_bounded_paper_evidence,
+    require_bounded_paper_evidence,
+)
+
+
+pytestmark = pytest.mark.postgres
+UTC = timezone.utc
+
+
+@pytest.fixture(scope="module")
+def source_lab():
+    administrative = os.getenv("ETH_TEST_PG_DSN")
+    if not administrative:
+        pytest.skip("ETH_TEST_PG_DSN required for disposable real PostgreSQL")
+    db_name = "eth_tester_storage_r6_" + uuid4().hex[:12]
+    dsn = make_conninfo(administrative, dbname=db_name)
+    settings = SimpleNamespace(
+        database_url=dsn, initial_equity_usd=Decimal("10000"),
+        symbol="ETHUSDT", category="linear",
+    )
+    try:
+        init_database(settings)
+        yield settings
+    finally:
+        # Never touch a preexisting database; only this generated unique name.
+        with psycopg.connect(make_conninfo(administrative, dbname="postgres"),
+                             autocommit=True) as admin:
+            exists = admin.execute(
+                "SELECT 1 FROM pg_database WHERE datname=%s", (db_name,)
+            ).fetchone()
+            if exists:
+                admin.execute(sql.SQL("DROP DATABASE {}").format(
+                    sql.Identifier(db_name)
+                ))
+
+
+def _trade(ident, ts, *, source="archive", price="3000", qty="0.1"):
+    p, q = Decimal(price), Decimal(qty)
+    return ("ETHUSDT", ts, ident, p, q, "Buy", p*q, source,
+            json.dumps({"i": ident, "event_ts": ts.isoformat()}))
+
+
+def test_round6_migration_owner_marker_and_quality_separation(source_lab):
+    with connection(source_lab) as conn:
+        versions = conn.execute(
+            "SELECT version FROM eth_schema_migrations ORDER BY version"
+        ).fetchall()
+        assert versions[-1]["version"] == "0007_bounded_live_and_archive_bins.sql"
+        tables = (
+            "archive_stage_receipts", "archive_source_price_bins",
+            "archive_validation_receipts", "live_trade_receipts",
+            "live_book_receipts", "live_oi_receipts", "paper_live_evidence",
+        )
+        for name in tables:
+            assert conn.execute(
+                "SELECT to_regclass(%s) AS reg", ("public." + name,)
+            ).fetchone()["reg"] is not None
+        cols = {
+            row["column_name"] for row in conn.execute(
+                """SELECT column_name FROM information_schema.columns
+                   WHERE table_schema='public'
+                     AND table_name='paper_live_evidence'"""
+            ).fetchall()
+        }
+        assert {"snapshot_key", "source_checksum", "observed_at",
+                "computed_at", "expires_at", "quality", "paper_only",
+                "ml_eligible", "exchange_complete", "evidence"} <= cols
+        assert conn.execute(
+            "SELECT owner_tag FROM eth_storage_identity WHERE singleton=true"
+        ).fetchone()["owner_tag"] == "eth_tester"
+
+
+def test_round6_sha_stage_bins_exclude_ws_only_and_replay_fail_closed(source_lab):
+    archive_day = date(2026, 11, 20)
+    midnight = datetime.combine(archive_day, datetime.min.time(), UTC)
+    a = _trade("R6-A", midnight+timedelta(minutes=1), source="websocket")
+    b = _trade("R6-B", midnight+timedelta(minutes=2))
+    outside = _trade("R6-WS-ONLY", midnight+timedelta(minutes=3),
+                     source="websocket", qty="2")
+    digest = "a"*64
+    with connection(source_lab) as conn:
+        for item in (a, outside):
+            conn.execute(
+                """INSERT INTO trades(
+                    symbol,ts,trade_id,price,qty,side,notional,source,raw)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+                item,
+            )
+        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        with conn.cursor() as cursor:
+            with cursor.copy(
+                "COPY eth_stage (symbol,ts,trade_id,price,qty,side,"
+                "notional,source,raw) FROM STDIN"
+            ) as copier:
+                for item in (a, b):
+                    current = list(item)
+                    current[7] = "archive"
+                    copier.write_row(current)
+        merged = merge_staged_trades(conn, "eth_stage")
+        assert merged["input_rows"] == 2
+        assert merged["inserted_rows"] == 1
+        capture = persist_archive_stage_bins(
+            conn, "ETHUSDT", archive_day, digest, 2,
+        )
+        assert capture["original_rows"] == 2
+        assert capture["distinct_trade_ids"] == 2
+        assert capture["exchange_complete"] is False
+        rows = conn.execute(
+            """SELECT minute_ts,price,side,trade_count,base_qty
+               FROM archive_source_price_bins
+               WHERE symbol='ETHUSDT' AND archive_sha256=%s
+               ORDER BY minute_ts""", (digest,),
+        ).fetchall()
+        assert len(rows) == 2
+        assert [r["minute_ts"].minute for r in rows] == [1, 2]
+        assert conn.execute(
+            """SELECT source FROM trades
+               WHERE symbol='ETHUSDT' AND trade_id='R6-A'"""
+        ).fetchone()["source"] == "websocket"
+        assert persist_archive_stage_bins(
+            conn, "ETHUSDT", archive_day, digest, 2,
+        )["price_bins"] == 2
+        with pytest.raises(ValueError, match="conflict"):
+            with conn.transaction():
+                conn.execute(
+                    "UPDATE eth_stage SET qty=qty+0.1 WHERE trade_id='R6-B'"
+                )
+                persist_archive_stage_bins(
+                    conn, "ETHUSDT", archive_day, digest, 2,
+                )
+        assert conn.execute(
+            """SELECT count(*) AS n FROM archive_source_price_bins
+               WHERE symbol='ETHUSDT' AND archive_sha256=%s""",
+            (digest,),
+        ).fetchone()["n"] == 2
+
+
+def test_round6_versioned_archive_volume_revalidation_is_never_full_identity(source_lab):
+    archive_day = date(2026, 11, 21)
+    midnight = datetime.combine(archive_day, datetime.min.time(), UTC)
+    digest = "c"*64
+    with connection(source_lab) as conn:
+        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        with conn.cursor() as cursor:
+            with cursor.copy(
+                "COPY eth_stage (symbol,ts,trade_id,price,qty,side,"
+                "notional,source,raw) FROM STDIN"
+            ) as copier:
+                copier.write_row(_trade("R6-REVALIDATE-A",
+                                        midnight+timedelta(minutes=1)))
+                copier.write_row(_trade("R6-REVALIDATE-B",
+                                        midnight+timedelta(minutes=2)))
+        merge_staged_trades(conn, "eth_stage")
+        persist_archive_stage_bins(conn, "ETHUSDT", archive_day, digest, 2)
+        first = revalidate_archive_bins(conn, "ETHUSDT", archive_day, digest)
+        assert first["status"] == "incomplete"
+        assert first["exchange_complete"] is False
+        with conn.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO candles(
+                   symbol,kind,tf,ts,open,high,low,close,volume,turnover,
+                   closed,source)
+                   VALUES('ETHUSDT','trade','1',%s,3000,3000,3000,
+                          3000,%s,%s,true,'bybit_v5')""",
+                [(midnight+timedelta(minutes=i),
+                  Decimal("0.1") if i in (1, 2) else Decimal("0"),
+                  Decimal("300") if i in (1, 2) else Decimal("0"))
+                 for i in range(1440)],
+            )
+        second = revalidate_archive_bins(conn, "ETHUSDT", archive_day, digest)
+        assert second["status"] == "volume_only_reconciled"
+        assert second["minutes_checked"] == 1440
+        assert second["minutes_matched"] == 1440
+        assert second["exchange_complete"] is False
+        assert first["validation_key"] != second["validation_key"]
+        assert revalidate_archive_bins(
+            conn, "ETHUSDT", archive_day, digest
+        )["validation_key"] == second["validation_key"]
+        assert conn.execute(
+            """SELECT count(*) AS n FROM archive_validation_receipts
+               WHERE symbol='ETHUSDT' AND archive_sha256=%s""",
+            (digest,),
+        ).fetchone()["n"] == 2
+        with pytest.raises(psycopg.Error, match="append-only"):
+            with conn.transaction():
+                conn.execute(
+                    """UPDATE archive_stage_receipts SET original_rows=999
+                       WHERE symbol='ETHUSDT' AND archive_sha256=%s""",
+                    (digest,),
+                )
+
+
+def test_round6_actual_db_live_receipts_and_no_retrospective_paper(source_lab):
+    now = datetime.now(UTC)
+    stamp = now-timedelta(seconds=1)
+    ident = "R6-LIVE-" + uuid4().hex[:12]
+    source_sha = "b"*64
+    with connection(source_lab) as conn:
+        conn.execute(
+            """INSERT INTO trades(
+                 symbol,ts,trade_id,price,qty,side,notional,source,raw)
+               VALUES('ETHUSDT',%s,%s,3000,0.01,'Buy',30,
+                      'websocket',%s::jsonb)""",
+            (stamp, ident, json.dumps({"i": ident})),
+        )
+        witnessed = record_trade_receipts(
+            conn, "ETHUSDT", "session-round6", [ident]
+        )
+        assert witnessed["recorded_ids"] == 1
+        receipt = conn.execute(
+            """SELECT received_at,source_event_at,exchange_complete
+               FROM live_trade_receipts
+               WHERE symbol='ETHUSDT' AND trade_id=%s""",
+            (ident,),
+        ).fetchone()
+        assert receipt["source_event_at"] == stamp
+        assert receipt["received_at"] >= stamp
+        assert receipt["exchange_complete"] is False
+
+        snapshot = conn.execute(
+            """INSERT INTO book_events(
+                 symbol,exchange_ts,recv_ts,update_id,sequence_no,
+                 event_type,bids,asks,valid)
+               VALUES('ETHUSDT',clock_timestamp(),clock_timestamp(),
+                 100,100,'snapshot','[["2999","1"]]'::jsonb,
+                 '[["3001","1"]]'::jsonb,true) RETURNING id""",
+        ).fetchone()["id"]
+        delta = conn.execute(
+            """INSERT INTO book_events(
+                 symbol,exchange_ts,recv_ts,update_id,sequence_no,
+                 event_type,bids,asks,valid)
+               VALUES('ETHUSDT',clock_timestamp(),clock_timestamp(),
+                 101,101,'delta','[]'::jsonb,'[]'::jsonb,true)
+               RETURNING id,recv_ts""",
+        ).fetchone()
+        conn.execute(
+            """INSERT INTO market_book_state(
+                 symbol,last_event_id,bids,asks,last_update_id,valid,updated_at)
+               VALUES('ETHUSDT',%s,'{"2999":"1"}'::jsonb,
+                      '{"3001":"1"}'::jsonb,101,true,%s)
+               ON CONFLICT(symbol) DO UPDATE SET
+                 last_event_id=EXCLUDED.last_event_id,
+                 bids=EXCLUDED.bids,asks=EXCLUDED.asks,
+                 last_update_id=EXCLUDED.last_update_id,
+                 valid=EXCLUDED.valid,updated_at=EXCLUDED.updated_at""",
+            (delta["id"], delta["recv_ts"]),
+        )
+        book_id = record_book_lineage(
+            conn, "ETHUSDT", "session-round6", snapshot, delta["id"]
+        )
+        assert book_id > 0
+        oi_ts = datetime.now(UTC)-timedelta(minutes=1)
+        conn.execute(
+            """INSERT INTO open_interest(symbol,interval,ts,value)
+               VALUES('ETHUSDT','5min',%s,1000)""", (oi_ts,),
+        )
+        oi_id = record_oi_observation(
+            conn, "ETHUSDT", "5min", oi_ts, source_sha
+        )
+        assert oi_id > 0
+        conn.execute(
+            """INSERT INTO feed_health(symbol,topic,status)
+               VALUES('ETHUSDT','connection','connected')""",
+        )
+        old_bar = now.replace(second=0, microsecond=0) - timedelta(minutes=10)
+        with pytest.raises(ValueError, match="prospective"):
+            publish_bounded_paper_evidence(
+                conn, "ETHUSDT", old_bar, "session-round6", book_id, oi_id,
+            )
+        with pytest.raises(ValueError, match="prospective"):
+            publish_bounded_paper_evidence(
+                conn, "ETHUSDT",
+                datetime.now(UTC).replace(second=0, microsecond=0)
+                    + timedelta(minutes=1),
+                "session-round6", book_id, oi_id,
+            )
+        assert conn.execute(
+            "SELECT count(*) AS n FROM paper_live_evidence"
+        ).fetchone()["n"] == 0
+        with pytest.raises(ValueError, match="current prospective"):
+            require_bounded_paper_evidence(
+                conn, symbol="ETHUSDT", bar_ts=old_bar,
+                evidence_key="a"*64, decision_at=datetime.now(UTC),
+            )
+        with pytest.raises(psycopg.Error, match="append-only"):
+            with conn.transaction():
+                conn.execute(
+                    """DELETE FROM live_trade_receipts
+                       WHERE symbol='ETHUSDT' AND trade_id=%s""",
+                    (ident,),
+                )
+
+
+def test_round6_direct_caller_flags_cannot_forge_paper_live_evidence(source_lab):
+    """Even direct SQL cannot force an old bar into a new paper decision."""
+    old = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(hours=1)
+    with connection(source_lab) as conn:
+        oi_id = conn.execute(
+            "SELECT id FROM live_oi_receipts ORDER BY id DESC LIMIT 1"
+        ).fetchone()["id"]
+        book_id = conn.execute(
+            "SELECT id FROM live_book_receipts ORDER BY id DESC LIMIT 1"
+        ).fetchone()["id"]
+        proof = {
+            "contract": "eth_paper_live_evidence_v1",
+            "quality": "live_observed_bounded",
+            "paper_only": True, "ml_eligible": False,
+            "exchange_complete": False, "trade_session": "session-round6",
+            "book_receipt_id": book_id, "oi_receipt_id": oi_id,
+        }
+        with pytest.raises(psycopg.Error, match="prospective|closed|source"):
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO paper_live_evidence(
+                       snapshot_key,source_checksum,symbol,bar_ts,bar_close_at,
+                       trade_session,trade_count,trade_first_receipt_at,
+                       trade_last_receipt_at,book_receipt_id,oi_receipt_id,
+                       base_volume,quote_turnover,evidence,expires_at,
+                       observed_at,computed_at)
+                       VALUES(%s,%s,'ETHUSDT',%s,%s,'session-round6',
+                              1,%s,%s,%s,%s,0.01,30,%s::jsonb,%s,%s,%s)""",
+                    ("a"*64, "b"*64, old, old+timedelta(minutes=1),
+                     old, old, book_id, oi_id, json.dumps(proof),
+                     old+timedelta(seconds=150),
+                     old+timedelta(minutes=1), old+timedelta(minutes=1)),
+                )
+        assert conn.execute(
+            "SELECT count(*) AS n FROM paper_live_evidence"
+        ).fetchone()["n"] == 0

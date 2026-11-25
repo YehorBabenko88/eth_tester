@@ -18,7 +18,8 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 def _millis(value):
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ValueError("Timezone-aware timestamp required")
-    return int((value.astimezone(timezone.utc) - _EPOCH).total_seconds() * 1000)
+    delta = value.astimezone(timezone.utc) - _EPOCH
+    return delta.days * 86400000 + delta.seconds * 1000 + delta.microseconds // 1000
 
 
 def _ceil_millis(value):
@@ -60,7 +61,8 @@ def _proof(conn, *, name, symbol, instrument, claimed, available_ms):
             not isinstance(interval, str) or
             not isinstance(digest, str) or not _HEX64.fullmatch(digest)):
         raise ValueError("Invalid source identifier/checksum: " + name)
-    if (not isinstance(claimed["evidence_ref"], str)
+    if (claimed.get("instrument") != instrument or
+            not isinstance(claimed["evidence_ref"], str)
             or not claimed["evidence_ref"]):
         raise ValueError("Missing immutable evidence reference: " + name)
     times = [claimed[k] for k in ("source_event_ms", "source_receipt_ms",
@@ -94,15 +96,23 @@ def _proof(conn, *, name, symbol, instrument, claimed, available_ms):
         evidence = json.loads(evidence)
     if (not isinstance(evidence, dict)
             or type(evidence.get("source_receipt_ms")) is not int
-            or evidence["source_receipt_ms"] != receipt_ms):
+            or evidence["source_receipt_ms"] != receipt_ms
+            or evidence.get("evidence_ref") != claimed["evidence_ref"]
+            or evidence.get("receipt_is_independently_recorded") is not True):
         raise ValueError("Source receipt not independently persisted: " + name)
-    if row["quality"] in ("unknown", "partial", "partial_unverified", "archive_import_failed"):
+    if (row["quality"] in ("unknown", "partial", "partial_unverified",
+                          "archive_import_failed", "bounded_live_observed")
+            or evidence.get("paper_only") is True
+            or evidence.get("ml_eligible") is False
+            or evidence.get("completeness_scope") in (
+                "observed_bounded", "bounded_local_observations_only")):
         raise ValueError("Unqualified source proof: " + name)
     # An archive-only volume match is necessary, but cannot certify print
     # completeness. This never upgrades an A-owned partial coverage row.
     if source == "trades_archive" and not all(
         evidence.get(key) is True for key in (
-            "gzip_crc_checked", "trade_identity_checked", "volume_verified")
+            "gzip_crc_checked", "trade_identity_checked", "volume_verified",
+            "proves_all_trade_ids")
     ):
         raise ValueError("Incomplete archive integrity proof: " + name)
     canonical = {
