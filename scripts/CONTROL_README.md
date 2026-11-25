@@ -100,3 +100,45 @@ owned-child shutdown, graceful uninstall, and non-owned resource preservation.
 Tests/integration/test_control_pg.py exercises a disposable local PostgreSQL
 database and read-only role with migration-checksum corruption; no real trades
 or exchange connections occur. Telegram /delete remains disabled.
+
+
+## Round 6: bounded paper-only research scheduling (Control G)
+
+`python -m eth_tester.cli learn` is now **an alias for causal shadow-only
+research**, never the disabled legacy PnL trainer. The explicit commands are
+`python -m eth_tester.cli train-causal-shadow` and
+`python -m eth_tester.cli label-horizons`.
+
+The supervisor schedules an independent **F-owned, post-horizon label**
+attempt every **300 seconds** and an F-owned **causal shadow training**
+attempt every **3600 seconds**. These are bounded *one-shot subprocesses*,
+not loops that relabel entry records. The G dispatcher delegates only to
+`eth_tester.ml.label_worker.run_label_horizons(settings, limit=100)`
+and `eth_tester.learning.run_causal_shadow_cycle(settings,
+min_new=100, min_rows=180, embargo_ms=60000)`.
+
+If the F source-proof worker has not yet been published, the job records
+`blocked_missing_verified_label_worker` or
+`blocked_missing_causal_shadow_cycle` in PostgreSQL `bot_heartbeat`
+and exits normally, so the supervisor does not rapidly restart a known
+missing dependency. Unexpected worker failures are recorded with an
+exception **type only**, then propagated to the bounded supervisor retry.
+Research reports are reduced to status and integer counts, never credentials
+or untrusted source text. F owns persistent monotone trained-label cursors
+and the real, independently checked label ledger; G does not create
+certificates, labels or model approvals.
+
+Use `python scripts/control_readiness_probe.py` to collect read-only
+observations from the configured dedicated PostgreSQL database. The tool
+uses read-only transactions and *always* returns
+`production_go=false`. Healthy feed or process heartbeats are not
+cryptographic market-quality proof, and the newly approved
+`bounded_live_observed` paper-only tier is **not** historical
+`eth_feature_snapshot_v2` certification and must never make samples
+ML-eligible.
+
+Acceptance still needs real bounded public-market observations, source
+receipt/candle/WS-gap/L2/OI lineage, separate historical and paper
+quality, reproducible PostgreSQL integration on PG17/18, native disposable
+Windows lifecycle, plus F/B's independently checked post-horizon worker.
+No live trading, no retrospective paper opens, no production GO.

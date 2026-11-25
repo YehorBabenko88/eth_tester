@@ -9,7 +9,8 @@ def main():
     parser.add_argument("--trade-id",type=int)
     commands=parser.add_subparsers(dest="command",required=True)
     for cmd in ("init","backfill","archives","live","levels","footprint",
-                "telegram","status","chart","backtest","engine","learn","cleanup","analyse","run","book-replay","aggregate"):
+                "telegram","status","chart","backtest","engine","learn","train-causal-shadow","label-horizons",
+                "cleanup","analyse","run","book-replay","aggregate"):
         commands.add_parser(cmd)
     args=parser.parse_args()
     settings=Settings()
@@ -54,9 +55,11 @@ def main():
     elif args.command=="analyse":
         from .workers import analytics_worker
         asyncio.run(analytics_worker(settings))
-    elif args.command=="learn":
-        from .learning import train_shadow
-        print("Shadow learning:",train_shadow(settings))
+    elif args.command in ("learn", "train-causal-shadow", "label-horizons"):
+        # 'learn' is a backward-compatible alias for verified shadow ONLY.
+        from .control_jobs import run_control_job
+        job = "train-causal-shadow" if args.command == "learn" else args.command
+        print("Paper research:", run_control_job(settings, job))
     elif args.command=="cleanup":
         from .retention import cleanup_diagnostics
         print(cleanup_diagnostics(settings))

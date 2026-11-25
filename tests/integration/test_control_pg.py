@@ -93,3 +93,38 @@ def test_checksum_tamper_blocks_supervisor_before_network_workers(control_pg, mo
         asyncio.run(supervisor.Supervisor(path=tmp_path).run(service))
     assert started == []
     assert not (tmp_path / "supervisor.json").exists()
+
+@pytest.mark.parametrize("command", ("label-horizons", "train-causal-shadow"))
+def test_control_jobs_report_blocked_status_without_creating_labels_or_orders(
+        control_pg, monkeypatch, command):
+    """Real disposable PostgreSQL heartbeat; no exchange or label writer."""
+    from eth_tester import control_jobs
+    _service, admin_settings = control_pg
+    if command == "label-horizons":
+        monkeypatch.setattr(control_jobs, "_label_horizons", lambda _: {
+            "status": "blocked_unverified_horizon", "processed": 0})
+    else:
+        monkeypatch.setattr(control_jobs, "_causal_shadow", lambda _: {
+            "status": "insufficient_new_verified_data", "usable": 0,
+            "required": 180, "approved": False})
+    with psycopg.connect(admin_settings.database_url) as conn:
+        before = conn.execute(
+            "SELECT enabled,paused FROM bot_control WHERE singleton=true"
+        ).fetchone()
+    result = control_jobs.run_control_job(admin_settings, command)
+    assert result["ml_certified_by_control"] is False
+    with psycopg.connect(admin_settings.database_url) as conn:
+        heartbeat = conn.execute(
+            "SELECT status,detail FROM bot_heartbeat WHERE component=%s",
+            ("control_" + command.replace("-", "_"),)
+        ).fetchone()
+        assert heartbeat is not None
+        assert heartbeat[0] == result["status"]
+        assert heartbeat[1]["paper_only"] is True
+        assert heartbeat[1]["ml_certified_by_control"] is False
+        assert conn.execute("SELECT count(*) FROM paper_ml_labels").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM paper_trades").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM model_versions").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT enabled,paused FROM bot_control WHERE singleton=true"
+        ).fetchone() == before

@@ -18,7 +18,8 @@ from .database import verify_existing_schema
 
 LOGGER = logging.getLogger(__name__)
 PERMANENT = ("live", "analyse", "engine")
-PERIODIC = {"backfill": 86400, "archives": 86400, "aggregate": 21600}
+PERIODIC = {"backfill": 86400, "archives": 86400, "aggregate": 21600,
+            "label-horizons": 300, "train-causal-shadow": 3600}
 
 
 def _is_windows():
