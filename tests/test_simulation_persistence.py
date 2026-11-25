@@ -77,3 +77,18 @@ def test_funding_and_fill_future_observation_rejected():
                     side='Buy', action='entry', qty=1, price=100,
                     fee=0, slippage_cost=0)
     assert observation_time(BASE) >= BASE
+
+
+def test_legacy_close_transition_never_adopts_an_active_entry():
+    state = {'paper_trade_id': None, 'version': 7, 'processed_cursor': BASE}
+    later = BASE + timedelta(seconds=1)
+    assert validate_transition(state, trade_id=91, at=later,
+                               action='close_legacy') == later
+    db = FakeDB(None)
+    assert advance_state(db, state, trade_id=91, at=later,
+                         action='close_legacy') == 8
+    assert db.queries[-1][1] == (None, later, 7)
+    state['paper_trade_id'] = 91
+    with pytest.raises(RuntimeError, match='legacy'):
+        validate_transition(state, trade_id=91, at=later,
+                            action='close_legacy')

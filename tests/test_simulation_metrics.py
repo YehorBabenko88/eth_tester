@@ -12,7 +12,7 @@ def positions_two_results():
     e.submit('long', 98, 104)
     e.quote(q(0))
     e.quote(q(1, bid='105', ask='105.1', last='105'))
-    e.submit('short', 110, 96)
+    e.submit('short', 108, 96)
     e.quote(q(2, bid='100', ask='100.1', last='100'))
     e.quote(q(3, bid='111', ask='111.1', last='111'))
     return e.history
