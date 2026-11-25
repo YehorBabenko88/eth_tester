@@ -59,4 +59,4 @@ def test_crossing_time_is_stop_first_under_ambiguous_trade_ids(monkeypatch):
     assert choice['reason'] == 'stop'
     assert choice['price'] == D(97)
     assert choice['ambiguous_same_timestamp']
-    assert 'FILTER (WHERE price<=' in runner.inspect_crossing_sql() if hasattr(runner, 'inspect_crossing_sql') else True
+    assert choice['ts'] == BASE
