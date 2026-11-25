@@ -42,14 +42,14 @@ async def collect_klines(settings,client,kind,tf):
                         continue
                 elif stamp+span>now:
                     continue
-                o,h,l,c=map(Decimal,row[1:5])
+                open_,high_,low_,close_=map(Decimal,row[1:5])
                 vol=Decimal(row[5]) if len(row)>5 else None
                 turnover=Decimal(row[6]) if len(row)>6 else None
                 conn.execute("""INSERT INTO candles(symbol,kind,tf,ts,open,high,low,close,volume,turnover,source)
                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'bybit_v5')
                    ON CONFLICT(symbol,kind,tf,ts) DO UPDATE SET open=EXCLUDED.open,high=EXCLUDED.high,
                    low=EXCLUDED.low,close=EXCLUDED.close,volume=EXCLUDED.volume,turnover=EXCLUDED.turnover""",
-                   (settings.symbol,kind,tf,dtms(stamp),o,h,l,c,vol,turnover))
+                   (settings.symbol,kind,tf,dtms(stamp),open_,high_,low_,close_,vol,turnover))
             save_cursor(conn,source,settings.symbol,tf,dtms(end+1))
         pos=end+1
 
