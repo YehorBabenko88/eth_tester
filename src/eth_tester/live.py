@@ -5,8 +5,12 @@ import json
 import random
 import websockets
 from .bybit import MarketClient
+from .data_quality import DataIntegrityError
 from .database import connection
-from .history import collect_klines,collect_funding,collect_oi,collect_account_ratios
+from .history import (
+    KIND_ENDPOINTS, INTERVAL_MS, OI_INTERVALS, collect_klines,
+    collect_funding, collect_oi, collect_account_ratios,
+)
 
 def stamp_ms(value):
     return datetime.fromtimestamp(int(value)/1000,timezone.utc)
@@ -16,16 +20,27 @@ def ingest_ws(conn,symbol,payload):
     data=payload.get("data")
     if not topic or data is None:
         return
+    if not topic.endswith("." + symbol):
+        raise DataIntegrityError(f"WebSocket topic symbol mismatch: {topic}")
     if topic.startswith("publicTrade."):
         for row in data:
             side=row["S"]
             if side not in ("Buy","Sell"):
                 raise ValueError("Unknown trade side")
+            if row.get("s", symbol) != symbol:
+                raise DataIntegrityError("WebSocket trade row has wrong symbol")
             price,qty=Decimal(row["p"]),Decimal(row["v"])
-            conn.execute("""INSERT INTO trades(symbol,ts,trade_id,price,qty,side,notional,source,raw)
+            if price <= 0 or qty <= 0:
+                raise DataIntegrityError("Invalid WebSocket trade price/quantity")
+            saved = conn.execute("""INSERT INTO trades(symbol,ts,trade_id,price,qty,side,notional,source,raw)
              VALUES(%s,%s,%s,%s,%s,%s,%s,'websocket',%s::jsonb)
-             ON CONFLICT(symbol,trade_id) DO NOTHING""",
-             (symbol,stamp_ms(row["T"]),row["i"],price,qty,side,price*qty,json.dumps(row)))
+             ON CONFLICT(symbol,trade_id) DO UPDATE SET price=EXCLUDED.price
+             WHERE trades.ts=EXCLUDED.ts AND trades.price=EXCLUDED.price
+             AND trades.qty=EXCLUDED.qty AND trades.side=EXCLUDED.side
+             RETURNING trade_id""",
+             (symbol,stamp_ms(row["T"]),row["i"],price,qty,side,price*qty,json.dumps(row))).fetchone()
+            if saved is None:
+                raise DataIntegrityError(f"Conflicting WS trade ID: {row['i']}")
     elif topic.startswith("orderbook."):
         row=data if isinstance(data,dict) else {}
         conn.execute("""INSERT INTO book_events(symbol,exchange_ts,update_id,sequence_no,
@@ -91,11 +106,14 @@ async def live_feed(settings):
                         with connection(settings) as conn:
                             ingest_ws(conn,settings.symbol,payload)
                             if topic.startswith('publicTrade.') and payload.get('data'):
-                                stamp=max(stamp_ms(x['T']) for x in payload['data'])
-                                if pending_id:
-                                    conn.execute('UPDATE data_gaps SET end_ts=%s WHERE id=%s AND end_ts IS NULL',(stamp,pending_id))
+                                stamps=[stamp_ms(x['T']) for x in payload['data']]
+                                first=min(stamps)
+                                latest=max(stamps)
+                                if pending_id and (last_trade is None or first > last_trade):
+                                    conn.execute('UPDATE data_gaps SET end_ts=%s WHERE id=%s AND end_ts IS NULL',(first,pending_id))
                                     pending_id=None
-                                last_trade=stamp
+                                last_trade=max(last_trade,latest) if last_trade else latest
+                raise ConnectionError("WebSocket stream closed without an exception")
         except Exception as exc:
             try:
                 with connection(settings) as conn:
@@ -114,11 +132,13 @@ async def live_rest_reconcile(settings):
     async with MarketClient(settings.bybit_rest,settings.rest_rps) as client:
         while True:
             try:
-                for tf in ("1","5","60"):
-                    await collect_klines(settings,client,"trade",tf)
+                for kind in KIND_ENDPOINTS:
+                    for tf in INTERVAL_MS:
+                        await collect_klines(settings,client,kind,tf)
                 await collect_funding(settings,client)
-                await collect_oi(settings,client,"5min")
-                await collect_account_ratios(settings,client,"5min")
+                for interval in OI_INTERVALS:
+                    await collect_oi(settings,client,interval)
+                    await collect_account_ratios(settings,client,interval)
             except Exception as exc:
                 with connection(settings) as conn:
                     conn.execute("""INSERT INTO feed_health(symbol,topic,status,detail)
