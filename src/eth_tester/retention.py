@@ -79,10 +79,10 @@ def _purge_bounded(conn, table, column, days, limit):
     }:
         raise ValueError("Only ETH Tester diagnostic tables are eligible")
     command = sql.SQL(
-        "WITH doomed AS (SELECT ctid FROM {} WHERE {} < "
+        "WITH doomed AS (SELECT tableoid,ctid FROM {} WHERE {} < "
         "(now() - (%s * interval '1 day')) ORDER BY {} LIMIT %s) "
         "DELETE FROM {} AS target USING doomed "
-        "WHERE target.ctid = doomed.ctid"
+        "WHERE target.tableoid = doomed.tableoid AND target.ctid = doomed.ctid"
     ).format(
         sql.Identifier(table), sql.Identifier(column),
         sql.Identifier(column), sql.Identifier(table),
