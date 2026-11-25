@@ -16,6 +16,14 @@ def number(value):
 
 
 @dataclass(frozen=True)
+class VolumeZone:
+    low: Decimal
+    high: Decimal
+    quantity: Decimal
+    kind: str
+
+
+@dataclass(frozen=True)
 class VolumeProfile:
     start: datetime
     end: datetime
@@ -27,6 +35,47 @@ class VolumeProfile:
     total_quantity: Decimal
     trade_count: int
     coverage: str
+
+    def zones(self, kind):
+        """Contiguous tick zones inside the actually observed price range.
+
+        Empty internal bins count as low volume, not as traded prices.
+        """
+        if kind not in ("high", "low"):
+            raise ValueError("unknown_zone_kind")
+        peak = max(self.by_price.values())
+        threshold = peak * (Decimal("0.65") if kind == "high"
+                            else Decimal("0.35"))
+        floor = min(self.by_price)
+        count = int((max(self.by_price) - floor) / self.tick_size) + 1
+        zones = []
+        opening = None
+        quantity = Decimal(0)
+        for index in range(count):
+            price = floor + self.tick_size * index
+            current = self.by_price.get(price, Decimal(0))
+            matching = current >= threshold if kind == "high" else current <= threshold
+            if matching:
+                if opening is None:
+                    opening = price
+                quantity += current
+            elif opening is not None:
+                zones.append(VolumeZone(opening, price - self.tick_size,
+                                        quantity, kind))
+                opening = None
+                quantity = Decimal(0)
+        if opening is not None:
+            zones.append(VolumeZone(opening, floor + self.tick_size * (count - 1),
+                                    quantity, kind))
+        return tuple(zones)
+
+    @property
+    def high_volume_zones(self):
+        return self.zones("high")
+
+    @property
+    def low_volume_zones(self):
+        return self.zones("low")
 
     @property
     def high_volume_nodes(self):
@@ -165,17 +214,21 @@ def volume_signal(closed_candles, profile, fee_rate=Decimal("0.00055"),
         nodes = [("naked_poc", profile.poc)]
         nodes += [("hvn", p) for p in profile.high_volume_nodes]
         nodes += [("lvn", p) for p in profile.low_volume_nodes]
+        for zone in profile.high_volume_zones:
+            nodes.extend((("hvn_zone", zone.low), ("hvn_zone", zone.high)))
+        for zone in profile.low_volume_zones:
+            nodes.extend((("lvn_zone", zone.low), ("lvn_zone", zone.high)))
         for kind, level in nodes:
             if abs(price - level) / price > Decimal("0.004"):
                 continue
             if kind == "naked_poc" and not untouched_poc(profile, pre_signal,
                                                          through=last["ts"]):
                 continue
-            if kind == "lvn":
+            if kind in ("lvn", "lvn_zone"):
                 if prev < level < price and price > opening:
-                    side, name = "long", "lvn_breakout"
+                    side, name = "long", kind + "_breakout"
                 elif prev > level > price and price < opening:
-                    side, name = "short", "lvn_breakout"
+                    side, name = "short", kind + "_breakout"
                 else:
                     continue
             elif prev >= level and low <= level < price and price > opening:
