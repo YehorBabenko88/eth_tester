@@ -1,6 +1,9 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
 from decimal import Decimal
 from .simulation.execution import number, utc
+from .simulation.live_evidence import (bind_live_paper_reference,
+                                       verify_live_paper_row)
 from .simulation.identity import (bind_snapshot_reference,
                                   require_new_strategy_identity,
                                   verify_persisted_snapshot)
@@ -29,7 +32,7 @@ def min_viable_target(notional,taker_rate,slippage_bps,safety_factor=Decimal("2"
         raise ValueError('Invalid costs')
     return (taker_rate*2+slippage_bps/Decimal(10000)*2)*safety_factor
 
-def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=None):
+def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=None,*,conn=None):
     if direction not in ("long","short"):
         raise ValueError("Invalid direction")
     if not isinstance(reason,dict):
@@ -49,17 +52,43 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
     # unverified and are never ML-training eligible.
     live_candidate=(context.get("source") in ("closed_candles", "verified_tick_volume")
                     or "orderflow" in context)
+    live_tier=False
     if live_candidate:
         stamp=context.get("signal_bar_ts")
         try:
             bar_ts=utc(datetime.fromisoformat(stamp))
         except (ValueError,TypeError) as exc:
             raise ValueError("Missing canonical signal bar timestamp") from exc
-        context=bind_snapshot_reference(context,decision_at=event_at,bar_ts=bar_ts)
+        flow=context.get("orderflow",{})
+        if not isinstance(flow,dict):
+            raise ValueError("Missing verified D orderflow")
+        live_tier="immutable_live_evidence" in flow
+        if live_tier and "immutable_feature_snapshot" in flow:
+            raise ValueError("Live paper and historical ML evidence cannot be mixed")
+        if live_tier:
+            context=bind_live_paper_reference(context,decision_at=event_at,bar_ts=bar_ts)
+        else:
+            context=bind_snapshot_reference(context,decision_at=event_at,bar_ts=bar_ts)
+            # Commit the LABEL POLICY at entry. No future outcome or post-entry
+            # source state is captured, so F may evaluate a *future* UTC grid.
+            policy={
+                "version":"utc_full_bars_v1",
+                "method":"fixed_horizon_barrier_v1",
+                "bar_interval_ms":60000,
+                "horizon_bars":3,
+                "barrier_bps":20,
+                "anchor":"first_full_bar_strictly_after_decision",
+            }
+            if "ml_label_policy" in context and context["ml_label_policy"]!=policy:
+                raise ValueError("Conflicting entry-time structural label policy")
+            context["ml_label_policy"]=policy
     elif any(k in context for k in ("ml_snapshot_key","ml_source_checksum",
-                                    "ml_label","ml_outcome")):
+                                    "ml_label","ml_outcome","paper_live_snapshot_key",
+                                    "paper_live_source_checksum")):
         raise ValueError("Unverified direct paper snapshot/label injection")
     market_ts=context.get("market_trade_ts")
+    if live_tier and market_ts is None:
+        raise ValueError("Live paper needs actual recent trade-print clock")
     if market_ts is not None:
         try:
             market_event_at=utc(datetime.fromisoformat(market_ts))
@@ -67,17 +96,33 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
             raise ValueError("Invalid trade print timestamp") from exc
         if market_event_at>event_at:
             raise ValueError("Future trade print cannot price a paper entry")
+        if live_tier and event_at-market_event_at>timedelta(seconds=15):
+            raise ValueError("Stale bounded live trade print")
     context['execution_quality']='trade_print_proxy_no_executable_book_proof'
     strategy_version=context['strategy_version']
-    with connection(settings) as conn:
+    # A supplied connection makes signal admission and paper settlement ONE
+    # transaction. Do not commit a 'candidate' before the paper entry.
+    with (nullcontext(conn) if conn is not None else connection(settings)) as conn:
         conn.execute("SELECT pg_advisory_xact_lock(20991991)")
         position_state=lock_state(conn)
         validate_transition(position_state,trade_id=None,at=event_at,action='open')
+        if live_tier:
+            # An old D proof is not permission to open a new historical trade.
+            # PostgreSQL time must witness this admission NOW, not yesterday.
+            witnessed=conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
+            if not timedelta(0) <= witnessed-event_at <= timedelta(seconds=5):
+                raise ValueError("Backdated or stalled bounded paper admission")
         if live_candidate:
-            # Lock/check the exact B snapshot inside the SAME transaction as
-            # paper_trades, settlement ledger, account and durable cursor.
-            verify_persisted_snapshot(conn,symbol=settings.symbol,
+            # B `paper_live_evidence` is immutable and paper-only; never
+            # elevate this receipt to a historical/ML feature snapshot.
+            # For bounded live: verify exact immutable B evidence but never
+            # elevate it to a complete historical/ML feature snapshot.
+            if live_tier:
+                verify_live_paper_row(conn,symbol=settings.symbol,
                                       reason=context,decision_at=event_at)
+            else:
+                verify_persisted_snapshot(conn,symbol=settings.symbol,
+                                          reason=context,decision_at=event_at)
         state=conn.execute("SELECT enabled,paused FROM bot_control WHERE singleton=true").fetchone()
         if not state or not state["enabled"] or state["paused"]:
             raise RuntimeError("Paused")

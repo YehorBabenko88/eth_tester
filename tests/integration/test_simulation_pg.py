@@ -227,6 +227,10 @@ def test_atomic_exact_snapshot_binding_and_no_future_label(simulated_pg):
         assert trade['reason']['ml_signal_decision_ms']==int(decision.timestamp()*1000)
         assert trade['reason']['market_trade_ts']==valid['market_trade_ts']
         assert 'ml_label' not in trade['reason']
+        policy=trade['reason']['ml_label_policy']
+        assert policy['anchor']=='first_full_bar_strictly_after_decision'
+        assert policy['bar_interval_ms']==60000
+        assert policy['horizon_bars']==3 and policy['barrier_bps']==20
         assert state['paper_trade_id']==first and state['version']==1
     assert close_paper(simulated_pg,105,'take',observed_at=decision+timedelta(seconds=1),
                        expected_id=first)==first
@@ -255,3 +259,65 @@ def test_missing_snapshot_rolls_back_without_paper_entry(simulated_pg):
         assert conn.execute("SELECT count(*) AS n FROM paper_order_events").fetchone()['n']==0
         state=conn.execute("SELECT paper_trade_id,version FROM paper_position_state").fetchone()
         assert state['paper_trade_id'] is None and state['version']==0
+
+
+def test_round6_paper_entry_and_strategy_decision_share_transaction(simulated_pg):
+    """A mid-transaction crash leaves neither signal nor paper settlement."""
+    stamp=start_time()
+    identity=strategy_identity()
+    reason=verified_reason(pattern='round6_transaction')
+    with pytest.raises(RuntimeError,match='crash'):
+        with connection(simulated_pg) as conn:
+            conn.execute("""INSERT INTO strategy_signals(
+              symbol,tf,bar_ts,version,decision,reason)
+              VALUES('ETHUSDT','1',%s,%s,'candidate','{}'::jsonb)""",
+              (stamp,identity))
+            open_paper(simulated_pg,'long',100,98,105,reason,
+                       observed_at=stamp,conn=conn)
+            raise RuntimeError('crash before commit')
+    with connection(simulated_pg) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM paper_trades").fetchone()['n']==0
+        assert conn.execute("SELECT count(*) AS n FROM paper_order_events").fetchone()['n']==0
+        assert conn.execute("SELECT count(*) AS n FROM strategy_signals").fetchone()['n']==0
+        state=conn.execute("SELECT version,paper_trade_id FROM paper_position_state").fetchone()
+        assert state['version']==0 and state['paper_trade_id'] is None
+    # The same transaction can instead commit a terminal opened decision.
+    with connection(simulated_pg) as conn:
+        ident=open_paper(simulated_pg,'long',100,98,105,reason,
+                         observed_at=stamp,conn=conn)
+        conn.execute("""INSERT INTO strategy_signals(
+          symbol,tf,bar_ts,version,decision,reason)
+          VALUES('ETHUSDT','1',%s,%s,'opened',%s::jsonb)""",
+          (stamp,identity,json.dumps({'paper_trade_id':ident})))
+    with connection(simulated_pg) as conn:
+        signals=conn.execute("SELECT decision,reason FROM strategy_signals").fetchall()
+        assert len(signals)==1
+        assert signals[0]['decision']=='opened'
+        assert signals[0]['reason']['paper_trade_id']==ident
+        assert conn.execute("SELECT count(*) AS n FROM paper_trades").fetchone()['n']==1
+        assert conn.execute("SELECT count(*) AS n FROM paper_order_events").fetchone()['n']==1
+    assert close_paper(simulated_pg,105,'take',
+                       observed_at=stamp+timedelta(seconds=5),
+                       expected_id=ident)==ident
+
+
+def test_round6_savepoint_rolls_back_bad_entry_without_orphan(simulated_pg):
+    """Paper admission rollback can coexist with a terminal strategy diagnostic."""
+    stamp=start_time()
+    with connection(simulated_pg) as conn:
+        with pytest.raises(RuntimeError,match='synthetic failure'):
+            with conn.transaction():
+                open_paper(simulated_pg,'short',100,102,95,
+                           verified_reason(),observed_at=stamp,conn=conn)
+                raise RuntimeError('synthetic failure after entry')
+        conn.execute("""INSERT INTO strategy_signals(
+           symbol,tf,bar_ts,version,decision,reason)
+           VALUES('ETHUSDT','1',%s,%s,'rejected_paper_admission',
+                  '{"reason":"atomic_savepoint_rollback"}'::jsonb)""",
+           (stamp,strategy_identity()))
+    with connection(simulated_pg) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM paper_trades").fetchone()['n']==0
+        assert conn.execute("SELECT count(*) AS n FROM paper_order_events").fetchone()['n']==0
+        assert conn.execute("SELECT version FROM paper_position_state").fetchone()['version']==0
+        row=conn.execute("SELECT decision FROM strategy_signals").fetchone()
+        assert row['decision']=='rejected_paper_admission'

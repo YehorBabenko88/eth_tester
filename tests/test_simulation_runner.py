@@ -81,7 +81,7 @@ def test_no_signal_records_full_rules_identity(monkeypatch):
     from eth_tester.strategies import Parameters
     saved=[]
     now=datetime.now(timezone.utc)
-    last=now.replace(second=0,microsecond=0)-timedelta(minutes=2)
+    last=now.replace(second=0,microsecond=0)-timedelta(minutes=1)
     bars=[{'ts':last-timedelta(minutes=34-i),'open':D(100),'high':D(101),
            'low':D(99),'close':D(100),'volume':D(1)} for i in range(35)]
     class Conn:
