@@ -17,12 +17,14 @@ def store_shadow(settings, model, train, validation, shadow):
         raise ValueError("model has seen validation period")
     if max(r.exit_ms for r in validation) >= min(r.decision_ms for r in shadow):
         raise ValueError("shadow period overlaps validation")
-    report = {"validation": evaluate(model, validation),
+    report = {"selection_bias": "observed_trades_only",
+              "validation": evaluate(model, validation),
               "shadow": evaluate(model, shadow),
               "train_count": len(train),
               "train_to_ms": model.train_to_ms,
               "paper_only": True, "state": "shadow", "model_version": model.version}
     with connection(settings) as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(20991992)")
         existing = conn.execute(
             """SELECT id FROM model_versions WHERE model_name='causal_softmax3'
                AND params->>'version'=%s ORDER BY id DESC LIMIT 1""",
@@ -110,13 +112,18 @@ def rollback_paper_model(settings, active_id, previous_id, reference_metrics,
     with connection(settings) as conn:
         conn.execute("SELECT pg_advisory_xact_lock(20991992)")
         rows = conn.execute(
-            """SELECT id,model_name,approved FROM model_versions
+            """SELECT id,model_name,approved,validation FROM model_versions
                WHERE id IN (%s,%s) FOR UPDATE""", (active_id, previous_id)
         ).fetchall()
         models = {r["id"]: r for r in rows}
         if len(models) != 2 or not models[active_id]["approved"]:
             return False
         if models[previous_id]["model_name"] != "causal_softmax3":
+            return False
+        historical = models[previous_id]["validation"] or {}
+        if isinstance(historical, str):
+            historical = json.loads(historical)
+        if historical.get("state") not in ("paper_approved", "rollback_restored"):
             return False
         conn.execute("UPDATE model_versions SET approved=false WHERE id=%s", (active_id,))
         conn.execute(
