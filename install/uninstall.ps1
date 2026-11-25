@@ -21,7 +21,22 @@ if ($t) {
         $actions[0].WorkingDirectory -cne $m.root) {
         throw 'Task action does not match manifest: refusing deletion'
     }
-    Stop-ScheduledTask -TaskName $m.task -ErrorAction SilentlyContinue
+    # Cooperative stop prevents leaving supervised child processes running.
+    $runtime = Join-Path $env:ProgramData 'ETHTester\runtime'
+    $marker = Join-Path $runtime 'shutdown.request'
+    if (Test-Path -LiteralPath $runtime -PathType Container) {
+        'Stop requested by verified uninstall' | Set-Content -LiteralPath $marker -Encoding Ascii
+        for ($i = 0; $i -lt 20; $i++) {
+            if ((Get-ScheduledTask -TaskName $m.task).State -ne 'Running') { break }
+            Start-Sleep -Seconds 1
+        }
+    }
+    if ((Get-ScheduledTask -TaskName $m.task).State -eq 'Running') {
+        Stop-ScheduledTask -TaskName $m.task -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $marker -PathType Leaf) {
+        Remove-Item -LiteralPath $marker -Force
+    }
     Unregister-ScheduledTask -TaskName $m.task -Confirm:$false
 }
 Remove-Item -LiteralPath $manifestPath -Force
