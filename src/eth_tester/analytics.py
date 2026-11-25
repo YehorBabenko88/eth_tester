@@ -72,9 +72,12 @@ def build_footprint(settings, tf="1", hours=24):
         # Same advisory lock as rollup_day, protecting archive-vs-live writes.
         conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                      (f"{settings.symbol}:{tf}:cluster",))
+        # Align start to the earliest complete bucket, preventing the
+        # sliding lookback from silently truncating an old bucket.
+        start = floor_time(now - timedelta(hours=hours), span)
         rows = conn.execute("""SELECT ts,price,qty,side FROM trades WHERE
             symbol=%s AND ts >= %s AND ts < %s ORDER BY ts,trade_id""",
-            (settings.symbol, now - timedelta(hours=hours), now)).fetchall()
+            (settings.symbol, start, now)).fetchall()
         buckets = {}
         for row in rows:
             ts = floor_time(row["ts"], span)
