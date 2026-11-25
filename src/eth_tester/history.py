@@ -25,7 +25,7 @@ async def collect_klines(settings,client,kind,tf):
         previous=cursor_ts(conn,source,settings.symbol,tf)
     pos=max(toms(start),toms(previous)-2*span) if previous else toms(start)
     now=toms(datetime.now(UTC))
-    while pos<now-span:
+    while pos<now-(span if tf!='M' else 0):
         end=min(now-1,pos+span*999-1)
         result=await client.get(KIND_ENDPOINTS[kind],category=settings.category,symbol=settings.symbol,
                                  interval=tf,start=pos,end=end,limit=1000)
@@ -33,7 +33,14 @@ async def collect_klines(settings,client,kind,tf):
         with connection(settings) as conn:
             for row in records:
                 stamp=int(row[0])
-                if not (pos<=stamp<=end) or stamp+span>now:
+                if not (pos<=stamp<=end):
+                    continue
+                if tf=='M':
+                    d=dtms(stamp)
+                    next_month=d.replace(year=d.year+(d.month==12),month=d.month%12+1)
+                    if toms(next_month)>now:
+                        continue
+                elif stamp+span>now:
                     continue
                 o,h,l,c=map(Decimal,row[1:5])
                 vol=Decimal(row[5]) if len(row)>5 else None
