@@ -155,7 +155,13 @@ def volume_signal(closed_candles, profile, fee_rate=Decimal("0.00055"),
             return None
         candidates = []
         # The POC was naked until the signal bar (which may test it).
-        pre_signal = candles[:-1]
+        pre_signal = [bar for bar in candles[:-1] if bar["ts"] >= profile.end]
+        # All volume signals require a fully observed post-profile 1m window.
+        if (not pre_signal or pre_signal[0]["ts"] != profile.end or
+                pre_signal[-1]["ts"] + timedelta(minutes=1) != last["ts"] or
+                any(b["ts"] - a["ts"] != timedelta(minutes=1)
+                    for a, b in zip(pre_signal, pre_signal[1:]))):
+            return None
         nodes = [("naked_poc", profile.poc)]
         nodes += [("hvn", p) for p in profile.high_volume_nodes]
         nodes += [("lvn", p) for p in profile.low_volume_nodes]
