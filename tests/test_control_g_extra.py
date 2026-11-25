@@ -120,3 +120,24 @@ def test_cooperative_supervisor_shutdown_request(tmp_path):
     marker.write_text("owned uninstall", encoding="utf-8")
     asyncio.run(Supervisor(path=tmp_path)._wait_shutdown())
     assert not marker.exists()
+
+@pytest.mark.skipif(__import__("sys").platform != "win32", reason="Windows PowerShell parser only")
+def test_windows_installer_scripts_parse_without_execution():
+    """Check syntax on Windows CI; never execute the privileged scripts."""
+    import subprocess
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for filename in ("install.ps1", "uninstall.ps1"):
+        path = (root / "install" / filename).as_posix().replace("'", "''")
+        command = (
+            "$tokens=$null; $errors=$null; "
+            "[System.Management.Automation.Language.Parser]::ParseFile("
+            f"'{path}', [ref]$tokens, [ref]$errors) | Out-Null; "
+            "if ($errors.Count -gt 0) { $errors | Out-String | Write-Error; exit 1 }"
+        )
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            text=True, capture_output=True, check=False, timeout=30,
+        )
+        assert completed.returncode == 0, completed.stderr
