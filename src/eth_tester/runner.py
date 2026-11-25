@@ -76,6 +76,20 @@ def _persist_paper_decision(conn, settings, bar_ts, version, decision, payload):
     return saved
 
 
+def _try_paper_admission_mutex(conn):
+    """Acquire E's global position mutex BEFORE D/B prospective source checks.
+
+    close_paper uses global 20991991 -> source hashtext(...) order. Taking
+    source in confirm_rejection BEFORE global causes the inverse lock cycle.
+    Never acquire source, mutate ledgers or terminalize a signal on contention.
+    The lease is transaction-scoped, including later open_paper re-entry.
+    """
+    result=conn.execute(
+        "SELECT pg_try_advisory_xact_lock(20991991) AS acquired"
+    ).fetchone()
+    return result is not None and result["acquired"] is True
+
+
 def engine_tick(settings):
     """Single-shot paper admission: evidence and entry commit atomically.
 
@@ -154,8 +168,27 @@ def engine_tick(settings):
               LIMIT 1""",(settings.symbol,now,last)).fetchone()
             if missing:
                 return "blocked_unresolved_tick_gap"
+            # Canonical R12 lock hierarchy for every prospective 1m decision:
+            # GLOBAL (20991991) -> per-bar paper_signal -> B/D SOURCE.
+            # Exit always takes GLOBAL -> SOURCE, avoiding both lock inversions.
+            # Never publish a terminal decision if another process owns GLOBAL.
+            conn.execute("SET LOCAL lock_timeout = '2000ms'")
+            conn.execute("SET LOCAL statement_timeout = '5000ms'")
+            if not _try_paper_admission_mutex(conn):
+                return "paper_admission_busy"
+            # Preliminary reads above were not protected by GLOBAL; a
+            # concurrent worker might have opened a position or changed pause.
+            if conn.execute(
+                "SELECT 1 FROM paper_trades WHERE state='open' LIMIT 1"
+            ).fetchone():
+                return "paper_position_already_open"
+            control=conn.execute(
+                "SELECT enabled,paused FROM bot_control WHERE singleton=true"
+            ).fetchone()
+            if not control or not control["enabled"] or control["paused"]:
+                return "paused"
             version,metadata=rule_identity()
-            # Serialize same symbol/tf/bar/version before the initial read.
+            # Serialize same symbol/tf/bar/version AFTER global mutex.
             conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                          (f"paper_signal:{settings.symbol}:1:{last.isoformat()}:{version}",))
             exists=conn.execute("""SELECT decision FROM strategy_signals WHERE

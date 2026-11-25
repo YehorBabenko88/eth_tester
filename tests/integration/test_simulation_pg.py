@@ -761,3 +761,46 @@ def test_round11_source_fence_concurrent_gap_before_exit(simulated_pg):
                             (ident,)).fetchone()["state"]=="open"
         assert conn.execute("SELECT version FROM paper_position_state"
                            ).fetchone()["version"]==1
+
+
+def test_round12_pg_two_connections_no_source_global_cycle(simulated_pg):
+    """Two real PG connections: while exit owns global, admission must not
+    take the source lease and then block waiting for the exit's global lease.
+    A failed acquisition leaves the original signal eligible for future
+    prospective retry, never a terminal paper decision.
+    """
+    from eth_tester.runner import _try_paper_admission_mutex
+    source="eth_paper_admission_source:ETHUSDT"
+    with connection(simulated_pg) as closer:
+        closer.execute("SELECT pg_advisory_xact_lock(20991991)")
+        with connection(simulated_pg) as opener:
+            opener.execute("SET LOCAL lock_timeout = '300ms'")
+            assert _try_paper_admission_mutex(opener) is False
+            # The closer is free to acquire the exact shared source lock:
+            # the losing admission did not acquire source first.
+            row=closer.execute("""SELECT pg_try_advisory_xact_lock(
+                hashtext(%s)) AS acquired""",(source,)).fetchone()
+            assert row["acquired"] is True
+    with connection(simulated_pg) as fresh:
+        assert _try_paper_admission_mutex(fresh) is True
+
+
+def test_round12_pg_source_wait_times_out_and_global_recovers(simulated_pg):
+    """An A/C source writer holding its source lease cannot hang E
+    indefinitely. When B/source lock waits beyond 200ms, PostgreSQL aborts
+    that uncommitted paper admission and releases its global transaction lock.
+    """
+    from eth_tester.runner import _try_paper_admission_mutex
+    source="eth_paper_admission_source:ETHUSDT"
+    with connection(simulated_pg) as source_writer:
+        source_writer.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                              (source,))
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            with connection(simulated_pg) as opener:
+                opener.execute("SET LOCAL lock_timeout = '200ms'")
+                assert _try_paper_admission_mutex(opener) is True
+                opener.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                               (source,))
+        # An aborted opener cannot poison the global mutex.
+        with connection(simulated_pg) as closer:
+            assert _try_paper_admission_mutex(closer) is True
