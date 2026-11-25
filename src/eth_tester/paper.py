@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 from .simulation.execution import number, utc
+from .simulation.persistence import (advance_state, lock_state, observation_time,
+                                     record_fill, validate_transition)
 import json
 from .database import connection
 
@@ -43,6 +45,8 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
     strategy_version=str(context.get('strategy_version') or 'unversioned')[:100]
     with connection(settings) as conn:
         conn.execute("SELECT pg_advisory_xact_lock(20991991)")
+        position_state=lock_state(conn)
+        validate_transition(position_state,trade_id=None,at=event_at,action='open')
         state=conn.execute("SELECT enabled,paused FROM bot_control WHERE singleton=true").fetchone()
         if not state or not state["enabled"] or state["paused"]:
             raise RuntimeError("Paused")
@@ -66,7 +70,18 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
           RETURNING id""",
           (settings.symbol,direction,event_at,event_at,fill,qty,settings.initial_notional_usd,stop,take,
            json.dumps(context,default=str),entry_fee,abs(fill-price)*qty,strategy_version)).fetchone()
-        return row["id"]
+        trade_id=row["id"]
+        record_fill(conn,trade_id=trade_id,symbol=settings.symbol,
+                    event_id=f"paper:{trade_id}:entry:{event_at.isoformat()}",
+                    at=event_at,observed_at=observation_time(event_at),
+                    side='Buy' if direction=='long' else 'Sell',action='entry',
+                    qty=qty,price=fill,fee=entry_fee,slippage_cost=abs(fill-price)*qty,
+                    quality='trade_print_proxy_no_liquidity',
+                    provenance={'strategy':strategy_version,'reason':context})
+        conn.execute("""UPDATE paper_trades SET execution_quality=%s WHERE id=%s""",
+                     ('trade_print_proxy_no_liquidity',trade_id))
+        advance_state(conn,position_state,trade_id=trade_id,at=event_at,action='open')
+        return trade_id
 
 def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),observed_at=None,expected_id=None):
     price=number(observed_price)
@@ -76,11 +91,13 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
     event_at=utc(observed_at) if observed_at is not None else datetime.now(timezone.utc)
     with connection(settings) as conn:
         conn.execute("SELECT pg_advisory_xact_lock(20991991)")
+        position_state=lock_state(conn)
         trade=conn.execute("SELECT * FROM paper_trades WHERE state='open' FOR UPDATE").fetchone()
         if not trade or (expected_id is not None and trade["id"]!=expected_id):
             return None
         if event_at<utc(trade['opened_at']):
             raise ValueError('Exit precedes entry')
+        validate_transition(position_state,trade_id=trade['id'],at=event_at,action='close')
         sign=Decimal(1) if trade["direction"]=="long" else Decimal(-1)
         fill=price*(1-sign*settings.slippage_bps/Decimal(10000))
         if fill<=0:
@@ -92,6 +109,15 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
           fee_paid=fee_paid+%s,slippage_paid=slippage_paid+%s,funding_paid=%s,
           gross_pnl=%s,net_pnl=%s,exit_reason=%s WHERE id=%s AND state='open'""",
           (event_at,fill,exit_fee,abs(fill-price)*trade["qty"],funding,gross,net,reason,trade["id"]))
+        record_fill(conn,trade_id=trade['id'],symbol=settings.symbol,
+                    event_id=f"paper:{trade['id']}:exit:{event_at.isoformat()}",
+                    at=event_at,observed_at=observation_time(event_at),
+                    side='Sell' if trade['direction']=='long' else 'Buy',
+                    action='exit',qty=trade['qty'],price=fill,fee=exit_fee,
+                    slippage_cost=abs(fill-price)*trade['qty'],
+                    quality='trade_print_proxy_no_liquidity',
+                    provenance={'exit_reason':reason,'funding_quality':'unverified'})
         conn.execute("""UPDATE paper_account SET equity=equity+%s,
           realized_pnl=realized_pnl+%s WHERE id=1""",(net,net))
+        advance_state(conn,position_state,trade_id=trade['id'],at=event_at,action='close')
         return trade["id"]
