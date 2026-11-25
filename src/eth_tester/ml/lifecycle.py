@@ -6,13 +6,23 @@ automatically opens a paper position; approval changes model_versions metadata.
 import json
 
 from ..database import connection
-from . import Gates, approve_candidate, evaluate, fit, rollback_required, should_retrain
+from . import evaluate, fit, rollback_required, should_retrain, validate
 
 
 def store_shadow(settings, model, train, validation, shadow):
     """Persist an append-only candidate; no approval without independent evidence."""
     if not (train and validation and shadow):
         raise ValueError("three disjoint samples required")
+    for partition in (train, validation, shadow):
+        if len(validate(partition, max(r.exit_ms for r in partition))) != len(partition):
+            raise ValueError("unresolved training evidence")
+    identifiers = [r.event_id for group in (train, validation, shadow) for r in group]
+    if len(identifiers) != len(set(identifiers)):
+        raise ValueError("duplicate event across shadow partitions")
+    if max(r.exit_ms for r in train) >= min(r.decision_ms for r in validation):
+        raise ValueError("training label overlap")
+    if model != fit(train):
+        raise ValueError("shadow model is not canonical")
     if model.train_to_ms >= min(r.decision_ms for r in validation):
         raise ValueError("model has seen validation period")
     if max(r.exit_ms for r in validation) >= min(r.decision_ms for r in shadow):
@@ -47,6 +57,8 @@ def run_shadow_cycle(settings, rows, boundaries, previous_trained_count=0,
     """
     if len(boundaries) != 2:
         raise ValueError("expected validation_start and shadow_start")
+    if steps != 240:
+        raise ValueError("noncanonical training optimizer prohibited")
     if not should_retrain(previous_trained_count, len(rows), min_new):
         return None
     from . import chronological
@@ -56,52 +68,13 @@ def run_shadow_cycle(settings, rows, boundaries, previous_trained_count=0,
 
 
 def admit_paper_candidate(settings, candidate_id, model, train, validation,
-                          shadow, *, champion=None, gates=Gates()):
-    """Atomic metadata promotion if independent gates pass; not a trading command."""
-    # Refit the fixed canonical training algorithm. This prevents a caller from
-    # sneaking validation-optimized weights through a favorable shadow report.
-    try:
-        if fit(train) != model:
-            return False, "noncanonical or altered model artifact"
-    except ValueError:
-        return False, "training evidence invalid"
-    approved, reason = approve_candidate(model, champion, train, validation, shadow, gates)
-    if not approved:
-        return False, reason
-    with connection(settings) as conn:
-        conn.execute("SELECT pg_advisory_xact_lock(20991992)")
-        candidate = conn.execute(
-            "SELECT id,model_name,params,approved FROM model_versions WHERE id=%s FOR UPDATE",
-            (candidate_id,)).fetchone()
-        if not candidate or candidate["model_name"] != "causal_softmax3":
-            return False, "unknown candidate"
-        serialized = json.loads(model.as_json())
-        params = candidate["params"]
-        if isinstance(params, str):
-            params = json.loads(params)
-        if params != serialized:
-            return False, "candidate artifact mismatch"
-        incumbent = conn.execute(
-            "SELECT id,params FROM model_versions WHERE approved=true FOR UPDATE"
-        ).fetchall()
-        if len(incumbent) > 1:
-            return False, "ambiguous champion"
-        if incumbent and incumbent[0]["id"] != candidate_id:
-            previous = incumbent[0]["params"]
-            if isinstance(previous, str):
-                previous = json.loads(previous)
-            if champion is None or previous != json.loads(champion.as_json()):
-                return False, "champion changed since evaluation"
-        if incumbent and incumbent[0]["id"] == candidate_id:
-            return True, "already approved paper metadata"
-        conn.execute("UPDATE model_versions SET approved=false WHERE approved=true")
-        conn.execute(
-            """UPDATE model_versions SET approved=true,
-               validation=coalesce(validation,'{}'::jsonb) ||
-               %s::jsonb WHERE id=%s""",
-            (json.dumps({"state": "paper_approved",
-                         "paper_only": True, "gate_reason": reason}), candidate_id))
-    return True, reason
+                          shadow, *, champion=None, gates=None):
+    """Fail closed until MASTER defines verifiable external OOS attestation.
+
+    The available Example type does not cryptographically attest the origin of
+    independent labels or executed-trade selection. Never update approved=true.
+    """
+    return False, "independent certified OOS promotion contract not approved"
 
 
 def rollback_paper_model(settings, active_id, previous_id, reference_metrics,

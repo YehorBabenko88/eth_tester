@@ -17,11 +17,22 @@ def record():
         "bar_ts": start, "available_at": start+timedelta(minutes=5),
         "observed_at": start+timedelta(minutes=6),
         "computed_at": start+timedelta(minutes=7),
-        "source_checksum": "deadbeef", "snapshot_quality": "complete",
-        "is_causal": True, "reason": {"ml_outcome": "bounce"},
+        "snapshot_key": "snap-paper-1",
+        "source_checksum": "a"*64, "snapshot_quality": "complete",
+        "is_causal": True, "reason": {
+            "ml_snapshot_key": "snap-paper-1", "ml_source_checksum": "a"*64,
+            "ml_outcome": "bounce",
+            "ml_label": {
+                "outcome": "bounce", "method": "fixed_horizon_barrier_v1",
+                "horizon_end_ms": epoch_ms(start+timedelta(minutes=16)),
+                "issued_at_ms": epoch_ms(start+timedelta(minutes=16)),
+                "coverage_verified": True, "source_checksum": "b"*64}},
         "values_json": dict.fromkeys(FEATURE_NAMES, 1.0),
-        "provenance": {"feature_available_ms": dict.fromkeys(
-            FEATURE_NAMES, epoch_ms(start+timedelta(minutes=4)))},
+        "provenance": {
+            "source_coverage_verified": True,
+            "source_receipt_ms": epoch_ms(start+timedelta(minutes=6)),
+            "feature_available_ms": dict.fromkeys(
+                FEATURE_NAMES, epoch_ms(start+timedelta(minutes=4)))},
         "notional": 1000, "gross_pnl": 12, "fees": 2,
         "funding": 1, "net_pnl": 9,
     }
@@ -91,3 +102,30 @@ def test_retraining_hook_requires_new_labels(monkeypatch):
     result = lifecycle.run_shadow_cycle(None, rows, [110000, 150000], min_new=100)
     assert result == (12, {"state": "shadow"})
     assert called and all(n > 0 for n in called[0][1:])
+
+
+def test_exact_snapshot_and_source_identity_binding():
+    row = record()
+    row["reason"]["ml_snapshot_key"] = "other"
+    assert from_snapshot_records([row], epoch_ms(row["closed_at"])+1)[0] == []
+    row = record()
+    row["reason"]["ml_source_checksum"] = "f"*64
+    assert from_snapshot_records([row], epoch_ms(row["closed_at"])+1)[0] == []
+
+
+def test_unverified_coverage_and_backdated_computation_rejected():
+    row = record()
+    row["provenance"]["source_coverage_verified"] = False
+    assert from_snapshot_records([row], epoch_ms(row["closed_at"])+1)[0] == []
+    row = record()
+    row["computed_at"] = row["observed_at"] - timedelta(seconds=1)
+    assert from_snapshot_records([row], epoch_ms(row["closed_at"])+1)[0] == []
+
+
+def test_label_must_be_complete_and_available_as_of():
+    row = record()
+    row["reason"]["ml_label"]["issued_at_ms"] = epoch_ms(row["closed_at"])+2000
+    assert from_snapshot_records([row], epoch_ms(row["closed_at"])+1)[0] == []
+    row = record()
+    row["reason"]["ml_label"]["coverage_verified"] = False
+    assert from_snapshot_records([row], epoch_ms(row["closed_at"])+1)[0] == []

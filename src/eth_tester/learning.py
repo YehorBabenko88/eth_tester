@@ -27,42 +27,12 @@ def brier(weights,rows):
     return sum((sigmoid(weights[0]+sum(w*x for w,x in zip(weights[1:],v)))-label)**2
                for v,label in rows)/len(rows) if rows else None
 
-def train_shadow(settings,minimum=100,epochs=20):
-    with connection(settings) as conn:
-        deals=conn.execute("""SELECT direction,entry,stop,take,reason,net_pnl
-        FROM paper_trades WHERE state='closed' AND entry>0 ORDER BY opened_at,id""").fetchall()
-    data=[]
-    for row in deals:
-        item=vector(row)
-        if item is not None:
-            scaled=(min(5,item[0]*100),min(5,item[1]*100),
-                    min(5,item[2]*100),item[3])
-            data.append((scaled,1 if row["net_pnl"]>0 else 0))
-    if len(data)<minimum:
-        raise RuntimeError(f"Not enough closed trades: {len(data)}/{minimum}")
-    a,b=int(len(data)*.6),int(len(data)*.8)
-    train,validation,holdout=data[:a],data[a:b],data[b:]
-    weights=[0.0]*5
-    for epoch in range(epochs):
-        rate=.05/(1+epoch/10)
-        for features,y in train:
-            prediction=sigmoid(weights[0]+sum(w*x for w,x in zip(weights[1:],features)))
-            error=prediction-y
-            weights[0]-=rate*error
-            for k in range(4):
-                weights[k+1]-=rate*(error*features[k]+.01*weights[k+1])
-    base=sum(y for _,y in train)/len(train)
-    base_brier=sum((base-y)**2 for _,y in holdout)/len(holdout)
-    stats={"train":len(train),"validation":len(validation),
-      "holdout":len(holdout),"validation_brier":brier(weights,validation),
-      "holdout_brier":brier(weights,holdout),"baseline_brier":base_brier,
-      "selection_bias":"only realized paper entries","approved":False}
-    with connection(settings) as conn:
-        result=conn.execute("""INSERT INTO model_versions(model_name,params,validation,approved)
-          VALUES('shadow_logistic_v1',%s::jsonb,%s::jsonb,false) RETURNING id""",
-          (json.dumps({"features":FEATURES,"weights":weights}),
-           json.dumps(stats))).fetchone()
-    return result["id"],stats
+def train_shadow(settings, minimum=100, epochs=20):
+    """Legacy PnL-based training is disabled: no immutable causal evidence."""
+    raise RuntimeError(
+        "Legacy paper-trade labels are not causally certified; "
+        "use train_causal_shadow with immutable snapshots"
+    )
 
 
 def train_causal_shadow(settings, as_of_ms, *, source="snapshots", tf="5",
@@ -74,29 +44,30 @@ def train_causal_shadow(settings, as_of_ms, *, source="snapshots", tf="5",
     periods are reserved for validation and independent shadow evaluation.
     """
     from .ml import chronological, fit, should_retrain
-    from .ml.extract import (load_backtest_examples, load_paper_examples,
-                             load_causal_feature_examples)
+    from .ml.extract import load_causal_feature_examples
     from .ml.lifecycle import store_shadow
 
     if min_rows < 30 or embargo_ms < 0:
         raise ValueError("invalid training policy")
-    if source == "snapshots":
-        rows, rejected = load_causal_feature_examples(settings, as_of_ms, tf=tf)
-    elif source == "backtest":
-        rows, rejected = load_backtest_examples(settings, as_of_ms)
-    elif source == "paper":
-        rows, rejected = load_paper_examples(settings, as_of_ms)
-    else:
-        raise ValueError("source must be snapshots, backtest or paper")
+    if source != "snapshots":
+        return {"status": "uncertified_source_disabled", "usable": 0,
+                "required": min_rows, "rejections": {"source_not_immutable": 1},
+                "approved": False}
+    rows, rejected = load_causal_feature_examples(settings, as_of_ms, tf=tf)
     if len(rows) < min_rows or not should_retrain(previous_count, len(rows), min_new):
         return {"status": "insufficient_new_verified_data", "usable": len(rows),
+                "required": max(min_rows, previous_count + min_new),
                 "rejections": rejected, "approved": False}
     start = rows[int(len(rows) * .6)].decision_ms
     end = rows[int(len(rows) * .8)].decision_ms
-    train, validation, shadow = chronological(rows, start, end, embargo_ms)
+    try:
+        train, validation, shadow = chronological(rows, start, end, embargo_ms)
+    except ValueError:
+        return {"status": "insufficient_purged_splits", "usable": len(rows),
+                "required": min_rows, "rejections": rejected, "approved": False}
     if len(train) < 100 or len(validation) < 30 or len(shadow) < 30:
         return {"status": "insufficient_purged_splits", "usable": len(rows),
-                "rejections": rejected, "approved": False}
+                "required": min_rows, "rejections": rejected, "approved": False}
     model = fit(train)
     candidate_id, metrics = store_shadow(settings, model, train, validation, shadow)
     return {"status": "shadow_registered", "candidate_id": candidate_id,

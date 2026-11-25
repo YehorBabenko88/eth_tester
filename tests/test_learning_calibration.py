@@ -35,6 +35,10 @@ def test_winrate_certificate_preserves_provenance_and_costs():
     assert certificate is not None
     assert certificate["strategy_version"] == "paper-v1"
     assert certificate["model_version"] == "frozen-test"
+    assert certificate["schema_version"] == 2
+    assert certificate["issuer"] == "eth_tester.ml.calibration.v2"
+    assert certificate["issued_at_ms"] >= certificate["holdout_end_ms"]
+    assert certificate["authenticity_verified"] is False
     assert certificate["net_wins"] == 80
     assert certificate["observations"] == 120
     assert certificate["probability_lower"] < 80/120
@@ -50,3 +54,11 @@ def test_calibration_refuses_small_or_unprofitable_holdout():
     assert winrate_certificate(model, losing, strategy_version="paper-v1") is None
     with pytest.raises(ValueError):
         winrate_certificate(model, [sample(1)], strategy_version="")
+
+
+def test_certificate_rejects_unpublished_holdout(monkeypatch):
+    from eth_tester.ml import calibration
+    monkeypatch.setattr(calibration.time, "time_ns", lambda: 50_000_000)
+    assert winrate_certificate(always_breakout(),
+                               [sample(i) for i in range(1, 121)],
+                               strategy_version="paper-v1") is None

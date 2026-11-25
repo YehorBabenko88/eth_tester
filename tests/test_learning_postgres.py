@@ -44,6 +44,12 @@ def test_immutable_feature_snapshot_asof_join(learning_postgres):
     closed = start + timedelta(minutes=10)
     feature_times = dict.fromkeys(FEATURE_NAMES, epoch_ms(start + timedelta(minutes=1)))
     values = dict.fromkeys(FEATURE_NAMES, 1.0)
+    label = {
+        "outcome": "bounce", "method": "fixed_horizon_barrier_v1",
+        "horizon_end_ms": epoch_ms(closed),
+        "issued_at_ms": epoch_ms(closed),
+        "coverage_verified": True, "source_checksum": "b"*64,
+    }
     with connection(learning_postgres) as conn:
         for suffix, computed in [
             ("good", start + timedelta(minutes=2)),
@@ -58,7 +64,11 @@ def test_immutable_feature_snapshot_asof_join(learning_postgres):
                 ("ml-" + suffix, start, start+timedelta(minutes=1),
                  start+timedelta(minutes=2), computed, "a"*64,
                  json.dumps(values),
-                 json.dumps({"feature_available_ms": feature_times})),
+                 json.dumps({
+                     "feature_available_ms": feature_times,
+                     "source_coverage_verified": True,
+                     "source_receipt_ms": epoch_ms(start+timedelta(minutes=2)),
+                 })),
             )
         conn.execute(
             """INSERT INTO paper_trades(symbol,state,direction,signal_ts,
@@ -66,7 +76,10 @@ def test_immutable_feature_snapshot_asof_join(learning_postgres):
                gross_pnl,fee_paid,funding_paid,net_pnl,strategy_version)
                VALUES('ETHUSDT','closed','long',%s,%s,%s,3000,3010,0.333,
                       1000,2980,3040,%s::jsonb,12,2,1,9,'test-no-orders')""",
-            (decision, opened, closed, json.dumps({"ml_outcome": "bounce"})),
+            (decision, opened, closed, json.dumps({
+                "ml_outcome": "bounce", "ml_snapshot_key": "ml-good",
+                "ml_source_checksum": "a"*64, "ml_label": label,
+            })),
         )
     records, rejected = load_causal_feature_examples(
         learning_postgres, epoch_ms(closed)+1, tf="5"

@@ -6,6 +6,7 @@ or correlated trades. Never interpret the 3-class probabilities as P(win).
 from hashlib import sha256
 import json
 import math
+import time
 
 from . import validate, evaluate
 
@@ -52,7 +53,12 @@ def winrate_certificate(model, holdout, *, strategy_version, minimum_ev=0.0,
     evidence = [(r.event_id, r.decision_ms, r.exit_ms, r.net_return)
                 for r in selected]
     digest = sha256(json.dumps(evidence, separators=(",", ":")).encode()).hexdigest()
-    return {"model_version": model.version, "strategy_version": strategy_version,
+    issued = time.time_ns() // 1000000
+    if issued < max(r.exit_ms for r in validated):
+        return None
+    return {"schema_version": 2, "issuer": "eth_tester.ml.calibration.v2",
+            "issued_at_ms": issued,
+            "model_version": model.version, "strategy_version": strategy_version,
             "method": "one_sided_wilson_95_iid_assumption",
             "probability_lower": wilson_lower(wins, len(selected)),
             "observations": len(selected), "net_wins": wins,
@@ -60,4 +66,5 @@ def winrate_certificate(model, holdout, *, strategy_version, minimum_ev=0.0,
             "holdout_end_ms": max(r.exit_ms for r in validated),
             "selected_evidence_sha256": digest,
             "selection": "frozen_model_nonuncertain_positive_predicted_net",
-            "independent_trades_assumed": True, "paper_only": True}
+            "independent_trades_assumed": True, "paper_only": True,
+            "authenticity_verified": False}
