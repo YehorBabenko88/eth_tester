@@ -23,4 +23,5 @@ class Settings(BaseSettings):
     max_daily_drawdown: Decimal = Decimal("0.03")
     tg_bot_token: str = ""
     tg_chat_id: str = ""
+    minimum_free_gb: float = 20.0
     dry_run: bool = True
