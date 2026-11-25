@@ -20,3 +20,15 @@ def test_no_signal_and_version():
     assert price_signal([]) is None
     assert Parameters().identity()==Parameters().identity()
     assert Parameters(min_score=80).identity()!=Parameters().identity()
+
+def test_calibrated_expectancy_requires_conservative_probability():
+    from eth_tester.strategy import calibrated_expectancy
+
+    args = ("long", D(100), D(99), D(105), D("0.00055"), D(2))
+    assert calibrated_expectancy(*args, None) is None
+    assert calibrated_expectancy(*args, D("0.1")) is None
+    assert calibrated_expectancy(*args, D("NaN")) is None
+    assert calibrated_expectancy(*args, D("1.01")) is None
+    qualified = calibrated_expectancy(*args, D("0.8"))
+    assert qualified is not None
+    assert D(qualified["expected_net_fraction_lower_bound"]) >= D("0.002")
