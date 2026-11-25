@@ -164,3 +164,60 @@ All included PostgreSQL tests use newly generated disposable
 SQL safety and contract compatibility ONLY. They cannot replace
 actual Bybit observed source evidence, PG17/18 matrix PASS, native Windows
 acceptance, or MASTER production GO. No trading API is used.
+
+
+## Round 9: unattended paper-only storage maintenance
+
+**Bounded diagnostic cleanup:** retention.cleanup_diagnostics(settings) remains
+restricted to feed_health (90 days), bot_events (180 days), and
+eth_storage_events (180 days), up to 10,000 rows per table per call. It uses
+one transactional, nonblocking advisory cleanup lease; local lock_timeout
+2500ms and statement_timeout 20000ms; FOR UPDATE SKIP LOCKED for diagnostic
+rows. A competing maintenance run raises, not a false success. G may schedule
+the existing CLI cleanup daily. The service DB role must have ONLY the
+necessary scoped DELETE rights and ownership marker. The service may never
+delete raw market sources, paper ledgers or historical ML evidence.
+
+**Long-term research preservation:** bot_events records with
+event='paper_trade_review_v1' or data.retention='preserve' are excluded
+from the 180-day diagnostic purge. E must use this exact event name and
+mark substantive paper review records. A bot_events entry is NOT an
+append-only cryptographic ML certificate. Unbounded research will need a
+future dedicated partitioned, protected research ledger and quota policy.
+
+**Owned-temp cleanup:** optional ETH_TESTER_OWNED_TEMP_DIR must contain a
+regular .eth-tester-owned-temp marker with exact content
+eth_tester:temporary:v1 followed by newline. The sweeper removes at most
+100 files per run, only old (>1h), regular, single-link, non-symlink files
+named eth-tester-stage-<32 lowercase hex>.part. It never recurses or
+touches backups, database directories, user files, young files, or raw
+research data. A missing marker fails closed. No production source yet
+emits this naming convention, so the sweep does not promise complete
+orphan cleanup.
+
+**Post-crash recovery:** storage.recovery.recover_abandoned_ingestion requires
+an independently verified workers_stopped=True, and requeues only a bounded
+batch of stale running ingestion jobs using its separate nonblocking
+advisory lease, SKIP LOCKED and transaction-local statement/lock timeouts.
+Default max 500, hard cap 5000. It never deletes archive rows or certifies
+an interrupted import. PostgreSQL WAL handles transactional rollback; A
+must retry the original immutable source SHA idempotently. Worker staleness
+alone is insufficient to claim safe shutdown of a remote writer.
+
+**Storage pressure:** storage_operational_preflight is read-only. It accepts
+explicit database size and cluster-WAL thresholds, without assuming that
+local disk free space equals the remote PostgreSQL server's free space.
+When actual remote database disk capacity is unavailable, it reports
+unknown, not ok. PostgreSQL WAL bytes are CLUSTER-wide, and permission to
+read pg_ls_waldir() may be absent. The pressure report is diagnostic only:
+it cannot authorize deletion of raw rows, or real orders.
+
+**Backups and acceptance:** existing backup_database checks checksum and
+pg_restore table-of-contents, not an actual restored-data comparison.
+Real restore to a NEW dedicated disposable DB, full content/hash
+comparison, power-loss injection, WAL pressure, least privilege,
+service restart, Windows/Linux runtime and 24h public-feed soak remain
+necessary for GO. tests/test_storage_round9.py models pure/fake-PG failures;
+tests/integration/test_storage_round9_pg.py uses only a fresh random
+eth_tester_b9_<UUID> disposable PostgreSQL test database, and has not yet
+been executed in this B environment. All data are paper-only and synthetic.

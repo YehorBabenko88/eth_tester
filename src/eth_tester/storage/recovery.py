@@ -1,33 +1,44 @@
-"""Conservative post-crash reconciliation; PostgreSQL WAL owns transaction recovery."""
+"""Conservative bounded post-crash reconciliation; PostgreSQL WAL owns rollback."""
 from . import check_ownership
 
 
-def recover_abandoned_ingestion(conn, *, workers_stopped=False, stale_minutes=180):
-    """Requeue stale work *only* after the workers are confirmed stopped.
+def recover_abandoned_ingestion(conn, *, workers_stopped=False, stale_minutes=180,
+                                max_jobs=500):
+    """Requeue only old owned jobs, after independent worker-stop confirmation.
 
-    Does not erase data or mark incomplete downloads complete. In-progress
-    transactions were already committed or rolled back by PostgreSQL WAL.
-    The next archive worker must use the same idempotent COPY transaction.
+    No archive/trade/candle/ML rows deleted or marked complete. A restarted
+    worker must reuse its transactionally idempotent COPY source SHA. This
+    routine cannot infer whether a remote process is still running: its caller
+    MUST verify worker quiescence before passing workers_stopped=True.
     """
-    if not workers_stopped:
+    if workers_stopped is not True:
         raise RuntimeError("Stop all ETH Tester ingestion workers before reconciliation")
-    if stale_minutes < 5:
-        raise ValueError("stale_minutes must be >= 5")
+    if (type(stale_minutes) is not int or stale_minutes < 5 or
+            type(max_jobs) is not int or not 1 <= max_jobs <= 5000):
+        raise ValueError("Recovery requires >=5 stale minutes and max 5000 jobs")
     check_ownership(conn)
+    conn.execute("SELECT set_config('lock_timeout',%s,true)", ("2500ms",))
+    conn.execute("SELECT set_config('statement_timeout',%s,true)", ("20000ms",))
     acquired = conn.execute(
-        "SELECT pg_try_advisory_xact_lock(hashtext(%s))",
+        "SELECT pg_try_advisory_xact_lock(hashtext(%s)) AS locked",
         ("eth_tester:storage:recover",),
     ).fetchone()
-    locked = next(iter(acquired.values())) if isinstance(acquired, dict) else acquired[0]
+    locked = next(iter(acquired.values())) if isinstance(acquired, dict) else (acquired[0] if acquired else False)
     if not locked:
         raise RuntimeError("Another storage recovery process is active")
     updated = conn.execute(
-        """UPDATE ingestion_job
+        """WITH old_jobs AS MATERIALIZED (
+               SELECT ctid FROM ingestion_job
+               WHERE state='running'
+                 AND updated_at < now() - (%s * interval '1 minute')
+               ORDER BY updated_at LIMIT %s FOR UPDATE SKIP LOCKED
+           )
+           UPDATE ingestion_job AS job
            SET state='pending',
-               error=concat_ws(' | ', nullif(error,''), 'interrupted; retry required'),
+               error=concat_ws(' | ', nullif(job.error,''), 'interrupted; retry required'),
                updated_at=now()
-           WHERE state='running'
-             AND updated_at < now() - (%s * interval '1 minute')""",
-        (stale_minutes,),
+           FROM old_jobs WHERE job.ctid=old_jobs.ctid""",
+        (stale_minutes, max_jobs),
     ).rowcount
-    return {"requeued": updated, "raw_rows_deleted": 0}
+    return {"requeued": updated, "raw_rows_deleted": 0,
+            "bounded": updated == max_jobs, "workers_stopped_required": True}
