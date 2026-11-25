@@ -35,6 +35,10 @@ def open_paper(settings,direction,observed_price,stop,take,reason):
         if conn.execute("SELECT 1 FROM paper_trades WHERE state='open'").fetchone():
             raise RuntimeError("One trade only")
         account=conn.execute("SELECT equity FROM paper_account WHERE id=1 FOR UPDATE").fetchone()
+        daily=conn.execute("""SELECT coalesce(sum(net_pnl),0) AS pnl FROM paper_trades
+          WHERE state='closed' AND closed_at>=date_trunc('day',now())""").fetchone()["pnl"]
+        if account and daily<0 and -daily>=account["equity"]*settings.max_daily_drawdown:
+            raise RuntimeError("Daily drawdown limit reached")
         sign=Decimal(1) if direction=="long" else Decimal(-1)
         fill=price*(1+sign*settings.slippage_bps/Decimal(10000))
         qty=settings.initial_notional_usd/fill
@@ -49,11 +53,11 @@ def open_paper(settings,direction,observed_price,stop,take,reason):
            json.dumps(reason),entry_fee,abs(fill-price)*qty)).fetchone()
         return row["id"]
 
-def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0)):
+def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),observed_at=None,expected_id=None):
     with connection(settings) as conn:
         conn.execute("SELECT pg_advisory_xact_lock(20991991)")
         trade=conn.execute("SELECT * FROM paper_trades WHERE state='open' FOR UPDATE").fetchone()
-        if not trade:
+        if not trade or (expected_id is not None and trade["id"]!=expected_id):
             return None
         sign=Decimal(1) if trade["direction"]=="long" else Decimal(-1)
         price=Decimal(str(observed_price))
@@ -62,10 +66,10 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0))
         exit_fee=trade["qty"]*fill*settings.taker_fee_rate
         funding=Decimal(str(funding_paid))
         net=gross-trade["fee_paid"]-exit_fee-funding
-        conn.execute("""UPDATE paper_trades SET state='closed',closed_at=now(),exit=%s,
+        conn.execute("""UPDATE paper_trades SET state='closed',closed_at=coalesce(%s,now()),exit=%s,
           fee_paid=fee_paid+%s,slippage_paid=slippage_paid+%s,funding_paid=%s,
           gross_pnl=%s,net_pnl=%s,exit_reason=%s WHERE id=%s""",
-          (fill,exit_fee,abs(fill-price)*trade["qty"],funding,gross,net,reason,trade["id"]))
+          (observed_at,fill,exit_fee,abs(fill-price)*trade["qty"],funding,gross,net,reason,trade["id"]))
         conn.execute("""UPDATE paper_account SET equity=equity+%s,
           realized_pnl=realized_pnl+%s WHERE id=1""",(net,net))
         return trade["id"]
