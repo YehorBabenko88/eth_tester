@@ -8,7 +8,7 @@ from decimal import Decimal as D
 import pytest
 
 from test_simulation_execution import BASE
-from eth_tester.strategies import Parameters
+from eth_tester.strategies import Parameters, strategy_identity
 from eth_tester.simulation.identity import require_new_strategy_identity
 
 
@@ -57,12 +57,13 @@ def test_open_uses_actual_event_timestamp_and_version(monkeypatch):
         taker_fee_rate=D('0.00055'), slippage_bps=D(2),
         max_daily_drawdown=D('0.03'), risk_fraction=D('0.01'))
     trade_id = p.open_paper(settings, 'long', 100, 98, 105,
-                            {'strategy_version': Parameters().version,
+                            {'strategy_version': strategy_identity(),
+                             'rules_version': Parameters().version,
                              **Parameters().identity()}, observed_at=BASE)
     assert trade_id == 11
     insert = [params for sql, params in calls if 'INSERT INTO paper_trades' in sql][0]
     assert insert[2] == BASE and insert[3] == BASE
-    assert insert[-1] == 'eth_rules_v2'
+    assert insert[-1] == strategy_identity()
     assert any('INSERT INTO paper_order_events' in sql for sql, _ in calls)
     assert any('UPDATE paper_position_state' in sql for sql, _ in calls)
 
@@ -82,8 +83,26 @@ def test_new_entry_requires_full_parameter_hash(monkeypatch):
         slippage_bps=D(2))
     with pytest.raises(ValueError, match='identity'):
         paper.open_paper(settings,'long',100,98,105,{'qa': True},observed_at=BASE)
-    valid={'strategy_version':Parameters().version,**Parameters().identity()}
+    valid={'strategy_version':strategy_identity(),
+           'rules_version':Parameters().version,**Parameters().identity()}
     with pytest.raises(ValueError, match='identity'):
         paper.open_paper(settings,'long',100,98,105,
                          {**valid,'parameter_sha256':'0'*64},observed_at=BASE)
     assert require_new_strategy_identity(valid)==valid
+
+
+def test_new_paper_rejects_rule_mismatch_and_preserves_d_identity(monkeypatch):
+    p = paper_stub(monkeypatch)
+    settings = types.SimpleNamespace(symbol='ETHUSDT', initial_notional_usd=D(1000),
+        taker_fee_rate=D('0.00055'), slippage_bps=D(2))
+    reason = {'strategy_version': strategy_identity(),
+              'rules_version': Parameters().version, **Parameters().identity()}
+    assert require_new_strategy_identity(reason)['strategy_version'] == strategy_identity()
+    for corrupted in (
+        {**reason, 'strategy_version': Parameters().version},
+        {**reason, 'strategy_version': 'eth_rules_v2:' + '0'*12},
+        {**reason, 'rules_version': 'eth_rules_v2'},
+        {**reason, 'parameters': {**reason['parameters'], 'max_distance': '0.999'}},
+    ):
+        with pytest.raises(ValueError, match='identity'):
+            p.open_paper(settings,'long',100,98,105,corrupted,observed_at=BASE)

@@ -8,7 +8,8 @@ from .paper import open_paper,close_paper
 from .strategy import price_signal
 from .orderflow import confirm_rejection
 from .simulation.crossing import resolve_first_crossing
-from .simulation.identity import rule_identity, require_new_strategy_identity
+from .simulation.identity import (bind_snapshot_reference, require_new_strategy_identity,
+                                  rule_identity)
 
 def estimated_funding(conn,settings,opened,observed,qty,entry,direction,*,with_events=False):
     """Never synthesize funding from entry price: require event-time mark evidence.
@@ -97,17 +98,43 @@ def engine_tick(settings):
                 return "already_evaluated"
             signal=price_signal(bars,settings.taker_fee_rate,settings.slippage_bps)
             invalid_identity=False
+            invalid_snapshot=False
+            decision_at=None
             if signal:
                 try:
                     require_new_strategy_identity(signal.reason)
-                    flow_ok,flow=confirm_rejection(conn,settings,signal,bars[-1])
                 except ValueError:
                     invalid_identity=True
                     flow_ok,flow=False,{"reason":"invalid_strategy_identity","admissible":False}
+                else:
+                    flow_ok,flow=confirm_rejection(conn,settings,signal,bars[-1],
+                                                   observed_at=now)
                 signal.reason['orderflow']=flow
+                if flow_ok:
+                    # Actual DB decision clock, never backdate to a public trade.
+                    decision_at=conn.execute(
+                        "SELECT clock_timestamp() AS ts").fetchone()["ts"]
+                    try:
+                        bound=bind_snapshot_reference(
+                            signal.reason,decision_at=decision_at,bar_ts=last)
+                        # Market print timestamp is price evidence, NOT decision time.
+                        bound['market_trade_ts']=recent['ts'].isoformat()
+                        if recent['ts']>decision_at:
+                            raise ValueError('future trade print')
+                        signal.reason.update(bound)
+                    except (ValueError,TypeError,KeyError,AttributeError):
+                        invalid_snapshot=True
+                        flow_ok=False
             else:
                 flow_ok,flow=False,{}
             payload=dict(signal.reason) if signal else {}
+            if signal is None:
+                payload.update({
+                    "strategy_version":engine_version,
+                    "rules_version":engine_metadata["parameters"]["version"],
+                    "parameters":engine_metadata["parameters"],
+                    "parameter_sha256":engine_metadata["parameter_sha256"],
+                })
             payload.update({
                 "engine_identity":engine_version,
                 "engine_parameters":engine_metadata["parameters"],
@@ -115,6 +142,7 @@ def engine_tick(settings):
             })
             decision=("no_signal" if signal is None else
                       "rejected_strategy_identity" if invalid_identity else
+                      "rejected_snapshot_binding" if invalid_snapshot else
                       "candidate" if flow_ok else "rejected_orderflow")
             conn.execute("""INSERT INTO strategy_signals(symbol,tf,bar_ts,version,decision,reason)
               VALUES(%s,'1',%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING""",
@@ -123,6 +151,8 @@ def engine_tick(settings):
                 return "no_signal"
             if invalid_identity:
                 return "rejected_strategy_identity"
+            if invalid_snapshot:
+                return "rejected_snapshot_binding"
             if not flow_ok:
                 return "rejected_orderflow"
             if abs(Decimal(recent["price"])/Decimal(bars[-1]["close"])-1)>Decimal("0.005"):
@@ -142,7 +172,7 @@ def engine_tick(settings):
         return "closed_"+str(identifier)
     try:
         identifier=open_paper(settings,signal.direction,recent["price"],
-                              signal.stop,signal.take,signal.reason,observed_at=recent["ts"])
+                              signal.stop,signal.take,signal.reason,observed_at=decision_at)
         try:
             from .charts import render_trade
             render_trade(settings,identifier)

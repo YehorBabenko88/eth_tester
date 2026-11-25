@@ -6,7 +6,7 @@ from decimal import Decimal as D
 
 from test_simulation_execution import BASE
 from eth_tester.simulation.identity import rule_identity, require_new_strategy_identity
-from eth_tester.strategies import Parameters
+from eth_tester.strategies import Parameters, strategy_identity
 
 
 class Result:
@@ -64,17 +64,49 @@ def test_crossing_time_is_stop_first_under_ambiguous_trade_ids(monkeypatch):
     assert choice['ts'] == BASE
 
 
-def test_engine_rule_identity_hash_changes_with_parameters(monkeypatch):
-    import eth_tester.simulation.identity as identity
+def test_engine_rule_identity_hash_changes_with_parameters():
     version,meta=rule_identity()
     assert version==Parameters().version+':'+meta['parameter_sha256'][:12]
-    reason={'strategy_version':Parameters().version,**meta}
+    reason={'strategy_version':strategy_identity(),
+            'rules_version':Parameters().version,**meta}
     assert require_new_strategy_identity(reason)==reason
-    class ChangedParams:
-        version='eth_rules_v3'
-        def identity(self):
-            return {'parameters': {'version':'eth_rules_v3'},
-                    'parameter_sha256':'a'*64}
-    monkeypatch.setattr(identity,'Parameters',ChangedParams)
-    changed,_=identity.rule_identity()
-    assert changed=='eth_rules_v3:'+('a'*12) and changed!=version
+    changed=Parameters(version='eth_rules_v4')
+    assert changed.engine_identity()!=version
+    assert strategy_identity(changed)==changed.engine_identity()
+
+
+def test_no_signal_records_full_rules_identity(monkeypatch):
+    runner=load_runner(monkeypatch)
+    from datetime import datetime, timedelta, timezone
+    from eth_tester.strategies import Parameters
+    saved=[]
+    now=datetime.now(timezone.utc)
+    last=now.replace(second=0,microsecond=0)-timedelta(minutes=2)
+    bars=[{'ts':last-timedelta(minutes=34-i),'open':D(100),'high':D(101),
+           'low':D(99),'close':D(100),'volume':D(1)} for i in range(35)]
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self,*a): return None
+        def execute(self,sql,params=None):
+            if 'INSERT INTO strategy_signals' in sql: saved.append(params)
+            if 'feed_health' in sql: return Result({'status':'connected'})
+            if 'ORDER BY ts DESC,trade_id DESC LIMIT 1' in sql:
+                return Result({'ts':now-timedelta(seconds=1),'price':D(100)})
+            if "paper_trades WHERE state='open'" in sql: return Result(None)
+            if 'FROM bot_control' in sql: return Result({'enabled':True,'paused':False})
+            if 'FROM data_gaps' in sql: return Result(None)
+            if 'FROM candles' in sql: return Result(list(reversed(bars)))
+            if 'FROM strategy_signals' in sql: return Result(None)
+            return Result(None)
+    monkeypatch.setattr(runner,'connection',lambda *a:Conn())
+    assert runner.engine_tick(types.SimpleNamespace(symbol='ETHUSDT',
+        taker_fee_rate=D('.00055'),slippage_bps=D(2)))=='no_signal'
+    assert len(saved)==1
+    import json
+    payload=json.loads(saved[0][-1])
+    params=Parameters()
+    assert saved[0][2]==strategy_identity()
+    assert payload['strategy_version']==strategy_identity()
+    assert payload['rules_version']==params.version
+    assert payload['parameter_sha256']==params.identity()['parameter_sha256']
+    assert payload['parameters']==params.identity()['parameters']

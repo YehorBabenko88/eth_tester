@@ -4,6 +4,7 @@ Tests never contact exchanges or reuse a user's persistent database.
 """
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal as D
+import json
 import os
 from uuid import uuid4
 
@@ -16,7 +17,9 @@ from eth_tester.config import Settings
 from eth_tester.database import connection, init_database
 from eth_tester.paper import close_paper, open_paper
 from eth_tester.simulation.persistence import record_fill
-from eth_tester.strategies import Parameters
+from eth_tester.strategies import Parameters, strategy_identity
+from eth_tester.ml import FEATURE_NAMES
+from eth_tester.simulation.identity import bind_snapshot_reference
 
 
 pytestmark = pytest.mark.postgres
@@ -42,7 +45,8 @@ def simulated_pg():
 
 
 def verified_reason(**extra):
-    return {'strategy_version': Parameters().version,
+    return {'strategy_version': strategy_identity(),
+            'rules_version': Parameters().version,
             **Parameters().identity(), **extra}
 
 
@@ -64,7 +68,7 @@ def test_position_open_close_replay_and_cursor_version(simulated_pg):
         assert rows[0]['quality'] == 'trade_print_proxy_no_liquidity'
         info = conn.execute('SELECT strategy_version,execution_quality FROM paper_trades WHERE id=%s',
                             (first,)).fetchone()
-        assert info['strategy_version'] == 'eth_rules_v2'
+        assert info['strategy_version'] == strategy_identity()
         assert info['execution_quality'] == 'trade_print_proxy_no_liquidity'
     # Another simulated worker reconnects and must observe the persistent open state.
     with pytest.raises(RuntimeError):
@@ -162,3 +166,92 @@ def test_reject_unknown_new_strategy_but_close_legacy_open(simulated_pg):
         events=conn.execute("SELECT action FROM paper_order_events WHERE paper_trade_id=%s",(old,)).fetchall()
         assert state['paper_trade_id'] is None and state['version']==1
         assert [r['action'] for r in events]==['exit']
+
+
+def test_atomic_exact_snapshot_binding_and_no_future_label(simulated_pg):
+    """Disposable PG fixture proves E atomic identity, NOT market certification.
+
+    The synthetic canonical row below must never be interpreted as an A/B/C
+    production proof of completeness or executable quote liquidity.
+    """
+    bar=start_time().replace(second=0,microsecond=0)
+    end=bar+timedelta(minutes=1)
+    available=end+timedelta(seconds=10)
+    computed=end+timedelta(seconds=20)
+    decision=end+timedelta(seconds=40)
+    key,checksum='a'*64,'b'*64
+    evidence={'snapshot_key':key,'source_checksum':checksum,
+              'contract':'eth_feature_snapshot_v2',
+              'source_receipt_ms':int((end+timedelta(seconds=2)).timestamp()*1000),
+              'source_checked_at_ms':int((end+timedelta(seconds=3)).timestamp()*1000),
+              'available_at':available.isoformat(),
+              'computed_at':computed.isoformat()}
+    valid=verified_reason(
+        source='closed_candles',signal_bar_ts=bar.isoformat(),
+        orderflow={'admissible':True,'immutable_feature_snapshot':evidence})
+    valid['market_trade_ts']=(decision-timedelta(seconds=2)).isoformat()
+    bound=bind_snapshot_reference(valid,decision_at=decision,bar_ts=bar)
+    checked_ms=int((end+timedelta(seconds=3)).timestamp()*1000)
+    receipt_ms=int((end+timedelta(seconds=2)).timestamp()*1000)
+    feature_ms=int((end+timedelta(seconds=4)).timestamp()*1000)
+    source_ms=int(bar.timestamp()*1000)
+    proof={'source':'trades_archive','instrument':'linear','interval':'',
+           'checksum':checksum,'coverage_status':'verified',
+           'evidence_ref':'synthetic_disposable_pg_fixture',
+           'source_event_ms':source_ms,'source_checked_at_ms':checked_ms,
+           'source_receipt_ms':receipt_ms}
+    provenance={
+        'contract':'eth_feature_snapshot_v2',
+        'certified_by':'independent_source_proof',
+        'source_coverage_verified':True,'coverage_status':'verified',
+        'source_checked_at_ms':checked_ms,'source_receipt_ms':receipt_ms,
+        'feature_sources':{name:dict(proof) for name in FEATURE_NAMES},
+        'feature_available_ms':{name:feature_ms for name in FEATURE_NAMES},
+        'fixture_only':True,
+    }
+    with connection(simulated_pg) as conn:
+        conn.execute("""INSERT INTO feature_snapshots(
+          snapshot_key,symbol,tf,bar_ts,available_at,observed_at,computed_at,
+          source,source_checksum,quality,is_causal,values_json,provenance)
+          VALUES(%s,'ETHUSDT','1',%s,%s,%s,%s,'fixture_only',%s,
+                 'complete',true,'{}'::jsonb,%s::jsonb)""",
+          (key,bar,available,computed,computed,checksum,json.dumps(provenance)))
+    first=open_paper(simulated_pg,'long',100,98,105,bound,observed_at=decision)
+    with connection(simulated_pg) as conn:
+        trade=conn.execute("""SELECT signal_ts,reason FROM paper_trades
+          WHERE id=%s""",(first,)).fetchone()
+        state=conn.execute("SELECT paper_trade_id,version FROM paper_position_state").fetchone()
+        assert trade['signal_ts']==decision
+        assert trade['reason']['ml_snapshot_key']==key
+        assert trade['reason']['ml_source_checksum']==checksum
+        assert trade['reason']['ml_signal_decision_ms']==int(decision.timestamp()*1000)
+        assert trade['reason']['market_trade_ts']==valid['market_trade_ts']
+        assert 'ml_label' not in trade['reason']
+        assert state['paper_trade_id']==first and state['version']==1
+    assert close_paper(simulated_pg,105,'take',observed_at=decision+timedelta(seconds=1),
+                       expected_id=first)==first
+
+
+def test_missing_snapshot_rolls_back_without_paper_entry(simulated_pg):
+    bar=start_time().replace(second=0,microsecond=0)
+    end=bar+timedelta(minutes=1)
+    available=end+timedelta(seconds=10)
+    computed=end+timedelta(seconds=20)
+    decision=end+timedelta(seconds=40)
+    evidence={'snapshot_key':'a'*64,'source_checksum':'b'*64,
+              'contract':'eth_feature_snapshot_v2',
+              'source_receipt_ms':int((end+timedelta(seconds=2)).timestamp()*1000),
+              'source_checked_at_ms':int((end+timedelta(seconds=3)).timestamp()*1000),
+              'available_at':available.isoformat(),
+              'computed_at':computed.isoformat()}
+    reason=verified_reason(
+        source='closed_candles',signal_bar_ts=bar.isoformat(),
+        orderflow={'admissible':True,'immutable_feature_snapshot':evidence})
+    bound=bind_snapshot_reference(reason,decision_at=decision,bar_ts=bar)
+    with pytest.raises(ValueError,match='missing'):
+        open_paper(simulated_pg,'long',100,98,105,bound,observed_at=decision)
+    with connection(simulated_pg) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM paper_trades").fetchone()['n']==0
+        assert conn.execute("SELECT count(*) AS n FROM paper_order_events").fetchone()['n']==0
+        state=conn.execute("SELECT paper_trade_id,version FROM paper_position_state").fetchone()
+        assert state['paper_trade_id'] is None and state['version']==0

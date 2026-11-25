@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 from .simulation.execution import number, utc
-from .simulation.identity import require_new_strategy_identity
+from .simulation.identity import (bind_snapshot_reference,
+                                  require_new_strategy_identity,
+                                  verify_persisted_snapshot)
 from .simulation.persistence import (advance_state, lock_state, mark_funding_event,
                                      observation_time, record_fill, validate_transition)
 import json
@@ -42,12 +44,40 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
                                            settings.taker_fee_rate,settings.slippage_bps):
         raise ValueError("Expected take does not cover costs")
     context=require_new_strategy_identity(reason)
+    # Real strategy candidates require a certified, original-decision snapshot.
+    # Direct QA/manual paper fixtures without a D signal remain visibly
+    # unverified and are never ML-training eligible.
+    live_candidate=(context.get("source") in ("closed_candles", "verified_tick_volume")
+                    or "orderflow" in context)
+    if live_candidate:
+        stamp=context.get("signal_bar_ts")
+        try:
+            bar_ts=utc(datetime.fromisoformat(stamp))
+        except (ValueError,TypeError) as exc:
+            raise ValueError("Missing canonical signal bar timestamp") from exc
+        context=bind_snapshot_reference(context,decision_at=event_at,bar_ts=bar_ts)
+    elif any(k in context for k in ("ml_snapshot_key","ml_source_checksum",
+                                    "ml_label","ml_outcome")):
+        raise ValueError("Unverified direct paper snapshot/label injection")
+    market_ts=context.get("market_trade_ts")
+    if market_ts is not None:
+        try:
+            market_event_at=utc(datetime.fromisoformat(market_ts))
+        except (ValueError,TypeError) as exc:
+            raise ValueError("Invalid trade print timestamp") from exc
+        if market_event_at>event_at:
+            raise ValueError("Future trade print cannot price a paper entry")
     context['execution_quality']='trade_print_proxy_no_executable_book_proof'
     strategy_version=context['strategy_version']
     with connection(settings) as conn:
         conn.execute("SELECT pg_advisory_xact_lock(20991991)")
         position_state=lock_state(conn)
         validate_transition(position_state,trade_id=None,at=event_at,action='open')
+        if live_candidate:
+            # Lock/check the exact B snapshot inside the SAME transaction as
+            # paper_trades, settlement ledger, account and durable cursor.
+            verify_persisted_snapshot(conn,symbol=settings.symbol,
+                                      reason=context,decision_at=event_at)
         state=conn.execute("SELECT enabled,paused FROM bot_control WHERE singleton=true").fetchone()
         if not state or not state["enabled"] or state["paused"]:
             raise RuntimeError("Paused")
