@@ -3,11 +3,13 @@ import asyncio
 import json
 from .analytics import build_footprint,build_levels,enrich_features
 from .database import connection
+from .book_analysis import replay_orderbook
 
 async def analytics_worker(settings):
     cycle=0
     while True:
         try:
+            await asyncio.to_thread(replay_orderbook,settings)
             if cycle%5==0:
                 for tf in ("1","3","5","15","30","60","120","240","360","720","D","W","M"):
                     await asyncio.to_thread(build_levels,settings,tf)
