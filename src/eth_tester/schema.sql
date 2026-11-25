@@ -112,3 +112,39 @@ CREATE TABLE IF NOT EXISTS model_versions (
   params jsonb NOT NULL, train_from timestamptz, train_to timestamptz,
   validation jsonb, approved boolean NOT NULL DEFAULT false
 );
+
+CREATE TABLE IF NOT EXISTS backtest_runs (
+ id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ created_at timestamptz NOT NULL DEFAULT now(), symbol text NOT NULL,
+ strategy text NOT NULL, tf text NOT NULL, config jsonb NOT NULL,
+ data_start timestamptz, data_end timestamptz, completeness text NOT NULL,
+ trades bigint NOT NULL DEFAULT 0, pnl numeric NOT NULL DEFAULT 0,
+ stats jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE TABLE IF NOT EXISTS backtest_trades (
+ run_id bigint NOT NULL REFERENCES backtest_runs(id) ON DELETE CASCADE,
+ seq integer NOT NULL, opened_at timestamptz NOT NULL, closed_at timestamptz NOT NULL,
+ direction text NOT NULL, entry numeric NOT NULL, exit numeric NOT NULL,
+ stop numeric NOT NULL, take numeric NOT NULL, qty numeric NOT NULL,
+ gross_pnl numeric NOT NULL, fees numeric NOT NULL, funding numeric NOT NULL,
+ net_pnl numeric NOT NULL, outcome text NOT NULL, reason jsonb NOT NULL,
+ PRIMARY KEY(run_id,seq)
+);
+CREATE TABLE IF NOT EXISTS data_gaps (
+ id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ source text NOT NULL, symbol text NOT NULL, start_ts timestamptz NOT NULL,
+ end_ts timestamptz, detected_at timestamptz NOT NULL DEFAULT now(),
+ resolved_at timestamptz, explanation text NOT NULL
+);
+CREATE INDEX IF NOT EXISTS gaps_unresolved ON data_gaps(symbol,source)
+ WHERE resolved_at IS NULL;
+CREATE TABLE IF NOT EXISTS bot_heartbeat (
+ component text PRIMARY KEY, updated_at timestamptz NOT NULL DEFAULT now(),
+ status text NOT NULL, detail jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE TABLE IF NOT EXISTS strategy_signals (
+ symbol text NOT NULL, tf text NOT NULL, bar_ts timestamptz NOT NULL,
+ version text NOT NULL, decision text NOT NULL, reason jsonb NOT NULL,
+ created_at timestamptz NOT NULL DEFAULT now(),
+ PRIMARY KEY(symbol,tf,bar_ts,version)
+);
