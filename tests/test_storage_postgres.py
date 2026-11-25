@@ -109,6 +109,27 @@ def test_copy_replay_and_conflict_rejection(postgres_lab):
         ).fetchone()["n"] == 0
 
 
+def test_two_writers_conflicting_trade_identity(postgres_lab):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def insert_one(price):
+        try:
+            with connection(postgres_lab) as conn:
+                return copy_trades(conn, [sample_trade("RACE-001", price=price)])
+        except (ValueError, psycopg.Error):
+            return "rejected"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(insert_one, ("3050", "3060")))
+    assert sum(isinstance(x, dict) and x["inserted_rows"] == 1
+               for x in outcomes) == 1
+    assert outcomes.count("rejected") == 1
+    with connection(postgres_lab) as conn:
+        assert conn.execute(
+            "SELECT count(*) AS n FROM trades WHERE trade_id='RACE-001'"
+        ).fetchone()["n"] == 1
+
+
 def test_append_only_feature_snapshots(postgres_lab):
     timestamp = datetime(2026, 11, 20, tzinfo=timezone.utc)
     with connection(postgres_lab) as conn:
