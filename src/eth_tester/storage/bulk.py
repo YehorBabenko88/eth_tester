@@ -55,7 +55,11 @@ def merge_staged_trades(conn, stage_name="eth_stage"):
                 "SELECT symbol,ts,trade_id,price,qty,side,notional,source,raw "
                 "FROM (SELECT DISTINCT ON (symbol,trade_id) * FROM {} "
                 "ORDER BY symbol,trade_id,ts) AS unique_trades "
-                "ON CONFLICT(symbol,trade_id) DO NOTHING"
+                "ON CONFLICT(symbol,trade_id) DO UPDATE "
+                "SET source=eth_raise_trade_identity_conflict(EXCLUDED.symbol,EXCLUDED.trade_id) "
+                "WHERE ROW(trades.ts,trades.price,trades.qty,trades.side,trades.notional) "
+                "IS DISTINCT FROM "
+                "ROW(EXCLUDED.ts,EXCLUDED.price,EXCLUDED.qty,EXCLUDED.side,EXCLUDED.notional)"
             ).format(source)
         ).rowcount
     return {"input_rows": input_rows, "inserted_rows": inserted,
