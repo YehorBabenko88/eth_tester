@@ -1,8 +1,8 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 from .simulation.execution import number, utc
-from .simulation.persistence import (advance_state, lock_state, observation_time,
-                                     record_fill, validate_transition)
+from .simulation.persistence import (advance_state, lock_state, mark_funding_event,
+                                     observation_time, record_fill, validate_transition)
 import json
 from .database import connection
 
@@ -83,7 +83,7 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
         advance_state(conn,position_state,trade_id=trade_id,at=event_at,action='open')
         return trade_id
 
-def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),observed_at=None,expected_id=None):
+def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),observed_at=None,expected_id=None,*,funding_evidence=None):
     price=number(observed_price)
     funding=number(funding_paid)
     if price<=0:
@@ -104,6 +104,14 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
             raise ValueError('Nonpositive exit fill')
         gross=sign*trade["qty"]*(fill-trade["entry"])
         exit_fee=trade["qty"]*fill*settings.taker_fee_rate
+        verified_sum=Decimal(0)
+        evidence=list(funding_evidence or ())
+        for event in evidence:
+            verified_sum+=sign*number(trade['qty'])*number(event['mark_price'])*number(event['rate'])
+        if evidence and verified_sum!=funding:
+            raise ValueError('Funding event breakdown does not match settlement')
+        if not evidence and funding!=0:
+            raise ValueError('Nonzero funding without event evidence')
         net=gross-trade["fee_paid"]-exit_fee-funding
         conn.execute("""UPDATE paper_trades SET state='closed',closed_at=%s,exit=%s,
           fee_paid=fee_paid+%s,slippage_paid=slippage_paid+%s,funding_paid=%s,
@@ -117,6 +125,13 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
                     slippage_cost=abs(fill-price)*trade['qty'],
                     quality='trade_print_proxy_no_liquidity',
                     provenance={'exit_reason':reason,'funding_quality':'unverified'})
+        for event in evidence:
+            mark_funding_event(conn,trade_id=trade['id'],funding_at=event['ts'],
+                               observed_at=observation_time(event['ts']),
+                               rate=event['rate'],mark_price=event['mark_price'],
+                               position_qty=trade['qty'],direction=trade['direction'],
+                               quality='mark_within_1s_completeness_unverified',
+                               provenance={'source':'market_ticker_events'})
         conn.execute("""UPDATE paper_account SET equity=equity+%s,
           realized_pnl=realized_pnl+%s WHERE id=1""",(net,net))
         advance_state(conn,position_state,trade_id=trade['id'],at=event_at,action='close')
