@@ -53,9 +53,11 @@ def ingest_ws(conn,symbol,payload):
                 raise DataIntegrityError("Invalid WebSocket trade price/quantity")
             saved = conn.execute("""INSERT INTO trades(symbol,ts,trade_id,price,qty,side,notional,source,raw)
              VALUES(%s,%s,%s,%s,%s,%s,%s,'websocket',%s::jsonb)
-             ON CONFLICT(symbol,trade_id) DO UPDATE SET price=EXCLUDED.price
+             ON CONFLICT(symbol,trade_id) DO UPDATE
+             SET price=EXCLUDED.price, source='websocket'
              WHERE trades.ts=EXCLUDED.ts AND trades.price=EXCLUDED.price
              AND trades.qty=EXCLUDED.qty AND trades.side=EXCLUDED.side
+             AND trades.notional=EXCLUDED.notional
              RETURNING trade_id""",
              (symbol,stamp_ms(row["T"]),row["i"],price,qty,side,price*qty,json.dumps(row))).fetchone()
             if saved is None:

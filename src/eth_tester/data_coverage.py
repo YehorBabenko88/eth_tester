@@ -31,8 +31,9 @@ def write_coverage(conn, *, source, symbol, interval, start_ms, end_exclusive_ms
     conn.execute(
         """INSERT INTO ingestion_coverage
            (source,symbol,instrument,interval,start_ts,end_ts,status,
-            observed_rows,expected_rows,checksum,quality,evidence)
-           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+            observed_rows,expected_rows,checksum,quality,evidence,checked_at)
+           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,
+                  clock_timestamp())
            ON CONFLICT(source,symbol,instrument,interval,start_ts,end_ts)
            DO UPDATE SET
              status=EXCLUDED.status,
@@ -41,7 +42,7 @@ def write_coverage(conn, *, source, symbol, interval, start_ms, end_exclusive_ms
              checksum=EXCLUDED.checksum,
              quality=EXCLUDED.quality,
              evidence=EXCLUDED.evidence,
-             checked_at=now()""",
+             checked_at=clock_timestamp()""",
         (source, symbol, instrument, interval, utc_millis(start_ms),
          utc_millis(end_exclusive_ms), status, observed_rows, expected_rows,
          checksum, quality, json.dumps(evidence or {}, sort_keys=True)),

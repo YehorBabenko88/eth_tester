@@ -193,3 +193,149 @@ def test_archive_evidence_certificate_observed_after_source(data_settings):
               AND archive_sha256=%s LIMIT 1""", ("c"*64,)).fetchone()
     assert row["evidence"]["observed_at"] == receipt.isoformat()
     assert row["checked_at"] == receipt
+
+def test_stage_volume_includes_identical_websocket_first_trade(data_settings):
+    """Archive COPY must count its own prints, not global trades.source."""
+    from eth_tester.archives import certify_archive_day
+
+    day = date(2026, 1, 3)
+    stamp = datetime.combine(day, datetime.min.time(), UTC) + timedelta(minutes=12)
+    when_ms = int(stamp.timestamp() * 1000)
+    with connection(data_settings) as conn:
+        conn.execute("""INSERT INTO candles(
+            symbol,kind,tf,ts,open,high,low,close,volume,turnover,source)
+            VALUES('ETHUSDT','trade','1',%s,100,100,100,100,0.5,50,'qa')""",
+            (stamp,))
+        ingest_ws(conn, "ETHUSDT", {"topic": "publicTrade.ETHUSDT",
+            "data": [{"i": "archive-ws-overlap", "T": when_ms, "p": "100",
+                      "v": "0.2", "S": "Buy"}]})
+        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        for trade_id, qty in (("archive-ws-overlap", Decimal("0.2")),
+                              ("archive-only-print", Decimal("0.3"))):
+            conn.execute("""INSERT INTO eth_stage(
+                symbol,ts,trade_id,price,qty,side,notional,source)
+                VALUES('ETHUSDT',%s,%s,100,%s,'Buy',%s,'archive')""",
+                (stamp, trade_id, qty, qty * 100))
+        merged = merge_staged_trades(conn, "eth_stage")
+        assert merged["input_rows"] == 2
+        report = certify_archive_day(
+            conn, data_settings, day, "e" * 64,
+            stage_name="eth_stage", row_count=2)
+        assert report["match"] == 1
+        assert report["status"] == "incomplete_candles"
+        assert report["certificate"]["archive_stage_captured"] is True
+        assert report["certificate"]["proves_all_trade_ids"] is False
+        overlap = conn.execute(
+            "SELECT source FROM trades WHERE trade_id='archive-ws-overlap'"
+        ).fetchone()
+        assert overlap["source"] == "websocket"
+        minute = conn.execute("""SELECT trade_count,trade_base_qty,
+            trade_quote_notional,status,evidence FROM trade_candle_volume_checks
+            WHERE symbol='ETHUSDT' AND archive_sha256=%s AND minute_ts=%s""",
+            ("e" * 64, stamp)).fetchone()
+        assert minute["trade_count"] == 2
+        assert minute["trade_base_qty"] == Decimal("0.5")
+        assert minute["trade_quote_notional"] == Decimal("50")
+        assert minute["status"] == "match"
+        assert minute["evidence"]["archive_stage_captured"] is True
+        coverage = conn.execute("""SELECT status,checksum,evidence
+            FROM ingestion_coverage WHERE source='trades_archive'
+            AND symbol='ETHUSDT' AND start_ts=%s""",
+            (datetime.combine(day, datetime.min.time(), UTC),)).fetchone()
+        assert coverage["status"] == "partial"
+        assert coverage["checksum"] == "e" * 64
+        assert coverage["evidence"]["source_receipt_ms"] > when_ms
+
+
+def test_archive_first_live_replay_marks_websocket_observation(data_settings):
+    """Live receipt must not be invisible to the paper engine after archive."""
+    stamp = datetime(2026, 1, 4, 0, 3, tzinfo=UTC)
+    when_ms = int(stamp.timestamp() * 1000)
+    with connection(data_settings) as conn:
+        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        conn.execute("""INSERT INTO eth_stage(
+            symbol,ts,trade_id,price,qty,side,notional,source)
+            VALUES('ETHUSDT',%s,'archive-before-live',100,0.5,
+                   'Buy',50,'archive')""", (stamp,))
+        merge_staged_trades(conn, "eth_stage")
+        ingest_ws(conn, "ETHUSDT", {"topic": "publicTrade.ETHUSDT",
+            "data": [{"i": "archive-before-live", "T": when_ms,
+                      "p": "100", "v": "0.5", "S": "Buy"}]})
+        found = conn.execute("""SELECT source,qty,notional FROM trades
+            WHERE trade_id='archive-before-live'""").fetchone()
+        assert found["source"] == "websocket"
+        assert found["qty"] == Decimal("0.5")
+        assert found["notional"] == Decimal("50")
+
+
+def test_stage_same_sha_replay_is_immutable(data_settings):
+    day = date(2026, 1, 5)
+    stamp = datetime.combine(day, datetime.min.time(), UTC)
+    with connection(data_settings) as conn:
+        conn.execute("""INSERT INTO candles(
+            symbol,kind,tf,ts,open,high,low,close,volume,turnover,source)
+            VALUES('ETHUSDT','trade','1',%s,100,100,100,100,1,100,'qa')""",
+            (stamp,))
+        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        conn.execute("""INSERT INTO eth_stage(
+            symbol,ts,trade_id,price,qty,side,notional,source)
+            VALUES('ETHUSDT',%s,'stable-archive-print',100,1,
+                   'Buy',100,'archive')""", (stamp,))
+        sha = "d" * 64
+        first = persist_minute_evidence(
+            conn, "ETHUSDT", day, sha, stage_name="eth_stage")
+        second = persist_minute_evidence(
+            conn, "ETHUSDT", day, sha, stage_name="eth_stage")
+        assert first["certificate"]["observed_at"] == (
+            second["certificate"]["observed_at"])
+        assert first["certificate"]["archive_minute_aggregate_sha256"] == (
+            second["certificate"]["archive_minute_aggregate_sha256"])
+        conn.execute("""UPDATE eth_stage SET qty=2,notional=200
+            WHERE trade_id='stable-archive-print'""")
+        with pytest.raises(DataIntegrityError, match="Conflicting immutable"):
+            with conn.transaction():
+                persist_minute_evidence(
+                    conn, "ETHUSDT", day, sha, stage_name="eth_stage")
+
+
+def test_archive_stage_conflict_does_not_publish_receipts(data_settings):
+    stamp = datetime(2026, 1, 6, tzinfo=UTC)
+    with connection(data_settings) as conn:
+        conn.execute("""INSERT INTO trades(
+            symbol,ts,trade_id,price,qty,side,notional,source)
+            VALUES('ETHUSDT',%s,'global-conflict',100,1,'Buy',100,
+                   'websocket')""", (stamp,))
+    with pytest.raises((ValueError, psycopg.Error)):
+        with connection(data_settings) as conn:
+            conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+            conn.execute("""INSERT INTO eth_stage(
+                symbol,ts,trade_id,price,qty,side,notional,source)
+                VALUES('ETHUSDT',%s,'global-conflict',100,2,'Buy',200,
+                       'archive')""", (stamp,))
+            merge_staged_trades(conn, "eth_stage")
+            persist_minute_evidence(
+                conn, "ETHUSDT", stamp.date(), "a" * 64,
+                stage_name="eth_stage")
+    with connection(data_settings) as conn:
+        assert conn.execute(
+            "SELECT count(*) AS n FROM trade_candle_volume_checks"
+        ).fetchone()["n"] == 0
+        original = conn.execute(
+            "SELECT qty FROM trades WHERE trade_id='global-conflict'"
+        ).fetchone()
+        assert original["qty"] == Decimal("1")
+
+
+def test_volume_match_cannot_auto_resolve_publictrade_gap(data_settings):
+    from eth_tester.archives import resolve_archived_gaps
+    stamp = datetime(2026, 1, 7, tzinfo=UTC)
+    with connection(data_settings) as conn:
+        conn.execute("""INSERT INTO data_gaps(
+            source,symbol,start_ts,end_ts,explanation)
+            VALUES('publicTrade','ETHUSDT',%s,%s,'missing WS event stream')""",
+            (stamp, stamp + timedelta(minutes=1)))
+    assert resolve_archived_gaps(data_settings) == 0
+    with connection(data_settings) as conn:
+        row = conn.execute("""SELECT resolved_at FROM data_gaps
+            WHERE source='publicTrade' AND symbol='ETHUSDT'""").fetchone()
+        assert row["resolved_at"] is None

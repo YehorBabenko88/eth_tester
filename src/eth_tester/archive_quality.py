@@ -79,7 +79,8 @@ def summarize_minutes(rows):
     return {"status": status, "minutes": 1440, **counts}
 
 
-def persist_minute_evidence(conn, symbol, day, archive_sha256, instrument="linear"):
+def persist_minute_evidence(conn, symbol, day, archive_sha256, instrument="linear",
+                            *, stage_name=None):
     if instrument != "linear" or symbol != "ETHUSDT":
         raise ValueError("Only linear ETHUSDT base/quote reconciliation is certified")
     if not isinstance(archive_sha256, str) or not re.fullmatch("[0-9a-f]{64}", archive_sha256):
@@ -91,12 +92,31 @@ def persist_minute_evidence(conn, symbol, day, archive_sha256, instrument="linea
            WHERE symbol=%s AND kind='trade' AND tf='1' AND closed=true
              AND ts >= %s AND ts < %s ORDER BY ts""",
         (symbol, start, end)).fetchall()
-    trades = conn.execute(
-        """SELECT date_trunc('minute',ts) AS ts, count(*) AS trade_count,
-                  sum(qty) AS base_qty, sum(notional) AS quote_qty
-           FROM trades WHERE symbol=%s AND source='archive'
-             AND ts >= %s AND ts < %s GROUP BY 1 ORDER BY 1""",
-        (symbol, start, end)).fetchall()
+    if stage_name is not None and stage_name != "eth_stage":
+        raise ValueError("Unapproved archive COPY staging table")
+    # Only the original, validated archive COPY stage contains every archive
+    # print. Global trades.source may say "websocket" for an identical trade.
+    # Preserve that live provenance; NEVER re-tag those global rows.
+    if stage_name == "eth_stage":
+        trades = conn.execute(
+            """SELECT date_trunc('minute',ts) AS ts, count(*) AS trade_count,
+                      sum(qty) AS base_qty, sum(notional) AS quote_qty
+               FROM (SELECT DISTINCT ON (symbol,trade_id)
+                            symbol,trade_id,ts,qty,notional
+                     FROM pg_temp.eth_stage
+                     WHERE symbol=%s AND ts >= %s AND ts < %s
+                     ORDER BY symbol,trade_id,ts) AS source_rows
+               GROUP BY 1 ORDER BY 1""",
+            (symbol, start, end)).fetchall()
+    else:
+        # Legacy diagnostic only; this is NOT evidence of the contents of a
+        # downloaded archive when WS/REST has already stored matching IDs.
+        trades = conn.execute(
+            """SELECT date_trunc('minute',ts) AS ts, count(*) AS trade_count,
+                      sum(qty) AS base_qty, sum(notional) AS quote_qty
+               FROM trades WHERE symbol=%s AND source='archive'
+                 AND ts >= %s AND ts < %s GROUP BY 1 ORDER BY 1""",
+            (symbol, start, end)).fetchall()
     comparisons = build_minute_evidence(day, candles, trades)
     receipt = conn.execute("SELECT clock_timestamp() AS observed_at").fetchone()["observed_at"]
     if receipt.tzinfo is None:
@@ -108,6 +128,11 @@ def persist_minute_evidence(conn, symbol, day, archive_sha256, instrument="linea
         "candle_source_sha256": digest_rows(candles),
         "archive_minute_aggregate_sha256": digest_rows(trades),
         "observed_at": observed_at, "not_available_before": observed_at,
+        "source_event_start_ms": int(start.timestamp() * 1000),
+        "source_event_end_exclusive_ms": int(end.timestamp() * 1000),
+        "source_receipt_ms": int(receipt.timestamp() * 1000),
+        "source_checked_at_ms": int(receipt.timestamp() * 1000),
+        "archive_stage_captured": stage_name == "eth_stage",
         "expected_closed_minutes": 1440,
         "observed_closed_minutes": len(candles),
         "matched_minutes": report["match"], "status": report["status"],
@@ -121,7 +146,9 @@ def persist_minute_evidence(conn, symbol, day, archive_sha256, instrument="linea
         "actual_quote_notional": str(sum((row["trade_quote_notional"]
                                            for row in comparisons), ZERO)),
         "proves_all_trade_ids": False, "allows_historical_backdating": False,
-        "method": "archive_only_unique_id_vs_closed_exchange_1m",
+        "method": ("sha_bound_archive_copy_stage_vs_closed_exchange_1m"
+                   if stage_name == "eth_stage"
+                   else "legacy_db_archive_source_diagnostic_only"),
         "base_epsilon": str(BASE_EPS), "quote_epsilon": str(QUOTE_EPS),
     }
     evidence = json.dumps(report["certificate"], sort_keys=True)
@@ -142,15 +169,48 @@ def persist_minute_evidence(conn, symbol, day, archive_sha256, instrument="linea
                 base_difference,quote_difference,status,evidence,checked_at)
                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
                ON CONFLICT(symbol,instrument,minute_ts,archive_source,archive_sha256)
-               DO UPDATE SET
-                 trade_count=EXCLUDED.trade_count,
-                 trade_base_qty=EXCLUDED.trade_base_qty,
-                 trade_quote_notional=EXCLUDED.trade_quote_notional,
-                 candle_base_volume=EXCLUDED.candle_base_volume,
-                 candle_quote_turnover=EXCLUDED.candle_quote_turnover,
-                 base_difference=EXCLUDED.base_difference,
-                 quote_difference=EXCLUDED.quote_difference,
-                 status=EXCLUDED.status,evidence=EXCLUDED.evidence,
-                 checked_at=EXCLUDED.checked_at""",
+               DO NOTHING""",
             statements)
+    # A receipt with the same archive SHA must not overwrite earlier evidence.
+    # Reject checksum reuse with conflicting source aggregates or official bars.
+    stored = conn.execute(
+        """SELECT minute_ts,trade_count,trade_base_qty,trade_quote_notional,
+                  candle_base_volume,candle_quote_turnover,status,evidence,
+                  checked_at
+           FROM trade_candle_volume_checks
+           WHERE symbol=%s AND instrument=%s AND archive_source='trades_archive'
+             AND archive_sha256=%s AND minute_ts >= %s AND minute_ts < %s
+           ORDER BY minute_ts""",
+        (symbol, instrument, archive_sha256, start, end)).fetchall()
+    if len(stored) != 1440:
+        raise DataIntegrityError("Archive evidence receipt has missing UTC minutes")
+    first_receipt = stored[0]["checked_at"]
+    if first_receipt.tzinfo is None or first_receipt < end:
+        raise DataIntegrityError("Archive evidence receipt precedes full UTC day")
+    fields = ("trade_count", "trade_base_qty", "trade_quote_notional",
+              "candle_base_volume", "candle_quote_turnover", "status")
+    for original, expected in zip(stored, comparisons):
+        previous = original["evidence"]
+        if isinstance(previous, str):
+            previous = json.loads(previous)
+        if (original["minute_ts"] != expected["minute_ts"]
+                or original["checked_at"] != first_receipt
+                or not isinstance(previous, dict)
+                or previous.get("archive_sha256") != archive_sha256
+                or previous.get("archive_stage_captured")
+                != (stage_name == "eth_stage")
+                or previous.get("candle_source_sha256")
+                != report["certificate"]["candle_source_sha256"]
+                or previous.get("archive_minute_aggregate_sha256")
+                != report["certificate"]["archive_minute_aggregate_sha256"]
+                or any(original[field] != expected[field] for field in fields)):
+            raise DataIntegrityError(
+                "Conflicting immutable minute evidence for archived source SHA")
+    # On an idempotent retry preserve the ORIGINAL DB receipt (not this call's
+    # clock), otherwise the evidence could be retrospectively re-timestamped.
+    pinned = first_receipt.astimezone(UTC)
+    report["certificate"]["observed_at"] = pinned.isoformat()
+    report["certificate"]["not_available_before"] = pinned.isoformat()
+    report["certificate"]["source_receipt_ms"] = int(pinned.timestamp() * 1000)
+    report["certificate"]["source_checked_at_ms"] = int(pinned.timestamp() * 1000)
     return report

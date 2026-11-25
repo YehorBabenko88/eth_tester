@@ -104,7 +104,7 @@ async def download_archive(settings,day,client):
                 if merged["input_rows"] != count:
                     raise DataIntegrityError("Archive COPY row count disagrees with stage")
             certify_archive_day(
-                conn, settings, day, checksum.hexdigest(),
+                conn, settings, day, checksum.hexdigest(), stage_name="eth_stage",
                 row_count=count, byte_count=size, url=url)
             conn.execute("""UPDATE ingestion_job SET state='complete',bytes_downloaded=%s,
               row_count=%s,sha256=%s,error=NULL,updated_at=now()
@@ -114,10 +114,13 @@ async def download_archive(settings,day,client):
 
 
 def certify_archive_day(conn, settings, day, checksum, *,
-                        row_count=None, byte_count=None, url=None):
+                        stage_name, row_count=None, byte_count=None, url=None):
     """Write time-honest aggregate evidence without claiming individual tick coverage."""
+    if stage_name != "eth_stage":
+        raise ValueError("Archive attestation requires verified COPY stage")
     report = persist_minute_evidence(
-        conn, settings.symbol, day, checksum, settings.category)
+        conn, settings.symbol, day, checksum, settings.category,
+        stage_name=stage_name)
     begin = datetime.combine(day, datetime.min.time(), timezone.utc)
     state = report["status"]
     write_coverage(
@@ -135,6 +138,14 @@ def certify_archive_day(conn, settings, day, checksum, *,
                  if state=="verified" else "archive_volume_"+state),
         evidence={"certificate": report["certificate"],
                   "compression_bytes": byte_count, "origin": url,
+                  "gzip_crc_read_to_eof": True,
+                  "trade_identity_guarded": True,
+                  "source_event_start_ms":
+                      report["certificate"]["source_event_start_ms"],
+                  "source_event_end_exclusive_ms":
+                      report["certificate"]["source_event_end_exclusive_ms"],
+                  "source_receipt_ms":
+                      report["certificate"]["source_receipt_ms"],
                   "can_certify_historical_asof": False},
         instrument=settings.category)
     return report
@@ -162,34 +173,14 @@ def reconcile_archive_day(conn, symbol, day):
 
 
 def resolve_archived_gaps(settings):
-    """Only close websocket gaps when every UTC archive day is volume-consistent."""
-    resolved = 0
-    with connection(settings) as conn:
-        gaps = conn.execute(
-            """SELECT id,start_ts,end_ts FROM data_gaps
-               WHERE source='publicTrade' AND symbol=%s
-                 AND end_ts IS NOT NULL AND resolved_at IS NULL""",
-            (settings.symbol,)).fetchall()
-        for gap in gaps:
-            start = gap["start_ts"].date()
-            end = gap["end_ts"].date()
-            total = (end - start).days + 1
-            jobs = conn.execute(
-                """SELECT day,sha256 FROM ingestion_job WHERE source='trades_archive'
-                   AND symbol=%s AND day BETWEEN %s AND %s AND state='complete'""",
-                (settings.symbol, start, end)).fetchall()
-            downloaded = {row["day"]: row["sha256"] for row in jobs}
-            if len(downloaded) != total:
-                continue
-            if all(certify_archive_day(
-                    conn, settings, start + timedelta(days=i),
-                    downloaded[start + timedelta(days=i)]
-                    )["status"] == "verified" for i in range(total)):
-                conn.execute(
-                    "UPDATE data_gaps SET resolved_at=now() WHERE id=%s", (gap["id"],))
-                resolved += 1
-    return resolved
+    """Fail closed: volume parity cannot prove every missing WS trade identity.
 
+    The complete gzip checksum and 1440 candle totals show consistency with
+    the downloaded archive, not authoritative exchange-wide print coverage.
+    Future independently attested identity recovery needs its own proof.
+    Do not mutate data_gaps.resolved_at merely from sum equality.
+    """
+    return 0
 
 async def backfill_archives(settings):
     start=settings.archive_start

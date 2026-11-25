@@ -6,6 +6,7 @@ Coverage receipts are validated against the actual time of observation.
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 
 UTC = timezone.utc
 
@@ -41,7 +42,9 @@ def certified_candle_coverage(conn, symbol, tf, start, end, decision_at,
         checked = _aware(row["checked_at"])
         if (lo > covered or row["status"] != "verified"
                 or row["quality"] != "exchange_closed_grid_checked"
-                or not row["checksum"] or checked > decision_at or checked < hi):
+                or not isinstance(row["checksum"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", row["checksum"])
+                or checked > decision_at or checked < hi):
             return None
         if hi <= covered:
             continue
@@ -63,6 +66,9 @@ def certified_candle_coverage(conn, symbol, tf, start, end, decision_at,
     if gap:
         return None
     observed_at = max(receipts)
+    event_start_ms = int(start.timestamp() * 1000)
+    event_end_ms = int(end.timestamp() * 1000)
+    receipt_ms = int(observed_at.timestamp() * 1000)
     source_sha256 = hashlib.sha256(
         json.dumps(digest_parts, separators=(",", ":")).encode("utf8")).hexdigest()
     return {
@@ -71,6 +77,15 @@ def certified_candle_coverage(conn, symbol, tf, start, end, decision_at,
         "source_sha256": source_sha256, "observed_at": observed_at.isoformat(),
         "available_at": max(observed_at, end).isoformat(),
         "source_receipt_count": len(digest_parts),
+        "source_event_start_ms": event_start_ms,
+        "source_event_end_exclusive_ms": event_end_ms,
+        "source_receipt_ms": receipt_ms,
+        "source_checked_at_ms": receipt_ms,
+        "feature_available_ms": receipt_ms,
+        "coverage_segments": [
+            {"start": lo, "end": hi, "checksum": checksum}
+            for lo, hi, checksum in digest_parts
+        ],
         "certifies_closed_candles_only": True,
         "certifies_trade_prints": False, "no_historical_backdating": True,
     }
