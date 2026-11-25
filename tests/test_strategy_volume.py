@@ -95,3 +95,32 @@ def test_profile_nodes_and_bad_prices():
     invalid[0] = dict(invalid[0], price="NaN")
     assert build_profile(invalid, START, END, D(1),
                          coverage_verified=True, expected_trade_count=3) is None
+
+def test_price_signal_can_consume_verified_profile_without_lookahead():
+    from eth_tester.strategy import price_signal
+
+    profile = build_profile(samples(), START, END, D(1),
+                            coverage_verified=True, expected_trade_count=3)
+    before = [candle(index, "100.1", "100.8", "100.5")
+              for index in range(-7, 1)]
+    afterwards = [candle(1, "100.1", "100.8", "100.5"),
+                  candle(2, "100.1", "100.9", "100.4"),
+                  candle(3, "100.1", "100.8", "100.5"),
+                  candle(4, "99.9", "100.6", "100.2", "100.1")]
+    bars = before + afterwards
+    without_profile = price_signal(bars)
+    assert without_profile is None
+    with_profile = price_signal(bars, volume_profiles=[profile])
+    assert with_profile is not None
+    assert with_profile.reason["strategy"] == "naked_poc_rejection"
+    assert price_signal(bars[:-1], volume_profiles=[profile]) is None
+
+
+def test_volume_signal_rejects_unobserved_time_holes():
+    profile = build_profile(samples(), START, END, D(1),
+                            coverage_verified=True, expected_trade_count=3)
+    bars = [candle(1, "100.1", "100.8", "100.5"),
+            candle(3, "100.1", "100.8", "100.5"),
+            candle(4, "99.9", "100.6", "100.2", "100.1"),
+            candle(5, "99.9", "100.6", "100.2", "100.1")]
+    assert volume_signal(bars, profile) is None
