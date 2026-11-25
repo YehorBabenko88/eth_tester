@@ -139,7 +139,7 @@ def rollup_day(settings, day, tf, digest):
                     (payload, settings.symbol, tf, stamp))
             # Historical corrections invalidate previously accumulated CVD.
             # Roll the checkpoint back to the last bucket before the change.
-            predecessor = conn.execute("""SELECT ts FROM features
+            predecessor = conn.execute("""SELECT ts,cvd FROM features
                 WHERE symbol=%s AND tf=%s AND ts<%s
                 ORDER BY ts DESC LIMIT 1""",
                 (settings.symbol, tf, affected[0])).fetchone()
@@ -148,7 +148,7 @@ def rollup_day(settings, day, tf, digest):
                 updated_at=now()
                 WHERE processor='cvd' AND symbol=%s AND tf=%s
                   AND cursor_ts>=%s""",
-                (predecessor["ts"] if predecessor else None,
+                (predecessor["ts"] if predecessor and predecessor["cvd"] is not None else None,
                  settings.symbol, tf, affected[0]))
         conn.execute("""INSERT INTO aggregation_job(symbol,tf,day,archive_sha256,rows)
             VALUES(%s,%s,%s,%s,%s)
