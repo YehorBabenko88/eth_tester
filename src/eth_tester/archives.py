@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 from shutil import disk_usage
 import httpx
+from psycopg.errors import UniqueViolation
 from .database import connection
 from .data_quality import DataIntegrityError, reconcile_minute_volume
 from .data_coverage import write_coverage
@@ -178,13 +179,30 @@ async def backfill_archives(settings):
                     state=await download_archive(settings,day,client)
                     break
                 except Exception as exc:
-                    if attempt==4:
+                    permanent = isinstance(
+                        exc, (DataIntegrityError, ValueError, UniqueViolation))
+                    if isinstance(exc, httpx.HTTPStatusError):
+                        permanent = exc.response.status_code in (400, 401, 403, 410)
+                    if permanent or attempt == 4:
+                        # Never retry deterministic identity conflicts or represent
+                        # their UTC day as a successfully imported archive.
+                        day_start = datetime.combine(day, datetime.min.time(), timezone.utc)
                         with connection(settings) as conn:
                             conn.execute("""UPDATE ingestion_job SET state='failed',error=%s,
                               updated_at=now() WHERE source='trades_archive' AND symbol=%s AND day=%s""",
-                              (str(exc)[:2000],settings.symbol,day))
+                              (str(exc)[:2000], settings.symbol, day))
+                            write_coverage(
+                                conn, source="trades_archive", symbol=settings.symbol,
+                                interval="", start_ms=int(day_start.timestamp()*1000),
+                                end_exclusive_ms=int(
+                                    (day_start+timedelta(days=1)).timestamp()*1000),
+                                status="gap", observed_rows=0, quality="archive_import_failed",
+                                evidence={"error": str(exc)[:1500],
+                                          "permanent": bool(permanent),
+                                          "attempts": attempt + 1},
+                                instrument=settings.category)
                         raise
-                    await asyncio.sleep(min(90,2**attempt*3))
+                    await asyncio.sleep(min(90, 2**attempt*3))
             print(f"{day} {state} {i+1}/{total} ({100*(i+1)/max(total,1):.1f}%)",flush=True)
             await asyncio.sleep(1/max(0.05,settings.archive_downloads_per_second))
     print('Resolved full-day archived tick gaps:',resolve_archived_gaps(settings),flush=True)
