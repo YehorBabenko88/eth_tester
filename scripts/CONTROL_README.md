@@ -142,3 +142,54 @@ receipt/candle/WS-gap/L2/OI lineage, separate historical and paper
 quality, reproducible PostgreSQL integration on PG17/18, native disposable
 Windows lifecycle, plus F/B's independently checked post-horizon worker.
 No live trading, no retrospective paper opens, no production GO.
+
+## Round 9: 24/7 owner-scoped paper laboratory — STATUS: NOT ACCEPTED
+
+Supervisor acquires a **nonblocking OS-held singleton lock** in the configured
+protected runtime path (`supervisor.instance.lock`). A dead PID file does
+not block recovery and a second supervisor cannot create duplicate workers.
+Only `engine` and `analyse` currently expose trustworthy continuous
+PostgreSQL heartbeats. Every **30 seconds** the watchdog checks those with the
+**PostgreSQL clock**. After **180 seconds** of child startup grace, **two**
+consecutive stale/missing heartbeats are needed before terminating **only**
+the owned child. Subsequent forced recovery is limited to **once per worker
+per 600 seconds**. A PostgreSQL outage is **indeterminate**: never kill
+workers, infer market completeness, or unpause paper trading. The existing
+per-child exponential restart/backoff handles actual exits. The public
+`live` source currently has no independent continuous process heartbeat;
+low trade volume is **not** proof of process hang. A must supply that contract
+before using source inactivity as an auto-restart trigger.
+
+The optional, uninstalled `install/eth-tester.service` is a non-root,
+systemd-sandboxed **example** for disposable Linux acceptance; it does not
+register a service. Windows remains a single owner-scoped LocalService
+startup task. Require native restart/reboot, ACL, network-drop, schema,
+least-privilege DB and owned-child shutdown acceptance before install.
+
+Telegram adds owner-only, private-chat `/trade ID` with detailed paper costs,
+`/signals`, `/models`, `/research`, `/risk`, `/health`,
+`/coverage`, `/maintenance`. Responses are bounded into pages instead
+of silently slicing at 3900 characters. The per-process burst guard is
+**not** durable or distributed. **Remote /delete remains disabled**.
+No automatic "daily report delivered" or "durable alert deduplicated" claim:
+B has NOT yet published a persistent authorized outbox/attempt-ack ledger.
+Until then these views are pull-only and Telegram outage does not
+mutate bot_control or alter paper decisions.
+
+**Important retention P0:** Existing B `cleanup_diagnostics` deletes
+`bot_events` older than 180 days, which may include E's
+`paper_trade_review_v1` replay/idempotency evidence. Therefore periodic
+`cleanup` is **OFF by default**. Even the opt-in flag
+`ETH_TESTER_SAFE_CLEANUP_APPROVED=1` MUST NOT be set until B independently
+preserves all research/provenance records while allowing bounded diagnostic
+cleanup; operator review is mandatory. B owns the purge SQL, schema and
+ownership ledger. G neither deletes raw ETHUSDT prints/candles/trades,
+nor truncates archived series or ML labels.
+
+Executed locally on a stub-only **isolated G copy**:
+`PYTHONPATH=src pytest -q tests/test_control_round9.py
+tests/test_control_round8.py tests/test_control_readiness_probe.py`
+→ **37 PASS** (round9 15; earlier G fixtures 22).
+`python -m compileall -q src tests` passed. NOT full repository,
+PG17/18, native Windows, real Telegram API, or real Bybit acceptance.
+No live orders were placed. **CODE / RUNTIME / ML NO_GO**.

@@ -23,6 +23,8 @@ MENU = (
     ("📥 Загрузка", "💾 Диск", "🖥 Система"),
     ("⚙️ Процессы", "🔌 WebSocket", "⚠️ Ошибки", "🕳 Пропуски"),
     ("📉 График", "🧱 Уровни", "❓ Помощь"),
+    ("🩺 Здоровье", "🛡 Риск", "📚 Модели", "🧪 Исследования"),
+    ("📡 Покрытие", "📌 Сигналы", "🧹 Обслуживание"),
 )
 ALIASES = {
     "▶️ Запуск": "startsim", "⏸ Пауза": "pause", "⏯ Продолжить": "resume",
@@ -31,11 +33,16 @@ ALIASES = {
     "🖥 Система": "system", "⚙️ Процессы": "processes", "🔌 WebSocket": "ws",
     "⚠️ Ошибки": "errors", "🕳 Пропуски": "gaps", "📉 График": "chart",
     "🧱 Уровни": "levels", "❓ Помощь": "help",
+    "🩺 Здоровье": "health", "🛡 Риск": "risk",
+    "📚 Модели": "models", "🧪 Исследования": "research",
+    "📡 Покрытие": "coverage", "📌 Сигналы": "signals",
+    "🧹 Обслуживание": "maintenance",
 }
 COMMANDS = (
     "start", "help", "startsim", "pause", "resume", "stop", "position",
     "history", "trade", "stats", "progress", "disk", "system", "processes",
     "ws", "errors", "gaps", "chart", "levels", "delete",
+    "health", "risk", "models", "research", "coverage", "signals", "maintenance",
 )
 
 
@@ -240,6 +247,12 @@ def _system():
 
 
 async def dispatch(settings, update, context, name):
+    from .telegram_views import allow_message, pages
+    chat = getattr(update, "effective_chat", None)
+    user = getattr(update, "effective_user", None)
+    if not allow_message((str(getattr(chat, "id", "")),
+                          str(getattr(user, "id", "")))):
+        return  # Per-process burst limit, including unauthenticated requests.
     if not authorise(settings, update):
         _audit(settings, update, name, False, "denied")
         return
@@ -257,7 +270,9 @@ async def dispatch(settings, update, context, name):
                 "/position /history /stats — позиция, сделки, расходы\n"
                 "/chart ID — график сделки\n"
                 "/progress /disk /system /processes /ws /errors /gaps /levels\n"
-                "/delete — отключено до согласования Storage #2"
+                "/trade ID — подробности конкретной бумажной сделки\n"
+                "/health /risk /signals /models /research /coverage /maintenance\n"
+                "/delete — удаление по Telegram отключено"
             )
         elif name in ("startsim", "pause", "resume", "stop"):
             answer = await asyncio.to_thread(_control, settings, name)
@@ -265,6 +280,17 @@ async def dispatch(settings, update, context, name):
             answer = "Удаление БД по Telegram заблокировано до согласования со Storage Guardian."
         elif name == "system":
             answer = await asyncio.to_thread(_system)
+        elif name == "trade":
+            args = context.args or []
+            if len(args) != 1 or not args[0].isdecimal() or not 0 < int(args[0]) < 2**63:
+                answer = "Укажите ID бумажной сделки: /trade 123"
+            else:
+                from .telegram_views import detail_trade
+                answer = await asyncio.to_thread(detail_trade, settings, int(args[0]))
+        elif name in ("health", "risk", "signals", "models", "research",
+                      "coverage", "maintenance"):
+            from .telegram_views import read_view
+            answer = await asyncio.to_thread(read_view, settings, name)
         elif name == "chart":
             args = context.args or []
             if not args or not args[0].isdigit() or int(args[0]) <= 0:
@@ -280,9 +306,11 @@ async def dispatch(settings, update, context, name):
                 return
         else:
             answer = await asyncio.to_thread(_read, settings, name)
-        await update.effective_message.reply_text(
-            answer[:3900], reply_markup=ReplyKeyboardMarkup(MENU, resize_keyboard=True)
-        )
+        for page_number, page in enumerate(pages(answer)):
+            await update.effective_message.reply_text(
+                page, reply_markup=(ReplyKeyboardMarkup(MENU, resize_keyboard=True)
+                                    if page_number == 0 else None)
+            )
         _audit(settings, update, name, True, "completed")
     except Exception:
         LOGGER.exception("Telegram command %s failed", name)

@@ -1,0 +1,32 @@
+# Example ONLY. Install on disposable Linux VM after independent approval.
+# Owner/service identity, venv and paths must be created by administrator.
+[Unit]
+Description=ETH Tester paper-only research supervisor (NO REAL ORDERS)
+After=network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=eth-tester
+Group=eth-tester
+WorkingDirectory=/opt/eth-tester
+EnvironmentFile=/etc/eth-tester/eth-tester.env
+Environment=ETH_TESTER_RUNTIME_DIR=/var/lib/eth-tester/runtime
+ExecStart=/opt/eth-tester/.venv/bin/python -m eth_tester.cli run
+Restart=always
+RestartSec=15s
+TimeoutStopSec=40s
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/eth-tester /var/log/eth-tester
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

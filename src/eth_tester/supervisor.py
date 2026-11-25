@@ -41,6 +41,7 @@ class Supervisor:
         self.path = Path(path) if path is not None else runtime_path()
         self.sleep = sleep
         self.children = {}
+        self.process_starts = {}
         self.status = {}
 
     def _argv(self, name):
@@ -122,6 +123,7 @@ class Supervisor:
                 kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if _is_windows() else {}
                 proc = await asyncio.create_subprocess_exec(*self._argv(name), **kwargs)
                 self.children[name] = proc
+                self.process_starts[name] = time.monotonic()
                 self._record(name, "running", pid=proc.pid)
                 while True:
                     try:
@@ -167,6 +169,7 @@ class Supervisor:
                 delay = min(delay * 2, 300)
             finally:
                 self.children.pop(name, None)
+                self.process_starts.pop(name, None)
 
     async def run(self, settings):
         # Storage B verifies ownership and migration hashes without DDL.
@@ -175,6 +178,11 @@ class Supervisor:
         LOGGER.info("Verified existing ETH Tester schema: %s", verification)
         specs = [(cmd, None) for cmd in PERMANENT]
         specs.extend(PERIODIC.items())
+        # Existing B retention still purges all bot_events, including E's
+        # durable paper_trade_review_v1 markers. NEVER enable it by default.
+        # Only an explicit owner opt-in after B protection is accepted.
+        if os.environ.get("ETH_TESTER_SAFE_CLEANUP_APPROVED", "") == "1":
+            specs.append(("cleanup", 86400))
         if settings.tg_bot_token and settings.tg_chat_id:
             if os.environ.get("ETH_TESTER_TG_USER_ID", "").strip().isdecimal():
                 specs.append(("telegram", None))
@@ -186,6 +194,9 @@ class Supervisor:
             for name, interval in specs
         ]
         watcher = asyncio.create_task(self._wait_shutdown(), name="supervisor_shutdown")
+        from .service_health import HealthWatchdog
+        watchdog = asyncio.create_task(HealthWatchdog().run(self, settings),
+                                       name="supervisor_health_watchdog")
         loop = asyncio.get_running_loop()
         registered = []
         stop = asyncio.Event()
@@ -198,17 +209,20 @@ class Supervisor:
         signal_watcher = asyncio.create_task(stop.wait())
         try:
             done, _ = await asyncio.wait(
-                [*tasks, watcher, signal_watcher], return_when=asyncio.FIRST_COMPLETED
+                [*tasks, watcher, watchdog, signal_watcher], return_when=asyncio.FIRST_COMPLETED
             )
             for task in done:
                 task.result()
         finally:
-            for task in (*tasks, watcher, signal_watcher):
+            for task in (*tasks, watcher, watchdog, signal_watcher):
                 task.cancel()
-            await asyncio.gather(*tasks, watcher, signal_watcher, return_exceptions=True)
+            await asyncio.gather(*tasks, watcher, watchdog, signal_watcher, return_exceptions=True)
             for sig in registered:
                 loop.remove_signal_handler(sig)
 
 
 async def supervise(settings):
-    await Supervisor().run(settings)
+    from .service_lease import service_lease
+    supervisor = Supervisor()
+    with service_lease(supervisor.path):
+        await supervisor.run(settings)
