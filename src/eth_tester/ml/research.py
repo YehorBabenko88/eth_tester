@@ -388,6 +388,7 @@ def historical_shadow_report(train, validation, shadow, model, *,
     if chosen["paired_delta_vs_observed_always"]["lower_p05"] <= 0:
         limitations.append("uncertain_net_improvement_after_costs")
     return {"version": RESEARCH_VERSION, "cohort": cohort,
+            "embargo_ms": embargo_ms,
             "fingerprint_sha256": evidence,
             "model_version": model.version,
             "observational_reference": "always_trade_among_already_executed_paper",

@@ -57,7 +57,7 @@ def from_trade_records(records, as_of_ms):
             examples.append(Example(event_id, decision, closed, values, available,
                                     outcome, gross, costs))
         except (KeyError, ValueError, TypeError, OverflowError, ZeroDivisionError) as exc:
-            key = str(exc)
+            key = "source_not_immutable" if isinstance(exc, KeyError) else "other"
             rejected[key] = rejected.get(key, 0) + 1
     return validate(examples, as_of_ms), rejected
 
@@ -95,6 +95,20 @@ def load_paper_examples(settings, as_of_ms, *, limit=100000):
                ORDER BY opened_at,id LIMIT %s""",
             (settings.symbol, as_of_ms, limit)).fetchall()
     return from_trade_records(rows, as_of_ms)
+
+
+def _rejection_category(exc):
+    """Finite, static source-quality diagnostics. Never expose source text/IDs."""
+    message = str(exc)
+    if "source certification" in message or "uncertified snapshot" in message:
+        return "not_independently_certified_historical_snapshot"
+    if "horizon" in message or "future" in message or "hindsight" in message:
+        return "late_or_backdated_horizon_source"
+    if "coverage" in message or "receipt" in message:
+        return "historical_receipt_not_independently_witnessed"
+    if "D/E snapshot identity" in message or "signal decision" in message:
+        return "source_not_immutable"
+    return "other"
 
 
 def from_snapshot_records(records, as_of_ms):
@@ -135,7 +149,7 @@ def from_snapshot_records(records, as_of_ms):
                 gross / nominal, (fee + funding) / nominal))
         except (KeyError, TypeError, ValueError, OverflowError,
                 ZeroDivisionError, AttributeError) as exc:
-            name = f"{type(exc).__name__}: {str(exc)[:100]}"
+            name = _rejection_category(exc)
             rejected[name] = rejected.get(name, 0) + 1
     return validate(accepted, as_of_ms), rejected
 
@@ -157,6 +171,9 @@ def load_causal_feature_examples(settings, as_of_ms, *, tf="1", limit=100000):
     cursor_ts = None
     cursor_id = None
     with connection(settings) as conn:
+        # Paging and limit+1 sentinel must share one stable database snapshot.
+        # Do not promote a mutable READ COMMITTED moving slice to full history.
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         present = conn.execute(
             "SELECT to_regclass('public.paper_ml_labels') IS NOT NULL AS installed"
         ).fetchone()
@@ -164,6 +181,7 @@ def load_causal_feature_examples(settings, as_of_ms, *, tf="1", limit=100000):
             return [], {"missing_post_horizon_label_ledger": 1}
         while examined < limit:
             batch = min(page_size, limit - examined)
+            last_page = examined + batch == limit
             rows = conn.execute(
                 """SELECT p.id AS paper_trade_id, p.reason,
                      p.signal_ts AS decision_at,p.opened_at,p.closed_at,
@@ -186,7 +204,10 @@ def load_causal_feature_examples(settings, as_of_ms, *, tf="1", limit=100000):
                           (p.signal_ts,p.id)<(%s::timestamptz,%s::bigint))
                    ORDER BY p.signal_ts DESC,p.id DESC LIMIT %s""",
                 (tf, settings.symbol, as_of_ms,
-                 cursor_ts, cursor_ts, cursor_id, batch)).fetchall()
+                 cursor_ts, cursor_ts, cursor_id, batch + int(last_page))).fetchall()
+            if last_page and len(rows) > batch:
+                rejected["scan_limit_reached"] = 1
+                rows = rows[:batch]
             if not rows:
                 break
             page, failures = from_snapshot_records(rows, as_of_ms)
@@ -197,8 +218,5 @@ def load_causal_feature_examples(settings, as_of_ms, *, tf="1", limit=100000):
             cursor_ts, cursor_id = rows[-1]["decision_at"], rows[-1]["paper_trade_id"]
             if len(rows) < batch:
                 break
-    if examined >= limit:
-        # Never claim a complete population scan when bounded page limit hit.
-        rejected["scan_limit_reached"] = 1
     return validate(accepted, as_of_ms), rejected
 

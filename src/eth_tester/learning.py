@@ -88,13 +88,14 @@ def train_causal_shadow(settings, as_of_ms, *, source="snapshots", tf="1",
     try:
         # Preflight all cohort timestamps, duplicates and finite values
         # BEFORE the expensive CPU optimizer is allowed to run.
-        from .ml.research import historical_shadow_report, verify_history_partition
+        from .ml.research import verify_history_partition
         verify_history_partition(train, validation, shadow,
                                  embargo_ms=max(60_000, embargo_ms))
         model = fit(train)
-        research = historical_shadow_report(
-            train, validation, shadow, model,
-            embargo_ms=max(60_000, embargo_ms))
+        candidate_id, metrics = store_shadow(
+            settings, model, train, validation, shadow,
+            eligible_count=len(rows), research_required=True,
+            research_embargo_ms=max(60_000, embargo_ms))
     except (ValueError, TypeError, OverflowError, ZeroDivisionError):
         # The source ledger remains intact and eligible. Missing classes,
         # future/out-of-order evidence and unstable estimates fail closed.
@@ -102,9 +103,6 @@ def train_causal_shadow(settings, as_of_ms, *, source="snapshots", tf="1",
                 "usable": len(rows), "required": min_rows,
                 "rejections": {"research_contract_invalid": 1},
                 "approved": False}
-    candidate_id, metrics = store_shadow(
-        settings, model, train, validation, shadow,
-        eligible_count=len(rows), research_report=research)
     return {"status": "shadow_registered", "candidate_id": candidate_id,
             "version": model.version, "metrics": metrics, "usable": len(rows),
             "rejections": rejected, "approved": False}

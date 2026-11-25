@@ -10,7 +10,8 @@ from . import evaluate, fit, rollback_required, should_retrain, validate
 
 
 def store_shadow(settings, model, train, validation, shadow, *,
-                 eligible_count=None, research_report=None):
+                 eligible_count=None, research_report=None,
+                 research_required=False, research_embargo_ms=60_000):
     """Persist an append-only candidate; no approval without independent evidence."""
     if not (train and validation and shadow):
         raise ValueError("three disjoint samples required")
@@ -41,6 +42,25 @@ def store_shadow(settings, model, train, validation, shadow, *,
     if eligible_count is not None:
         report["eligible_count"] = eligible_count
         report["source_contract"] = "eth_feature_snapshot_v2"
+    if research_required or research_report is not None:
+        # Validate values against the **supplied immutable cohorts**, not
+        # merely an arbitrary 64-hex caller string. This remains a research
+        # consistency check, not cryptographic proof of market authenticity.
+        from .research import historical_shadow_report
+        if research_report is None:
+            report_embargo = research_embargo_ms
+        else:
+            report_embargo = research_report.get("embargo_ms") if isinstance(research_report, dict) else None
+        if research_report is not None and (research_report.get("go") is not False or
+                                           research_report.get("promotion_eligible") is not False):
+            raise ValueError("invalid or promotable historical research report")
+        if type(report_embargo) is not int or report_embargo < 60_000 or report_embargo > 86_400_000:
+            raise ValueError("invalid historical research embargo")
+        expected = historical_shadow_report(
+            train, validation, shadow, model, embargo_ms=report_embargo)
+        if research_report is not None and research_report != expected:
+            raise ValueError("research metrics or fingerprint differ from immutable cohort")
+        research_report = expected
     if research_report is not None:
         # The final research verdict is deliberately NOT a promotion gate.
         # Match the exact training model and immutable historical-v2 cohort.
