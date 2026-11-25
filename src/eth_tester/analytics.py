@@ -5,6 +5,9 @@ from .database import connection
 
 TF_SECONDS={"1":60,"3":180,"5":300,"15":900,"30":1800,
  "60":3600,"120":7200,"240":14400,"360":21600,"720":43200,"D":86400}
+# A single live recomputation must never materialize an unbounded number of
+# distinct bucket/price/side groups in the Python worker.
+MAX_LIVE_FOOTPRINT_GROUPS = 8192
 
 def floor_time(ts,seconds):
     return datetime.fromtimestamp(int(ts.timestamp())//seconds*seconds,timezone.utc)
@@ -66,8 +69,14 @@ def build_footprint(settings, tf="1", hours=24):
     """
     if tf not in TF_SECONDS:
         raise ValueError("Live footprint supports the 11 fixed intervals; W/M use archive rollups")
+    if type(hours) is not int or not 1 <= hours <= 24:
+        raise ValueError("Live footprint hours must be an integer in 1..24")
     span = TF_SECONDS[tf]
     with connection(settings) as conn:
+        # Bound even the grouped SQL read. A timeout/overflow rolls back the
+        # whole transaction, never commits a truncated footprint or feature.
+        conn.execute("SET LOCAL lock_timeout = '2000ms'")
+        conn.execute("SET LOCAL statement_timeout = '10000ms'")
         # Database clock, not a host clock (Windows time jumps must not
         # manufacture future closed buckets).
         now = conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
@@ -86,8 +95,11 @@ def build_footprint(settings, tf="1", hours=24):
               AND NOT EXISTS (SELECT 1 FROM aggregation_job a
                 WHERE a.symbol=t.symbol AND a.tf=%s
                   AND a.day=(t.ts AT TIME ZONE 'UTC')::date)
-            GROUP BY 1,2,3 ORDER BY 1,2,3""",
-            (span, settings.symbol, start, now, tf)).fetchall()
+            GROUP BY 1,2,3 ORDER BY 1,2,3 LIMIT %s""",
+            (span, settings.symbol, start, now, tf,
+             MAX_LIVE_FOOTPRINT_GROUPS + 1)).fetchall()
+        if len(rows) > MAX_LIVE_FOOTPRINT_GROUPS:
+            raise RuntimeError("live_footprint_group_budget_exceeded")
         buckets = {}
         for row in rows:
             values = buckets.setdefault(row["bucket"], {}).setdefault(
@@ -146,7 +158,7 @@ def enrich_features(settings, tf="1", hours=24):
     from .book_analysis import snapshot_metrics
 
     with connection(settings) as conn:
-        rows = conn.execute("""SELECT ts,delta,volume FROM features
+        rows = conn.execute("""SELECT ts,delta,volume,quality FROM features
             WHERE symbol=%s AND tf=%s
               AND ts>=now()-(%s || ' hours')::interval ORDER BY ts""",
             (settings.symbol, tf, hours)).fetchall()
@@ -191,20 +203,56 @@ def enrich_features(settings, tf="1", hours=24):
                     book["bids"], book["asks"], observed_at=book["updated_at"],
                     as_of=as_of)
                 imbalance = metrics.get("imbalance")
-            archive = conn.execute("""SELECT state FROM ingestion_job WHERE
-                source='trades_archive' AND symbol=%s AND day=%s""",
-                (settings.symbol, ts.date())).fetchone()
+            # An archive job alone is NOT SHA membership, and equal volumes
+            # cannot prove all exchange trade IDs were captured. Require the
+            # exact B stage and C rollup SHA before describing *parity* only.
+            archive = conn.execute("""SELECT i.state,i.sha256,
+                EXISTS (SELECT 1 FROM archive_stage_receipts r
+                  WHERE r.symbol=i.symbol AND r.instrument=%s
+                    AND r.archive_day=i.day AND r.archive_sha256=i.sha256
+                    AND r.exchange_complete=false) AS stage_sha_present,
+                EXISTS (SELECT 1 FROM aggregation_job a
+                  WHERE a.symbol=i.symbol AND a.tf=%s
+                    AND a.day=i.day AND a.archive_sha256=i.sha256)
+                    AS rollup_sha_present
+                FROM ingestion_job i WHERE i.source='trades_archive'
+                  AND i.symbol=%s AND i.day=%s""",
+                (settings.category, tf, settings.symbol, ts.date())).fetchone()
+            sha_witness = bool(archive and archive["state"] == "complete"
+                               and archive["sha256"]
+                               and archive["stage_sha_present"]
+                               and archive["rollup_sha_present"])
             quality = "partial_unverified"
-            if archive and archive["state"] == "complete" and candle and (
-                    candle["volume"] is not None):
-                error = abs(Decimal(item["volume"]) - Decimal(candle["volume"]))
-                tolerance = max(Decimal("0.001"),
-                                Decimal(candle["volume"]) * Decimal("0.0005"))
-                quality = "verified_volume" if error <= tolerance else "volume_mismatch"
+            volume_check = "not_comparable"
+            if archive and archive["state"] == "complete" and not sha_witness:
+                volume_check = "archive_sha_membership_missing"
+            if (sha_witness and candle and candle["volume"] is not None
+                    and item["volume"] is not None):
+                observed, reference = (Decimal(item["volume"]),
+                                       Decimal(candle["volume"]))
+                if (observed.is_finite() and reference.is_finite()
+                        and observed >= 0 and reference >= 0):
+                    error = abs(observed - reference)
+                    tolerance = max(Decimal("0.001"),
+                                    reference * Decimal("0.0005"))
+                    if error <= tolerance:
+                        volume_check = "parity_only_not_trade_id_completeness"
+                        quality = ("archive_rollup_partial"
+                                   if item["quality"] == "archive_rollup_partial"
+                                   else "volume_parity_only_unverified")
+                    else:
+                        volume_check = "mismatch"
+                        quality = "volume_mismatch"
+                else:
+                    volume_check = "invalid_quantity"
+                    quality = "volume_mismatch"
             meta = json.dumps({"cvd_baseline": baseline,
                                "cvd_scope": "observed_trades_only",
                                "orderbook": "fresh_replayed_L2_only",
-                               "oi_availability": "exchange_timestamp_only"})
+                               "oi_availability": "exchange_timestamp_only",
+                               "volume_check": volume_check,
+                               "volume_sha_membership_present": sha_witness,
+                               "volume_exchange_complete": False})
             conn.execute("""UPDATE features SET cvd=%s,oi=%s,funding_rate=%s,
                 imbalance=%s,quality=%s,
                 metadata=features.metadata || %s::jsonb
