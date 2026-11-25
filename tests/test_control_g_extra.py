@@ -168,3 +168,13 @@ def test_websocket_recent_trade_counts_as_active(monkeypatch):
     assert "поток сделок активен" in control._read(
         SimpleNamespace(symbol="ETHUSDT"), "ws"
     )
+
+def test_auth_rejects_incomplete_telegram_update_without_exception(monkeypatch):
+    from eth_tester.telegram_control import authorise
+    monkeypatch.setenv("ETH_TESTER_TG_USER_ID", "42")
+    settings = SimpleNamespace(tg_chat_id="42")
+    assert not authorise(settings, SimpleNamespace(effective_chat=SimpleNamespace(
+        id=42, type="private")))
+    assert not authorise(settings, SimpleNamespace(effective_user=SimpleNamespace(
+        id=42, is_bot=False)))
+    assert not authorise(settings, SimpleNamespace())
