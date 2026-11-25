@@ -6,7 +6,7 @@ import random
 import websockets
 from .bybit import MarketClient
 from .database import connection
-from .history import collect_klines,collect_funding,collect_oi
+from .history import collect_klines,collect_funding,collect_oi,collect_account_ratios
 
 def stamp_ms(value):
     return datetime.fromtimestamp(int(value)/1000,timezone.utc)
@@ -118,6 +118,7 @@ async def live_rest_reconcile(settings):
                     await collect_klines(settings,client,"trade",tf)
                 await collect_funding(settings,client)
                 await collect_oi(settings,client,"5min")
+                await collect_account_ratios(settings,client,"5min")
             except Exception as exc:
                 with connection(settings) as conn:
                     conn.execute("""INSERT INTO feed_health(symbol,topic,status,detail)
