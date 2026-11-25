@@ -85,6 +85,20 @@ async def download_archive(settings,day,client):
               (size,count,checksum.hexdigest(),symbol,day))
     return "complete"
 
+def resolve_archived_gaps(settings):
+    resolved=0
+    with connection(settings) as conn:
+        gaps=conn.execute("SELECT id,start_ts,end_ts FROM data_gaps WHERE source='publicTrade' AND symbol=%s AND end_ts IS NOT NULL AND resolved_at IS NULL",(settings.symbol,)).fetchall()
+        for gap in gaps:
+            start=gap['start_ts'].date()
+            end=gap['end_ts'].date()
+            expected=(end-start).days+1
+            row=conn.execute("SELECT count(*) FILTER (WHERE state='complete') AS complete FROM ingestion_job WHERE source='trades_archive' AND symbol=%s AND day BETWEEN %s AND %s",(settings.symbol,start,end)).fetchone()
+            if row['complete']==expected:
+                conn.execute('UPDATE data_gaps SET resolved_at=now() WHERE id=%s',(gap['id'],))
+                resolved+=1
+    return resolved
+
 async def backfill_archives(settings):
     start=settings.archive_start
     end=datetime.now(timezone.utc).date()
@@ -108,3 +122,4 @@ async def backfill_archives(settings):
                     await asyncio.sleep(min(90,2**attempt*3))
             print(f"{day} {state} {i+1}/{total} ({100*(i+1)/max(total,1):.1f}%)",flush=True)
             await asyncio.sleep(1/max(0.05,settings.archive_downloads_per_second))
+    print('Resolved full-day archived tick gaps:',resolve_archived_gaps(settings),flush=True)
