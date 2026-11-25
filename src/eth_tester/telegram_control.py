@@ -41,7 +41,8 @@ COMMANDS = (
 
 def authorise(settings, update):
     """Fail closed: match chat ID, human user ID AND private chat."""
-    user, chat = update.effective_user, update.effective_chat
+    user = getattr(update, "effective_user", None)
+    chat = getattr(update, "effective_chat", None)
     owner = os.environ.get("ETH_TESTER_TG_USER_ID", "").strip()
     return bool(
         user and not user.is_bot and chat and chat.type == "private"
