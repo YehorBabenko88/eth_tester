@@ -4,8 +4,6 @@ Requires Storage migration 0002 (levels timestamps, level_events, analytics_curs
 The cursor and events are committed in the SAME transaction as the level rows.
 A closed candle confirms a pivot only after the right flank has closed.
 """
-from collections import deque
-from datetime import timedelta
 from decimal import Decimal
 import json
 
@@ -86,16 +84,17 @@ def _store_event(conn, symbol, tf, level, event, provenance):
 
 
 def process_levels(settings, tf="60", flank=2, *, batch=2000,
-                   tolerance=Decimal("0")):
+                   tolerance=Decimal("0"), max_batches=1):
     """Incrementally process closed bars without rescanning old history.
 
     The cursor records candle OPEN timestamps; every emitted event records the
     source candle's CLOSE time. A missing candle fails closed, no cursor advance.
     Concurrent workers on the same symbol/frame are serialized.
     """
-    if batch < 1:
-        raise ValueError("batch must be positive")
+    if batch < 1 or max_batches < 1:
+        raise ValueError("batch and max_batches must be positive")
     processed = 0
+    batches = 0
     while True:
         with connection(settings) as conn:
             conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
@@ -132,5 +131,6 @@ def process_levels(settings, tf="60", flank=2, *, batch=2000,
                     (settings.symbol, tf, previous,
                      json.dumps({"flank": flank, "tolerance": str(tolerance)})))
             processed += len(rows)
-        if len(rows) < batch:
+        batches += 1
+        if len(rows) < batch or batches >= max_batches:
             return processed
