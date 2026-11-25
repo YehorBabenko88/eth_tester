@@ -18,7 +18,9 @@ python -m eth_tester.cli run starts live, analyse, engine, periodic ingestion/ag
 and optionally telegram. Unexpected exits (including zero for permanent processes) restart
 with bounded 3–300 second backoff. Ctrl+C cancels workers and terminates owned PIDs,
 waiting 12 seconds before killing an unresponsive child. Existing bot_control state is never
-automatically changed. Status: ETH_TESTER_RUNTIME_DIR/supervisor.json (default ./runtime).
+automatically changed. Status: ETH_TESTER_RUNTIME_DIR/supervisor.json (default ./runtime on Linux;
+C:\ProgramData\ETHTester\runtime\supervisor.json on Windows). The verified Windows
+uninstaller requests graceful worker shutdown with runtime/shutdown.request.
 
 ## Windows
 Install dependencies in .venv and configure a protected .env plus required
