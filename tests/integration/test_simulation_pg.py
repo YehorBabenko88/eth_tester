@@ -128,6 +128,16 @@ def test_funding_mark_breakdown_is_atomic(simulated_pg):
     event = {'ts': stamp + timedelta(seconds=20), 'rate': D('0.001'),
              'mark_price': D(100)}
     amount = qty * D('0.1')
+    # R11: a caller may NOT invent a funding rate/mark. Store the exact
+    # disposable PostgreSQL market rows that the closing transaction will
+    # independently re-read. Nothing here contacts an exchange.
+    with connection(simulated_pg) as conn:
+        conn.execute("""INSERT INTO funding(symbol,ts,rate)
+           VALUES('ETHUSDT',%s,%s)""",(event['ts'],event['rate']))
+        conn.execute("""INSERT INTO market_ticker_events(
+           symbol,exchange_ts,event_type,mark_price,raw)
+           VALUES('ETHUSDT',%s,'snapshot',%s,'{}'::jsonb)""",
+           (event['ts'],event['mark_price']))
     with pytest.raises(ValueError, match='breakdown'):
         close_paper(simulated_pg, 105, 'take', funding_paid=amount + D(1),
                     observed_at=stamp + timedelta(seconds=30), expected_id=ident,
@@ -567,3 +577,187 @@ def test_round9_entry_costs_are_frozen_across_service_config_changes(simulated_p
         provenance=conn.execute("""SELECT provenance FROM paper_order_events
            WHERE paper_trade_id=%s AND action='exit'""",(ident,)).fetchone()["provenance"]
         assert provenance["fee_quality"]=="entry_time_cost_policy_pinned"
+
+
+def test_round11_forged_funding_rejected_with_atomic_no_exit(simulated_pg):
+    """Caller-provided event JSON must correspond to original DB sources."""
+    stamp=start_time()
+    ident=open_paper(simulated_pg,"long",D(100),D(98),D(105),
+                     verified_reason(),observed_at=stamp)
+    with connection(simulated_pg) as conn:
+        qty=conn.execute("SELECT qty FROM paper_trades WHERE id=%s",
+                         (ident,)).fetchone()["qty"]
+    imaginary={"ts":stamp+timedelta(seconds=20),
+               "rate":D(".002"),"mark_price":D("100")}
+    with pytest.raises(ValueError,match="original DB"):
+        close_paper(simulated_pg,D(105),"take",
+                    funding_paid=qty*D(".2"),
+                    observed_at=stamp+timedelta(seconds=25),
+                    expected_id=ident,funding_evidence=[imaginary])
+    with connection(simulated_pg) as conn:
+        assert conn.execute("SELECT state FROM paper_trades WHERE id=%s",
+                            (ident,)).fetchone()["state"]=="open"
+        assert conn.execute("SELECT count(*) AS n FROM paper_order_events"
+                           ).fetchone()["n"]==1
+        assert conn.execute("SELECT version FROM paper_position_state"
+                           ).fetchone()["version"]==1
+    # No funding coverage proof: close safely and label provisional.
+    assert close_paper(simulated_pg,D(105),"manual",
+                       funding_paid=D(0),
+                       observed_at=stamp+timedelta(seconds=25),
+                       expected_id=ident)==ident
+    with connection(simulated_pg) as conn:
+        trade=conn.execute("""SELECT funding_verified,net_pnl,state
+              FROM paper_trades WHERE id=%s""",(ident,)).fetchone()
+        assert trade["funding_verified"] is False and trade["state"]=="closed"
+        prov=conn.execute("""SELECT provenance FROM paper_order_events
+             WHERE paper_trade_id=%s AND action='exit'""",
+             (ident,)).fetchone()["provenance"]
+        assert prov["funding_schedule_complete"] is False
+        assert prov["funding_quality"]=="provisional_missing_funding_completeness"
+        assert prov["net_pnl_quality"]=="provisional_paper_only"
+
+
+def test_round11_canonical_funding_rate_mark_mismatch_fails_closed(simulated_pg):
+    stamp=start_time()
+    ident=open_paper(simulated_pg,"short",D(100),D(102),D(95),
+                     verified_reason(),observed_at=stamp)
+    rate_at=stamp+timedelta(seconds=5)
+    with connection(simulated_pg) as conn:
+        conn.execute("""INSERT INTO funding(symbol,ts,rate)
+             VALUES('ETHUSDT',%s,.001)""",(rate_at,))
+        conn.execute("""INSERT INTO market_ticker_events(
+             symbol,exchange_ts,event_type,mark_price,raw)
+             VALUES('ETHUSDT',%s,'snapshot',100,'{}'::jsonb)""",
+             (rate_at,))
+        qty=conn.execute("SELECT qty FROM paper_trades WHERE id=%s",
+                         (ident,)).fetchone()["qty"]
+    forged={"ts":rate_at,"rate":D(".002"),"mark_price":D("100")}
+    with pytest.raises(ValueError,match="original DB"):
+        close_paper(simulated_pg,D(99),"manual",funding_paid=-qty*D(".2"),
+                    observed_at=rate_at+timedelta(seconds=1),
+                    expected_id=ident,funding_evidence=[forged])
+    correct={"ts":rate_at,"rate":D(".001"),"mark_price":D("100")}
+    assert close_paper(simulated_pg,D(99),"manual",funding_paid=-qty*D(".1"),
+                    observed_at=rate_at+timedelta(seconds=1),
+                    expected_id=ident,funding_evidence=[correct])==ident
+    with connection(simulated_pg) as conn:
+        exit=conn.execute("""SELECT provenance FROM paper_order_events
+             WHERE paper_trade_id=%s AND action='exit'""",
+             (ident,)).fetchone()["provenance"]
+        assert exit["funding_source_db_rechecked"] is True
+        assert exit["funding_quality"]=="provisional_canonical_marks_schedule_unproven"
+        assert exit["funding_schedule_complete"] is False
+
+
+def test_round11_exit_source_gap_blocks_atomic_settlement(simulated_pg):
+    """A source writer may publish a disconnect/gap before E acquires fence."""
+    stamp=start_time()
+    ident=open_paper(simulated_pg,"long",D(100),D(98),D(105),
+                     verified_reason(),observed_at=stamp)
+    hit=stamp+timedelta(seconds=5)
+    with connection(simulated_pg) as conn:
+        conn.execute("""INSERT INTO feed_health(symbol,topic,status)
+              VALUES('ETHUSDT','connection','connected')""")
+        conn.execute("""INSERT INTO trades(
+              symbol,ts,trade_id,price,qty,side,notional,source)
+              VALUES('ETHUSDT',%s,'round11-exit-cross',96,1,'Sell',96,'websocket')""",
+              (hit,))
+        conn.execute("""INSERT INTO data_gaps(source,symbol,start_ts,end_ts,
+              explanation) VALUES('publicTrade','ETHUSDT',%s,%s,
+              'r11_between_first_read_and_exit_tx')""",
+              (stamp+timedelta(seconds=1),hit+timedelta(seconds=1)))
+    with pytest.raises(RuntimeError,match="paper_exit_source_gap"):
+        close_paper(simulated_pg,D(96),"stop",observed_at=hit,
+                    expected_id=ident,require_live_crossing=True)
+    with connection(simulated_pg) as conn:
+        assert conn.execute("SELECT state FROM paper_trades WHERE id=%s",
+                            (ident,)).fetchone()["state"]=="open"
+        assert conn.execute("SELECT version FROM paper_position_state"
+                           ).fetchone()["version"]==1
+        assert conn.execute("""SELECT count(*) AS n FROM paper_order_events
+            WHERE paper_trade_id=%s""",(ident,)).fetchone()["n"]==1
+        assert conn.execute("SELECT realized_pnl FROM paper_account WHERE id=1"
+                           ).fetchone()["realized_pnl"]==0
+
+
+def test_round11_exit_requires_first_persisted_crossing(simulated_pg):
+    stamp=start_time()
+    ident=open_paper(simulated_pg,"long",D(100),D(98),D(105),
+                     verified_reason(),observed_at=stamp)
+    first=stamp+timedelta(seconds=3)
+    with connection(simulated_pg) as conn:
+        conn.execute("""INSERT INTO feed_health(symbol,topic,status)
+                VALUES('ETHUSDT','connection','connected')""")
+        conn.execute("""INSERT INTO trades(
+              symbol,ts,trade_id,price,qty,side,notional,source)
+              VALUES('ETHUSDT',%s,'r11-first-stop',97,1,'Sell',97,'websocket')""",
+              (first,))
+        conn.execute("""INSERT INTO trades(
+              symbol,ts,trade_id,price,qty,side,notional,source)
+              VALUES('ETHUSDT',%s,'r11-late-take',108,1,'Buy',108,'websocket')""",
+              (first+timedelta(seconds=1),))
+    with pytest.raises(RuntimeError,match="crossing_source_changed"):
+        close_paper(simulated_pg,D(105),"take",
+                    observed_at=first+timedelta(seconds=1),
+                    expected_id=ident,require_live_crossing=True)
+    assert close_paper(simulated_pg,D(97),"stop",observed_at=first,
+                       expected_id=ident,require_live_crossing=True)==ident
+
+
+def test_round11_review_drawdown_cannot_see_later_closed_trade(simulated_pg):
+    from eth_tester.simulation.review import review_one_closed_trade
+    stamp=start_time()
+    first=open_paper(simulated_pg,"long",D(100),D(98),D(105),
+                     verified_reason(),observed_at=stamp)
+    close_paper(simulated_pg,D(105),"take",
+                observed_at=stamp+timedelta(seconds=2),expected_id=first)
+    second=open_paper(simulated_pg,"short",D(100),D(102),D(95),
+                      verified_reason(),observed_at=stamp+timedelta(seconds=3))
+    close_paper(simulated_pg,D(102),"stop",
+                observed_at=stamp+timedelta(seconds=4),expected_id=second)
+    assert review_one_closed_trade(simulated_pg)=="review_recorded"
+    with connection(simulated_pg) as conn:
+        review=conn.execute("""SELECT data FROM bot_events
+               WHERE event='paper_trade_review_v1'""").fetchone()["data"]
+        assert review["trade_id"]==first
+        assert D(review["max_realized_drawdown_fraction"])==0
+        assert review["realized_drawdown_asof"]==(
+            stamp+timedelta(seconds=2)).isoformat()
+        assert review["retention"]=="preserve"
+        assert review["net_pnl_certified"] is False
+
+
+def test_round11_source_fence_concurrent_gap_before_exit(simulated_pg):
+    """Two actual PG transactions, serialized by the exact A/E lock name."""
+    from concurrent.futures import ThreadPoolExecutor
+    stamp=start_time()
+    ident=open_paper(simulated_pg,"long",D(100),D(98),D(105),
+                     verified_reason(),observed_at=stamp)
+    hit=stamp+timedelta(seconds=4)
+    with connection(simulated_pg) as conn:
+        conn.execute("""INSERT INTO feed_health(symbol,topic,status)
+             VALUES('ETHUSDT','connection','connected')""")
+        conn.execute("""INSERT INTO trades(
+             symbol,ts,trade_id,price,qty,side,notional,source)
+             VALUES('ETHUSDT',%s,'r11-fenced-stop',96,1,'Sell',96,'websocket')""",
+             (hit,))
+    # E starts after source writer has acquired lock. When A commits its gap
+    # and unlocks, E MUST see it and refuse the already-selected crossing.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with connection(simulated_pg) as writer:
+            writer.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                           ("eth_paper_admission_source:ETHUSDT",))
+            waiting=pool.submit(close_paper,simulated_pg,D(96),"stop",D(0),
+                               hit,ident,require_live_crossing=True)
+            writer.execute("""INSERT INTO data_gaps(source,symbol,start_ts,
+              end_ts,explanation) VALUES('publicTrade','ETHUSDT',%s,%s,
+              'r11_concurrent_gap_under_source_fence')""",
+              (stamp+timedelta(seconds=1),hit+timedelta(seconds=1)))
+        with pytest.raises(RuntimeError,match="paper_exit_source_gap"):
+            waiting.result(timeout=15)
+    with connection(simulated_pg) as conn:
+        assert conn.execute("SELECT state FROM paper_trades WHERE id=%s",
+                            (ident,)).fetchone()["state"]=="open"
+        assert conn.execute("SELECT version FROM paper_position_state"
+                           ).fetchone()["version"]==1

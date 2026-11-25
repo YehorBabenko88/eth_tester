@@ -77,13 +77,17 @@ def review_one_closed_trade(settings):
         settled = conn.execute("""
             SELECT net_pnl FROM paper_trades
             WHERE state='closed' AND symbol=%s
+              AND (closed_at,id) <= (%s,%s)
             ORDER BY closed_at,id LIMIT 10001
-        """,(settings.symbol,)).fetchall()
+        """,(settings.symbol,trade["closed_at"],trade["id"])).fetchall()
         drawdown = closed_equity_drawdown(
             account["initial_equity"],[p["net_pnl"] for p in settled])
         report = {
             "trade_id": trade["id"], "symbol": trade["symbol"],
             "version": "observed_paper_review_v1",
+            "retention": "preserve",
+            "realized_drawdown_asof": trade["closed_at"].isoformat(),
+            "realized_drawdown_scope": "closed_trades_through_target_only",
             "strategy_version": trade["strategy_version"],
             "direction": trade["direction"],
             "opened_at": trade["opened_at"].isoformat(),
@@ -96,6 +100,9 @@ def review_one_closed_trade(settings):
             "gross_pnl": str(trade["gross_pnl"]),
             "fees": str(trade["fee_paid"]),
             "funding": str(trade["funding_paid"]),
+            "funding_verified": trade["funding_verified"] is True,
+            "net_pnl_certified": False,
+            "net_pnl_quality": "provisional_paper_funding_completeness_unproven",
             "mae_fraction": (str(excursion["mae_fraction"])
                              if excursion["mae_fraction"] is not None else None),
             "mfe_fraction": (str(excursion["mfe_fraction"])
@@ -114,6 +121,7 @@ def review_one_closed_trade(settings):
                  "slippage_cost": str(event["slippage_cost"])}
                 for event in fills],
             "entry_chart": trade["entry_chart"],
+            "funding_never_promoted_to_ml": True,
             "exit_chart": trade["exit_chart"],
             "charts_are_local_paths_not_immutable_file_evidence": True,
         }

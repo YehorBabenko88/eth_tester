@@ -5,7 +5,7 @@ from decimal import Decimal
 import json
 import logging
 from .database import connection
-from .paper import open_paper,close_paper
+from .paper import open_paper,close_paper,_canonical_funding_rows
 from .strategy import price_signal
 from .orderflow import confirm_rejection
 from .simulation.crossing import resolve_first_crossing
@@ -21,13 +21,7 @@ def estimated_funding(conn,settings,opened,observed,qty,entry,direction,*,with_e
     Historical funding chronology may still be incomplete: a returned 'marked'
     result is not proof all funding events were supplied.
     """
-    rows=conn.execute("""SELECT f.ts,f.rate,
-      (SELECT m.mark_price FROM market_ticker_events m
-         WHERE m.symbol=f.symbol AND m.exchange_ts<=f.ts
-         AND m.exchange_ts>=f.ts-interval '1 second'
-         AND m.mark_price>0 ORDER BY m.exchange_ts DESC LIMIT 1) AS mark_price
-      FROM funding f WHERE f.symbol=%s AND f.ts>%s AND f.ts<=%s
-      ORDER BY f.ts""",(settings.symbol,opened,observed)).fetchall()
+    rows=_canonical_funding_rows(conn,settings.symbol,opened,observed)
     if not rows or any(row["mark_price"] is None for row in rows):
         return (Decimal(0),"unverified",[]) if with_events else (Decimal(0),"unverified")
     sign=Decimal(1) if direction=="long" else Decimal(-1)
@@ -244,7 +238,8 @@ def engine_tick(settings):
                 return decision
     if trade:
         identifier=close_paper(settings,recent["price"],reason,funding,recent["ts"],
-                               trade["id"],funding_evidence=funding_evidence)
+                               trade["id"],funding_evidence=funding_evidence,
+                               require_live_crossing=True)
         if identifier:
             try:
                 from .charts import render_trade
@@ -289,6 +284,11 @@ async def run_engine(settings):
                 LOGGER.warning("Engine event DB unavailable; next cycle retries")
         try:
             with connection(settings) as conn:
+                # Persisted exposure, NOT a status-name heuristic. A position
+                # blocked on a data gap is still open and genuinely at risk.
+                exposed=conn.execute("""SELECT 1 FROM paper_trades
+                    WHERE state='open' AND symbol=%s LIMIT 1""",
+                    (settings.symbol,)).fetchone() is not None
                 old=conn.execute("""SELECT status FROM bot_heartbeat
                     WHERE component='paper_engine'""").fetchone()
                 previous=old["status"] if old else None
@@ -298,15 +298,17 @@ async def run_engine(settings):
                     status=EXCLUDED.status,detail=EXCLUDED.detail,
                     updated_at=clock_timestamp()""",
                     (state[:250],json.dumps({"paper_only":True,
-                     "open_position_risk":state=="waiting_live_feed_open_position",
+                     "open_position_risk":exposed,
                      "automatic_fake_exit":False})))
                 if (state!=previous and state in (
                         "waiting_live_feed_open_position",
-                        "blocked_unresolved_tick_gap")):
+                        "blocked_unresolved_tick_gap",
+                        "engine_error")):
                     conn.execute("""INSERT INTO bot_events(severity,event,data)
                       VALUES('warning','paper_source_risk',%s::jsonb)""",
                       (json.dumps({"status":state,"symbol":settings.symbol,
                                    "paper_only":True,
+                                   "open_position_risk":exposed,
                                    "source_completeness_claimed":False}),))
         except Exception:
             LOGGER.warning("Paper heartbeat DB unavailable; next cycle retries")

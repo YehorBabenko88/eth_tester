@@ -3,6 +3,7 @@ from contextlib import nullcontext
 from decimal import Decimal
 from .simulation.execution import number, utc
 from .simulation.operations import conservative_exit_proxy
+from .simulation.crossing import resolve_first_crossing
 from .simulation.live_evidence import (bind_live_paper_reference,
                                        verify_live_paper_row)
 from .simulation.identity import (bind_snapshot_reference,
@@ -170,7 +171,70 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
         advance_state(conn,position_state,trade_id=trade_id,at=event_at,action='open')
         return trade_id
 
-def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),observed_at=None,expected_id=None,*,funding_evidence=None):
+def _canonical_funding_rows(conn,symbol,opened,closed):
+    """Funding/mark join ALWAYS read inside the settlement's DB transaction.
+
+    An event-time mark is only a partial observation. No API here certifies
+    completeness of the exchange's funding schedule or historical provenance.
+    """
+    return conn.execute("""SELECT f.ts,f.rate,
+      (SELECT m.mark_price FROM market_ticker_events m
+       WHERE m.symbol=f.symbol AND m.exchange_ts<=f.ts
+         AND m.exchange_ts>=f.ts-interval '1 second'
+         AND m.mark_price>0 ORDER BY m.exchange_ts DESC,m.id DESC
+       LIMIT 1) AS mark_price
+      FROM funding f WHERE f.symbol=%s AND f.ts>%s AND f.ts<=%s
+      ORDER BY f.ts""",(symbol,opened,closed)).fetchall()
+
+
+def _require_live_exit_source(conn,trade,event_at,price,reason):
+    """Recheck stop/take in the SAME atomic transaction that posts paper PnL.
+
+    Global paper-state lock must be acquired first by the caller, then source
+    fence. A/C source writers must acquire this exact fence before source SQL.
+    Historical/missing trade prints are not executable stop confirmations.
+    """
+    symbol=trade["symbol"]
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                 (f"eth_paper_admission_source:{symbol}",))
+    now=conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
+    latest=conn.execute("""SELECT status FROM feed_health
+       WHERE symbol=%s AND topic='connection' AND ts<=%s
+       ORDER BY ts DESC LIMIT 1""",(symbol,now)).fetchone()
+    if not latest or latest["status"]!="connected":
+        raise RuntimeError("paper_exit_source_not_connected")
+    # A disconnect or any overlapping tick/L2 gap invalidates the entire
+    # simulated continuous path; a later reconnect must not rewrite it.
+    discontinuity=conn.execute("""SELECT 1 FROM feed_health
+       WHERE symbol=%s AND topic='connection' AND status='disconnected'
+         AND ts>=%s AND ts<=%s LIMIT 1""",
+       (symbol,trade["opened_at"],now)).fetchone()
+    if discontinuity:
+        raise RuntimeError("paper_exit_disconnected_since_open")
+    gap=conn.execute("""SELECT 1 FROM data_gaps
+       WHERE symbol=%s AND source IN ('publicTrade','orderbook')
+         AND start_ts<=%s AND (end_ts IS NULL OR end_ts>=%s)
+       LIMIT 1""",(symbol,now,trade["opened_at"])).fetchone()
+    if gap:
+        raise RuntimeError("paper_exit_source_gap")
+    stop,take=number(trade["stop"]),number(trade["take"])
+    low,high=min(stop,take),max(stop,take)
+    hit=conn.execute("""SELECT ts,
+      min(price) FILTER (WHERE price<=%s) AS low_cross,
+      max(price) FILTER (WHERE price>=%s) AS high_cross
+      FROM trades WHERE symbol=%s AND source='websocket'
+        AND ts>%s AND ts<=%s AND (price<=%s OR price>=%s)
+      GROUP BY ts ORDER BY ts LIMIT 1""",
+      (low,high,symbol,trade["opened_at"],event_at,low,high)).fetchone()
+    crossing=resolve_first_crossing(hit,trade["direction"],stop,take)
+    if (crossing is None or crossing["ts"]!=event_at
+            or crossing["price"]!=number(price)
+            or reason.split("_",1)[0]!=crossing["reason"]):
+        raise RuntimeError("paper_exit_crossing_source_changed")
+    return crossing
+
+
+def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),observed_at=None,expected_id=None,*,funding_evidence=None,require_live_crossing=False):
     price=number(observed_price)
     funding=number(funding_paid)
     if price<=0:
@@ -198,6 +262,8 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
         else:
             validate_transition(position_state,trade_id=trade['id'],
                                 at=event_at,action='close')
+        if require_live_crossing:
+            _require_live_exit_source(conn,trade,event_at,price,reason)
         sign=Decimal(1) if trade["direction"]=="long" else Decimal(-1)
         policy=(trade["reason"].get("paper_cost_policy")
                 if isinstance(trade["reason"],dict) else None)
@@ -234,20 +300,35 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
             raise ValueError('Nonpositive exit fill')
         gross=sign*trade["qty"]*(fill-trade["entry"])
         exit_fee=trade["qty"]*fill*fee_rate
-        verified_sum=Decimal(0)
+        # Caller funding JSON is NEVER an authority. Original DB event-time
+        # funding and mark rows must match every caller value in this very
+        # transaction. Even when matched, event schedule completeness is NOT
+        # proven: persisted monetary results remain explicitly provisional.
+        canonical=_canonical_funding_rows(
+            conn,trade["symbol"],trade["opened_at"],event_at)
         evidence=list(funding_evidence or ())
-        for event in evidence:
-            if not utc(trade['opened_at']) < utc(event['ts']) <= event_at:
-                raise ValueError('Funding event outside position lifetime')
-            verified_sum+=sign*number(trade['qty'])*number(event['mark_price'])*number(event['rate'])
+        if evidence and len(evidence)!=len(canonical):
+            raise ValueError('Funding evidence does not match original DB rows')
+        verified_sum=Decimal(0)
+        for event,row in zip(evidence,canonical):
+            if (row["mark_price"] is None or
+                    utc(event["ts"])!=utc(row["ts"]) or
+                    number(event["rate"])!=number(row["rate"]) or
+                    number(event["mark_price"])!=number(row["mark_price"])):
+                raise ValueError('Funding event not witnessed by original DB records')
+            verified_sum+=sign*number(trade["qty"])*number(row["mark_price"])*number(row["rate"])
         if evidence and verified_sum!=funding:
             raise ValueError('Funding event breakdown does not match settlement')
         if not evidence and funding!=0:
-            raise ValueError('Nonzero funding without event evidence')
+            raise ValueError('Nonzero funding without canonical event evidence')
+        funding_quality=("provisional_canonical_marks_schedule_unproven"
+                         if evidence else
+                         "provisional_missing_funding_completeness")
         net=gross-trade["fee_paid"]-exit_fee-funding
         conn.execute("""UPDATE paper_trades SET state='closed',closed_at=%s,exit=%s,
           fee_paid=fee_paid+%s,slippage_paid=slippage_paid+%s,funding_paid=%s,
-          gross_pnl=%s,net_pnl=%s,exit_reason=%s WHERE id=%s AND state='open'""",
+          gross_pnl=%s,net_pnl=%s,exit_reason=%s,funding_verified=false
+          WHERE id=%s AND state='open'""",
           (event_at,fill,exit_fee,abs(fill-proxy["reference"])*trade["qty"],funding,gross,net,reason,trade["id"]))
         record_fill(conn,trade_id=trade['id'],symbol=settings.symbol,
                     event_id=f"paper:{trade['id']}:exit:{event_at.isoformat()}",
@@ -257,19 +338,26 @@ def close_paper(settings,observed_price,reason="manual",funding_paid=Decimal(0),
                     slippage_cost=abs(fill-proxy["reference"])*trade['qty'],
                     spread_cost=trade["qty"]*proxy["spread_reference_cost_per_unit"],
                     quality=proxy["quality"],
-                    provenance={'exit_reason':reason,'funding_quality':'unverified',
+                    provenance={'exit_reason':reason,
                                 'spread_reference_cost_embedded_in_gross':True,
                                 'quote_asof_crossing':proxy["quality"].startswith(
                                     "observed_bbo_proxy"),
                                 'paper_only':True,'exchange_fill_proven':False,
-                                'fee_quality':fee_quality})
+                                'fee_quality':fee_quality,
+                                'funding_quality':funding_quality,
+                                'net_pnl_quality':'provisional_paper_only',
+                                'funding_source_db_rechecked':True,
+                                'funding_schedule_complete':False,
+                                'verified_live_crossing':bool(require_live_crossing)})
         for event in evidence:
             mark_funding_event(conn,trade_id=trade['id'],funding_at=event['ts'],
                                observed_at=observation_time(event['ts']),
                                rate=event['rate'],mark_price=event['mark_price'],
                                position_qty=trade['qty'],direction=trade['direction'],
-                               quality='mark_within_1s_completeness_unverified',
-                               provenance={'source':'market_ticker_events'})
+                               quality='db_mark_within_1s_schedule_unverified',
+                               provenance={'source':'market_ticker_events_and_funding',
+                                            'db_rechecked':True,
+                                            'schedule_complete':False})
         conn.execute("""UPDATE paper_account SET equity=equity+%s,
           realized_pnl=realized_pnl+%s WHERE id=1""",(net,net))
         advance_state(conn,position_state,trade_id=trade['id'],at=event_at,
