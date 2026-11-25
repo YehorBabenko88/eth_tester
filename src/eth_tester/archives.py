@@ -267,79 +267,143 @@ def revalidate_completed_archive(settings, day):
         return proof
 
 
+def plan_archive_days(start, end, cursor, retries, *, limit=24):
+    """Bounded UTC cycle, excluding today's unfinished archive."""
+    if end < start or not 1 <= limit <= 64:
+        raise ValueError("Invalid archive start or unbounded cycle")
+    cursor = max(start, min(end, cursor or start))
+    days = []
+    for day in list(retries)[:8]:
+        if start <= day < end and day not in days:
+            days.append(day)
+    for offset in range(min(limit, (end-cursor).days)):
+        day = cursor + timedelta(days=offset)
+        if day not in days:
+            days.append(day)
+    return days
+
+
+def archive_cycle_plan(settings):
+    """Load bounded retry eligibility and durable forward cursor."""
+    start = settings.archive_start
+    end = datetime.now(timezone.utc).date()
+    with connection(settings) as conn:
+        cursor = conn.execute("""SELECT cursor_ts FROM ingestion_cursor
+            WHERE source='trades_archive_scan' AND symbol=%s
+              AND instrument=%s AND interval=''""",
+              (settings.symbol, settings.category)).fetchone()
+        due = conn.execute("""SELECT day FROM ingestion_job
+            WHERE source='trades_archive' AND symbol=%s
+              AND day >= %s AND day < %s
+              AND ((state='failed' AND updated_at < now()-interval '6 hours')
+                 OR (state='unavailable' AND updated_at < now()-interval '24 hours'))
+            ORDER BY updated_at,day LIMIT 8""",
+            (settings.symbol,start,end)).fetchall()
+    next_date = cursor["cursor_ts"].date() if cursor and cursor["cursor_ts"] else start
+    return plan_archive_days(start,end,next_date,[r["day"] for r in due])
+
+
+def advance_archive_cursor(settings, day):
+    """After an actual day attempt, atomically remember crash-resumable progress."""
+    stamp = datetime.combine(day+timedelta(days=1),datetime.min.time(),timezone.utc)
+    with connection(settings) as conn:
+        conn.execute("""INSERT INTO ingestion_cursor
+             (source,symbol,instrument,interval,cursor_ts,last_success,status,meta)
+             VALUES('trades_archive_scan',%s,%s,'',%s,clock_timestamp(),
+                    'partial',%s::jsonb)
+             ON CONFLICT(source,symbol,instrument,interval) DO UPDATE SET
+             cursor_ts=greatest(ingestion_cursor.cursor_ts,excluded.cursor_ts),
+             last_success=clock_timestamp(),status='partial',meta=excluded.meta""",
+             (settings.symbol,settings.category,stamp,json.dumps({
+                 "contract":"bounded_archive_cycle_v1","ml_eligible":False,
+                 "exchange_complete":False})))
+
+
+def quarantine_archive_day(settings, day, error, permanent):
+    """An unrelated failed UTC day must not erase an acquired immutable SHA."""
+    begin = datetime.combine(day,datetime.min.time(),timezone.utc)
+    with connection(settings) as conn:
+        original = conn.execute("""SELECT state,sha256 FROM ingestion_job
+           WHERE source='trades_archive' AND symbol=%s AND day=%s FOR UPDATE""",
+           (settings.symbol,day)).fetchone()
+        if original and original["state"] == "complete":
+            conn.execute("""INSERT INTO bot_events(severity,event,data)
+                VALUES('error','archive_rehydration_failed',%s::jsonb)""",
+                (json.dumps({"day":day.isoformat(),"original_sha256":original["sha256"],
+                             "error":str(error)[:300],"verified_new_bins":False}),))
+            return
+        conn.execute("""INSERT INTO ingestion_job
+          (source,symbol,day,state,attempts,error,updated_at)
+          VALUES('trades_archive',%s,%s,'failed',1,%s,clock_timestamp())
+          ON CONFLICT(source,symbol,day) DO UPDATE
+          SET state='failed',error=excluded.error,updated_at=clock_timestamp()""",
+          (settings.symbol,day,str(error)[:2000]))
+        write_coverage(conn,source="trades_archive",symbol=settings.symbol,
+            interval="",start_ms=int(begin.timestamp()*1000),
+            end_exclusive_ms=int((begin+timedelta(days=1)).timestamp()*1000),
+            status="gap",observed_rows=0,quality="archive_import_failed",
+            evidence={"error":str(error)[:1500],"permanent":bool(permanent),
+                      "retry_after_hours":6,"ml_eligible":False},
+            instrument=settings.category)
+
+
 async def backfill_archives(settings):
-    start=settings.archive_start
-    end=datetime.now(timezone.utc).date()
-    total=(end-start).days
-    if total<0:
-        raise ValueError("ARCHIVE_START in future")
+    """Process a finite restartable batch; leave source quality fail-closed."""
+    days = archive_cycle_plan(settings)
+    result = {"attempted":0,"failed":0,"unavailable":0,"completed":0,
+              "recheck_pending":0,"exchange_complete":False,"ml_eligible":False}
     async with httpx.AsyncClient(follow_redirects=False) as client:
-        for i in range(total):
-            day=start+timedelta(days=i)
+        for day in days:
+            result["attempted"] += 1
+            state = "failed"
             for attempt in range(5):
                 try:
-                    state=await download_archive(settings,day,client)
+                    state = await download_archive(settings,day,client)
                     break
                 except Exception as exc:
-                    permanent = isinstance(
-                        exc, (DataIntegrityError, ValueError, UniqueViolation))
-                    if isinstance(exc, httpx.HTTPStatusError):
-                        permanent = exc.response.status_code in (400, 401, 403, 410)
-                    if permanent or attempt == 4:
-                        # Never retry deterministic identity conflicts or represent
-                        # their UTC day as a successfully imported archive.
-                        day_start = datetime.combine(day, datetime.min.time(), timezone.utc)
-                        with connection(settings) as conn:
-                            prior = conn.execute(
-                                """SELECT state,sha256 FROM ingestion_job
-                                   WHERE source='trades_archive'
-                                     AND symbol=%s AND day=%s FOR UPDATE""",
-                                (settings.symbol, day)).fetchone()
-                            if prior and prior["state"] == "complete":
-                                # An old immutable gzip acquisition survived;
-                                # only an independent rehydration attempt failed.
-                                # Preserve its original state, SHA and coverage.
-                                conn.execute(
-                                    """INSERT INTO bot_events(severity,event,data)
-                                       VALUES('error','archive_rehydration_failed',
-                                              %s::jsonb)""",
-                                    (json.dumps({
-                                        "day": day.isoformat(),
-                                        "original_sha256": prior["sha256"],
-                                        "error": str(exc)[:300],
-                                        "verified_new_bins": False}),))
-                            else:
-                                conn.execute("""UPDATE ingestion_job SET state='failed',error=%s,
-                                  updated_at=now() WHERE source='trades_archive' AND symbol=%s AND day=%s""",
-                                  (str(exc)[:2000], settings.symbol, day))
-                                write_coverage(
-                                    conn, source="trades_archive", symbol=settings.symbol,
-                                    interval="", start_ms=int(day_start.timestamp()*1000),
-                                    end_exclusive_ms=int(
-                                        (day_start+timedelta(days=1)).timestamp()*1000),
-                                    status="gap", observed_rows=0, quality="archive_import_failed",
-                                    evidence={"error": str(exc)[:1500],
-                                              "permanent": bool(permanent),
-                                              "attempts": attempt + 1},
-                                    instrument=settings.category)
+                    if (isinstance(exc,OSError) and getattr(exc,"errno",None)==28):
+                        raise  # ENOSPC is a global fatal error.
+                    if isinstance(exc,RuntimeError) and "Disk space too low" in str(exc):
                         raise
-                    await asyncio.sleep(min(90, 2**attempt*3))
-            # Revalidation is a separate append-only transaction. Network
-            # acquisition is NOT undone if official closed bars arrive late.
-            if state in ("cached", "complete"):
+                    permanent = isinstance(exc,(DataIntegrityError,ValueError,UniqueViolation))
+                    if isinstance(exc,httpx.HTTPStatusError):
+                        permanent = exc.response.status_code in (400,401,403,410)
+                    if permanent or attempt == 4:
+                        # Database failure writing this ledger aborts the entire
+                        # cycle instead of advancing a fake successful cursor.
+                        quarantine_archive_day(settings,day,exc,permanent)
+                        print(f"Archive quarantined {day}: {exc}",flush=True)
+                        break
+                    await asyncio.sleep(min(90,2**attempt*3))
+            if state in ("cached","complete"):
+                result["completed"] += 1
                 try:
-                    comparison = revalidate_completed_archive(settings, day)
-                    if comparison.get("status") not in (
-                            "pending_official_1m", "missing_sha_stage"):
-                        print(f"archive recheck {day}: "
-                              f"{comparison['status']}", flush=True)
-                except Exception as recheck_error:
-                    # Preserve source SHA and retry on the next scheduled pass.
-                    # A broken comparison is neither a verified archive nor a
-                    # reason to erase its original downloaded source receipt.
-                    print(f"Archive SHA recheck pending for {day}: "
-                          f"{recheck_error}", flush=True)
-            print(f"{day} {state} {i+1}/{total} ({100*(i+1)/max(total,1):.1f}%)",flush=True)
+                    check = revalidate_completed_archive(settings,day)
+                    if check.get("status") not in ("verified","volume_match"):
+                        result["recheck_pending"] += 1
+                except Exception as exc:
+                    result["recheck_pending"] += 1
+                    print(f"Archive recheck pending {day}: {exc}",flush=True)
+            else:
+                result["unavailable" if state=="unavailable" else "failed"] += 1
+            # Advancing a cursor is allowed after the failure is DURABLY recorded.
+            advance_archive_cursor(settings,day)
             if state != "cached":
                 await asyncio.sleep(1/max(0.05,settings.archive_downloads_per_second))
-    print('Resolved full-day archived tick gaps:',resolve_archived_gaps(settings),flush=True)
+    with connection(settings) as conn:
+        unresolved = conn.execute("""SELECT count(*) AS n FROM ingestion_job
+            WHERE source='trades_archive' AND symbol=%s
+              AND state IN ('failed','unavailable')""",
+              (settings.symbol,)).fetchone()["n"]
+        current = conn.execute("""SELECT cursor_ts FROM ingestion_cursor
+            WHERE source='trades_archive_scan' AND symbol=%s
+              AND instrument=%s AND interval=''""",
+              (settings.symbol,settings.category)).fetchone()
+    today = datetime.now(timezone.utc).date()
+    caught_up = bool(current and current["cursor_ts"]
+                     and current["cursor_ts"].date() >= today)
+    result["unresolved_days"] = unresolved
+    result["status"] = ("cycle_completed" if caught_up and not unresolved
+                        and not result["recheck_pending"] else "partial")
+    print("Archive bounded cycle:",result,flush=True)
+    return result

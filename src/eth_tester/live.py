@@ -210,6 +210,8 @@ def ingest_ws(conn,symbol,payload,*,session_id=None):
         raise DataIntegrityError(f"WebSocket topic symbol mismatch: {topic}")
     if topic.startswith("publicTrade."):
         unique = canonical_ws_trade_rows(data, symbol)
+        # Fail malformed whole frames before any write, then fence all WS writes.
+        lock_admission_source(conn, symbol)
         for identifier, row, event, price, qty, side in unique:
             saved = conn.execute("""INSERT INTO trades(symbol,ts,trade_id,price,qty,side,notional,source,raw)
              VALUES(%s,%s,%s,%s,%s,%s,%s,'websocket',%s::jsonb)
@@ -256,6 +258,7 @@ def ingest_ws(conn,symbol,payload,*,session_id=None):
                 (symbol, json.dumps(detail, sort_keys=True)))
     elif topic.startswith("orderbook."):
         row=data if isinstance(data,dict) else {}
+        lock_admission_source(conn, symbol)
         book_result = conn.execute("""INSERT INTO book_events(
           symbol,exchange_ts,recv_ts,update_id,sequence_no,
           event_type,bids,asks)
@@ -291,6 +294,7 @@ def ingest_ws(conn,symbol,payload,*,session_id=None):
         def numeric(name):
             value=row.get(name)
             return Decimal(str(value)) if value not in (None,'') else None
+        lock_admission_source(conn, symbol)
         conn.execute('''INSERT INTO market_ticker_events(symbol,exchange_ts,event_type,
           mark_price,index_price,last_price,open_interest,funding_rate,bid_price,ask_price,raw)
           VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)''',
@@ -300,6 +304,7 @@ def ingest_ws(conn,symbol,payload,*,session_id=None):
            numeric('bid1Price'),numeric('ask1Price'),json.dumps(row)))
     elif topic.startswith('allLiquidation.'):
         rows=data if isinstance(data,list) else [data]
+        lock_admission_source(conn, symbol)
         for row in rows:
             conn.execute('''INSERT INTO liquidation_events(symbol,ts,side,price,qty,raw)
               VALUES(%s,%s,%s,%s,%s,%s::jsonb)''',
@@ -428,8 +433,7 @@ async def live_feed(settings):
                                 latest=max(stamps)
                                 unseen=[stamp for stamp in stamps
                                         if last_trade is None or stamp > last_trade]
-                                if pending_id and unseen:
-                                    lock_admission_source(conn, settings.symbol)
+                                # ingest_ws takes the same B/E lock for EVERY WS frame.
                                 event_id=ingest_ws(
                                     conn,settings.symbol,payload,session_id=session_id)
                                 if pending_id and unseen:
