@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 
 from .strategies import Parameters
 from .strategy import economics
+from .strategies.paper_live import read_live_evidence
 
 VOLUME_REL_TOLERANCE = Decimal("0.0005")
 VOLUME_ABS_TOLERANCE = Decimal("0.001")
@@ -217,6 +218,12 @@ def confirm_rejection(conn, settings, signal, bar, *, observed_at=None):
     now = observed_at if observed_at is not None else datetime.now(timezone.utc)
 
     def reject(reason):
+        if reason == "pending_bounded_live_evidence":
+            return False, {
+                "reason": reason, "score": 0, "admissible": False,
+                "source_quality": "live_observed_bounded_pending",
+                "retryable": True, "paper_only": True, "ml_eligible": False,
+            }
         return False, {"reason": reason, "score": 0, "admissible": False}
 
     if signal is None or signal.direction not in ("long", "short"):
@@ -314,11 +321,14 @@ def confirm_rejection(conn, settings, signal, bar, *, observed_at=None):
         accepted = (score >= Parameters().min_score and
                     checks["directional_flow_or_absorption"] and
                     checks["multitimeframe"] and costs is not None)
-        certified = None
+        live = None
         if accepted:
-            certified = _certified_snapshot(conn, symbol, start, end, now)
-            if certified is None:
-                return reject("missing_verified_feature_snapshot")
+            # Historical/ML v2 feature snapshots are deliberately NOT a
+            # substitute for MASTER-approved bounded LIVE paper receipts.
+            # Pending evidence may be retried by E only before close+90s.
+            live = read_live_evidence(conn, symbol, start, end, now)
+            if live is None:
+                return reject("pending_bounded_live_evidence")
         liquidation = conn.execute("""SELECT side,coalesce(sum(qty),0) AS qty
           FROM liquidation_events WHERE symbol=%s AND ts>=%s AND ts<%s
           GROUP BY side""", (symbol, start, end)).fetchall()
@@ -335,7 +345,10 @@ def confirm_rejection(conn, settings, signal, bar, *, observed_at=None):
             "liquidations_observed_unverified": {
                 item["side"]: str(item["qty"]) for item in liquidation},
             "economics_at_observed_entry": costs,
-            "immutable_feature_snapshot": certified,
+            "immutable_live_evidence": live,
+            "source_quality": "live_observed_bounded" if accepted else "unverified",
+            "paper_only": True,
+            "ml_eligible": False,
             "baseline": "five_closed_1m_candles_volume_matched",
             "warning": ("Score is not a probability; book changes and liquidation "
                         "counts cannot prove absorption or fill attribution."),

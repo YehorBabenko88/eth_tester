@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal as D
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+import sys
+
+import pytest
 
 from eth_tester.orderflow import _matches_volume, _valid_oi, confirm_rejection, _certified_snapshot
 from eth_tester.ml import FEATURE_NAMES
@@ -10,6 +13,52 @@ from eth_tester.strategy import Signal
 
 START = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
 NOW = START + timedelta(minutes=1, seconds=10)
+
+
+def make_paper_live_row():
+    """Synthetic B-row shape for interface logic only, NOT exchange proof."""
+    end = START + timedelta(minutes=1)
+    ms = lambda stamp: int(stamp.timestamp() * 1000)
+    def proof(event, received, checked):
+        return {
+            "source_checksum": "f" * 64, "evidence_ref": "synthetic-sql-only",
+            "source_event_ms": ms(event), "source_receipt_ms": ms(received),
+            "source_checked_at_ms": ms(checked),
+        }
+    trade = proof(end - timedelta(seconds=1), end + timedelta(seconds=5),
+                  end + timedelta(seconds=6))
+    trade.update(session_continuous=True, no_unresolved_gaps=True,
+                 session_id="qa-ws-only")
+    candle = proof(end, end + timedelta(seconds=1),
+                   end + timedelta(seconds=2))
+    candle.update(closed=True, base_volume_reconciled=True,
+                  quote_volume_reconciled=True)
+    book = proof(end + timedelta(seconds=3), end + timedelta(seconds=5),
+                 end + timedelta(seconds=6))
+    book.update(snapshot_lineage_verified=True, snapshot_id="qa-l2-only")
+    oi = proof(START - timedelta(minutes=5), end + timedelta(seconds=1),
+               end + timedelta(seconds=2))
+    oi.update(receipt_and_grid_verified=True, interval="5min")
+    return {
+        "snapshot_key": "e" * 64, "symbol": "ETHUSDT", "tf": "1",
+        "bar_ts": START, "source_checksum": "d" * 64,
+        "observed_at": end + timedelta(seconds=8),
+        "computed_at": end + timedelta(seconds=8),
+        "expires_at": end + timedelta(seconds=90),
+        "quality": "live_observed_bounded", "paper_only": True,
+        "ml_eligible": False, "evidence": {
+            "contract": "eth_paper_live_evidence_v1",
+            "quality": "live_observed_bounded",
+            "paper_only": True, "ml_eligible": False,
+            "proves_all_trade_ids": False,
+            "source_receipt_ms": ms(end + timedelta(seconds=5)),
+            "source_checked_at_ms": ms(end + timedelta(seconds=6)),
+            "source_proofs": {
+                "public_trade": trade, "closed_candle": candle,
+                "orderbook": book, "open_interest": oi,
+            },
+        },
+    }
 
 
 class Result:
@@ -40,6 +89,7 @@ class FakeConn:
                      "updated_at": NOW - timedelta(seconds=1), "valid": True}
         self.recent = {"ts": NOW - timedelta(seconds=1), "price": D(102)}
         self.liquidations = [{"side": "Sell", "qty": D(2)}]
+        self.live_row = make_paper_live_row()
         end_ms = int((START + timedelta(minutes=1)).timestamp() * 1000)
         event_ms = end_ms - 1000
         receipt_ms = end_ms + 1000
@@ -98,9 +148,46 @@ class FakeConn:
             return Result(self.recent)
         if "FROM liquidation_events" in statement:
             return Result(self.liquidations)
+        if "to_regclass('public.paper_live_evidence')" in statement:
+            return Result({"present": "paper_live_evidence"})
+        if "FROM paper_live_evidence" in statement:
+            return Result(self.live_row)
         if "FROM feature_snapshots" in statement:
             return Result(self.snapshot)
         raise AssertionError("Unexpected SQL: " + statement)
+
+
+@pytest.fixture(autouse=True)
+def b_verified_bounded_paper_only(monkeypatch):
+    """Only mock B issuance; these are not proof of actual Bybit completeness."""
+    module = ModuleType("eth_tester.storage.live_evidence")
+
+    def require_bounded_paper_evidence(conn, *, symbol, bar_ts, evidence_key,
+                                       decision_at):
+        row = conn.live_row
+        if row is None or row["snapshot_key"] != evidence_key:
+            raise ValueError("no B-issued row")
+        sources = row["evidence"].get("source_proofs", {})
+        if (set(sources) != {"public_trade", "closed_candle",
+                             "orderbook", "open_interest"}
+                or sources["public_trade"].get("no_unresolved_gaps") is not True
+                or sources["orderbook"].get("snapshot_lineage_verified") is not True):
+            raise ValueError("independent source unavailable")
+        return {
+            "snapshot_key": row["snapshot_key"],
+            "source_checksum": row["source_checksum"],
+            "contract": row["evidence"]["contract"],
+            "quality": row["quality"],
+            "bar_ts": row["bar_ts"],
+            "observed_at": row["observed_at"],
+            "computed_at": row["computed_at"],
+            "expires_at": row["expires_at"],
+            "paper_only": row["paper_only"],
+            "ml_eligible": row["ml_eligible"],
+        }
+
+    module.require_bounded_paper_evidence = require_bounded_paper_evidence
+    monkeypatch.setitem(sys.modules, module.__name__, module)
 
 
 def evaluate(conn, bar_volume=D(50), now=NOW):
@@ -119,7 +206,10 @@ def test_positive_path_checks_all_required_gates():
     assert evidence["score"] == 100
     assert evidence["mtf"]["5"] and evidence["mtf"]["15"] and evidence["mtf"]["60"]
     assert evidence["baseline"] == "five_closed_1m_candles_volume_matched"
-    assert evidence["immutable_feature_snapshot"]["snapshot_key"] == "a" * 64
+    assert evidence["immutable_live_evidence"]["snapshot_key"] == "e" * 64
+    assert evidence["source_quality"] == "live_observed_bounded"
+    assert evidence["ml_eligible"] is False
+    assert "immutable_feature_snapshot" not in evidence
     assert evidence["liquidations_observed_unverified"]["Sell"] == "2"
     assert D(evidence["economics_at_observed_entry"]["net_reward_risk"]) >= 2
 
@@ -157,20 +247,24 @@ def test_book_rejects_negative_level_even_if_total_positive():
 
 def test_missing_or_late_snapshot_denies_strong_signal():
     conn = FakeConn()
-    conn.snapshot = None
-    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    conn.live_row = None
+    missing = evaluate(conn)[1]
+    assert missing["reason"] == "pending_bounded_live_evidence"
+    assert missing["retryable"] is True
+    assert missing["ml_eligible"] is False
     conn = FakeConn()
-    conn.snapshot["computed_at"] = NOW + timedelta(seconds=1)
-    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    conn.live_row["computed_at"] = NOW + timedelta(seconds=1)
+    assert evaluate(conn)[1]["reason"] == "pending_bounded_live_evidence"
     conn = FakeConn()
-    conn.snapshot["provenance"]["coverage_status"] = "observed_partial"
-    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    conn.live_row["evidence"]["source_proofs"]["orderbook"][
+        "snapshot_lineage_verified"] = False
+    assert evaluate(conn)[1]["reason"] == "pending_bounded_live_evidence"
     conn = FakeConn()
-    conn.snapshot["provenance"]["feature_available_ms"]["oi"] += 60_000
-    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
-    conn = FakeConn()
-    conn.snapshot["source_checksum"] = ""
-    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    conn.live_row["evidence"]["source_proofs"]["public_trade"][
+        "no_unresolved_gaps"] = False
+    assert evaluate(conn)[1]["reason"] == "pending_bounded_live_evidence"
+    assert evaluate(FakeConn(), now=START + timedelta(minutes=3))[1][
+        "reason"] == "stale_or_open_bar"
 
 
 def test_causal_snapshot_requires_complete_feature_availability():
@@ -194,7 +288,7 @@ def test_v1_or_unverified_source_cannot_unlock_paper():
     ):
         conn = FakeConn()
         conn.snapshot["provenance"][field] = value
-        assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+        assert _certified_snapshot(conn, "ETHUSDT", START, START + timedelta(minutes=1), NOW) is None
 
 
 def test_per_feature_receipt_and_checksum_enforced():
@@ -208,16 +302,18 @@ def test_per_feature_receipt_and_checksum_enforced():
     ):
         conn = FakeConn()
         conn.snapshot["provenance"]["feature_sources"]["oi"][field] = value
-        assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+        assert _certified_snapshot(conn, "ETHUSDT", START, START + timedelta(minutes=1), NOW) is None
     conn = FakeConn()
     del conn.snapshot["provenance"]["feature_sources"]["volatility"]
-    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    assert _certified_snapshot(conn, "ETHUSDT", START, START + timedelta(minutes=1), NOW) is None
 
 
 def test_snapshot_is_asof_actual_decision_and_never_selected_by_hindsight():
     conn = FakeConn()
     conn.snapshot["available_at"] = NOW + timedelta(seconds=1)
-    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    assert _certified_snapshot(conn, "ETHUSDT", START,
+                               START + timedelta(minutes=1), NOW) is None
     conn = FakeConn()
     conn.snapshot["snapshot_key"] = "not-a-hash"
-    assert evaluate(conn)[1]["reason"] == "missing_verified_feature_snapshot"
+    assert _certified_snapshot(conn, "ETHUSDT", START,
+                               START + timedelta(minutes=1), NOW) is None
