@@ -112,9 +112,9 @@ def test_reject_inverted_stop_take_before_order_creation():
 
 def test_partial_entry_reserves_existing_and_remaining_risk():
     e = PaperEngine(equity=D(10000), max_risk_fraction=D('.01'))
-    e.submit('long', 91, 105)
+    e.submit('long', 94, 120)
     e.quote(q(0, ask_qty='2'))
     assert e.position is not None and e.position.qty == 2
-    # Position accumulated and potential remainder would exceed 1% cap at this stop.
-    e.quote(q(1, ask_qty='50'))
+    # A price jump makes remaining-entry risk exceed the original 1% budget.
+    e.quote(q(1, bid='106.9', ask='107', last='106', ask_qty='50'))
     assert e.position.qty == 2 and e.order is None
