@@ -14,16 +14,42 @@ class Signal:
     reason: dict
 
 def economics(direction, price, stop, take, fee, slip, params=Parameters()):
-    if not (0 < stop < price < take if direction == "long" else 0 < take < price < stop):
+    """Outcome-at-TP feasibility, not independently calibrated expectancy."""
+    if direction not in ("long", "short"):
         return None
-    reserve = D(params.funding_reserve)*1000
-    win = estimate_trade(direction,price,take,D(1000),fee,slip,reserve)["net"]
-    loss = -estimate_trade(direction,price,stop,D(1000),fee,slip,reserve)["net"]
-    if loss <= 0 or win < D(params.min_net)*1000 or win/loss < D(params.reward_risk):
+    try:
+        price, stop, take, fee, slip = (
+            D(str(value)) for value in (price, stop, take, fee, slip))
+        reserve_fraction = D(params.funding_reserve)
+        minimum_net = D(params.min_net)
+        minimum_rr = D(params.reward_risk)
+        values = (price, stop, take, fee, slip, reserve_fraction,
+                  minimum_net, minimum_rr)
+        if not all(value.is_finite() for value in values):
+            return None
+        if (fee < 0 or slip < 0 or reserve_fraction < 0 or minimum_net < 0
+                or minimum_rr <= 0):
+            return None
+        correct = (0 < stop < price < take if direction == "long"
+                   else 0 < take < price < stop)
+        if not correct:
+            return None
+        reserve = reserve_fraction * D(1000)
+        win = estimate_trade(direction, price, take, D(1000), fee, slip,
+                             reserve)["net"]
+        loss = -estimate_trade(direction, price, stop, D(1000), fee, slip,
+                              reserve)["net"]
+        if (not win.is_finite() or not loss.is_finite() or loss <= 0
+                or win < minimum_net * D(1000)
+                or win / loss < minimum_rr):
+            return None
+        return {"net_target_fraction": str(win / D(1000)),
+                "net_risk_fraction": str(loss / D(1000)),
+                "net_reward_risk": str(win / loss),
+                "funding_reserve_fraction": str(reserve_fraction),
+                "break_even_win_rate": str(loss / (win + loss))}
+    except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
         return None
-    return {"net_target_fraction":str(win/1000),"net_risk_fraction":str(loss/1000),
-            "net_reward_risk":str(win/loss),"funding_reserve_fraction":params.funding_reserve,
-            "break_even_win_rate":str(loss/(win+loss))}
 
 def calibrated_expectancy(direction, price, stop, take, fee, slip, probability_lower,
                            params=Parameters()):
