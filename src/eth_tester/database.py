@@ -9,6 +9,7 @@ from .config import Settings
 @contextmanager
 def connection(settings: Settings):
     with psycopg.connect(settings.database_url, row_factory=dict_row, connect_timeout=10) as conn:
+        conn.execute("SET TIME ZONE 'UTC'")
         yield conn
 
 def init_database(settings: Settings):
