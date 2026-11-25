@@ -25,8 +25,8 @@ def merge_staged_trades(conn, stage_name="eth_stage"):
     with conn.cursor() as cur:
         # pg_temp qualifier prevents accidentally selecting unrelated tables.
         input_rows = cur.execute(
-            sql.SQL("SELECT count(*) FROM {}").format(source)
-        ).fetchone()[0]
+            sql.SQL("SELECT count(*) AS input_rows FROM {}").format(source)
+        ).fetchone()["input_rows"]
         if input_rows == 0:
             return {"input_rows": 0, "inserted_rows": 0, "deduplicated_rows": 0}
         duplicate = cur.execute(

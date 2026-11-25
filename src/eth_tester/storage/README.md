@@ -19,23 +19,69 @@ Delete: first call `deletion_manifest(url, backup_path)`. Then, only after human
 Contracts: A Data — ingestion_coverage/trade_candle_volume_checks; C Analytics — level_events/analytics_cursor; F Learning — append-only causal feature_snapshots; E Simulation — paper_order_events/paper_funding_events/optimistic paper_position_state.
 
 
-## Round 2: point-in-time snapshots and startup permissions
+## Round 4: canonical snapshot provenance v2
 
-Use eth_tester.storage.snapshots.write_feature_snapshot(conn, ...) to emit
-immutable records. It requires the exact eth_tester.ml.FEATURE_NAMES schema,
-per-feature available timestamps and a source SHA256. For certified=True,
-each feature requires independent ingestion_coverage(status='verified',
-checksum=...) at its availability timestamp; missing or partial evidence
-fails closed. Provisional snapshots remain is_causal=false and quality
-partial_unverified. The writer derives available_at from the features and
-writes computed_at using the PostgreSQL clock. A later rebuild cannot
-retroactively claim it was computed before an earlier trading decision.
-Consumers must additionally enforce computed_at, observed_at and available_at
-less than or equal to the decision timestamp.
+Certified snapshots MUST be published through
+`eth_tester.storage.snapshots.write_feature_snapshot(conn, ...)`.
+Do not directly INSERT with quality='complete'/is_causal=true.
+The API requires exactly the nine names in ml.FEATURE_NAMES. Each entry
+in feature_sources has: source, instrument, interval (the empty archive
+interval is VALID), checksum (64 lowercase SHA256), source_event_ms
+(timestamp within ingestion_coverage event window), source_receipt_ms
+(actual source receipt persisted in ingestion_coverage.evidence),
+source_checked_at_ms (DB-persisted coverage check), coverage_status='verified',
+and evidence_ref. The writer cross-verifies the event-time window, hash,
+quality, checked_at and independently recorded receipt with DB rows and
+pins a SHA256 of the witnessed evidence. It never considers a later source
+availability timestamp to be inside an earlier archive event window.
+For trades_archive only, CRC, identity and minute-volume evidence must
+all be true; mere volume agreement does not certify all exchange prints.
+Without actual independent evidence for L2/OI/levels/volatility, certification
+fails CLOSED. The caller cannot assert valid coverage by setting booleans.
 
-Use eth_tester.database.verify_existing_schema(settings) for read-only
-LocalService service startup. It checks owner, exact migration versions and
-checksums and the critical tables without DDL. One-time init_database remains
-an explicit administrator operation. Control G owns the supervisor consumer
-change at the MASTER checkpoint. Existing snapshots inserted outside this
-writer are NOT retroactively certified.
+The writer's returned snapshot_key deterministically binds all nine
+values and verified provenance. The PostgreSQL INSERT uses one DB
+clock_timestamp() for available_at, observed_at and computed_at: all
+three are real publication clocks, NEVER bar-close or retroactive receipt.
+Feature source/event/receipt/check times remain separately visible inside
+provenance and must precede publication. The writer emits
+contract='eth_feature_snapshot_v2',
+certified_by='independent_source_proof',
+source_coverage_verified, coverage_status,
+source_receipt_ms, source_checked_at_ms,
+feature_available_ms and feature_sources. Non-certified snapshots stay
+quality='partial_unverified', is_causal=false. Old v1 rows are not
+silently upgraded. D/E/F still must independently validate this v2 contract,
+as-of time, the exact snapshot_key/source_checksum and one position/$1000
+paper limits; no real order routing.
+
+## Round 4: independently evidenced post-horizon structural labels
+
+Migration `0006_paper_ml_labels.sql` introduces
+`paper_ml_labels` (NOT an entry-time change to paper_trades.reason).
+`eth_tester.storage.labels.record_paper_ml_label(conn, ...)` accepts:
+paper_trade_id, snapshot_key, source_checksum, outcome, horizon_end_at,
+label_source, label_interval, covered_from_at, coverage_sha256,
+source_receipt_at, coverage_checked_at, source_evidence and optional
+label_instrument='linear'. It fixes method='fixed_horizon_barrier_v1'.
+The PostgreSQL trigger rejects open trades, absent/tampered original
+top-level reason.ml_snapshot_key/ml_source_checksum binding, snapshot
+not available at the original decision, label issued before horizon
+completion, and missing verified source coverage with exact DB-witnessed
+receipt/checksum. It always sets issued_at using PostgreSQL clock_timestamp()
+and forbids UPDATE and DELETE. The source_evidence must carry an
+independently generated barrier_evidence_sha256. One row per trade is
+allowed; replay of the identical label is idempotent, contradictory
+replay fails closed. Training labels are NEVER derived from paper PnL,
+and no model is promoted automatically.
+
+The permanent marker, migration and table verification is available via
+read-only database.verify_existing_schema(settings); normal supervisor
+startup should use it under a limited DB role. Administrator applies
+init_database and migrations explicitly. If absent or checksum-mismatched,
+the supervisor must not spawn worker processes. Destructive DB/file
+lifecycle remains gated by the original ownership/backup/OID protocol.
+
+All PostgreSQL tests use randomized disposable test databases. Synthetic
+source certificates in those tests demonstrate SQL contract compatibility,
+NOT exchange-complete market evidence or production GO.

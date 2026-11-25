@@ -39,7 +39,7 @@ def _assert_safe_existing_database(conn):
         raise RuntimeError("Refusing to adopt unknown nonempty PostgreSQL database")
     resources = files("eth_tester")
     sources = [resources.joinpath("schema.sql")]
-    for name in ("0001_partitioned_archive.sql", "0002_quality_and_provenance.sql", "0003_retention_indexes.sql", "0004_trade_identity_guard.sql", "0005_paper_settlement_ledger.sql"):
+    for name in ("0001_partitioned_archive.sql", "0002_quality_and_provenance.sql", "0003_retention_indexes.sql", "0004_trade_identity_guard.sql", "0005_paper_settlement_ledger.sql", "0006_paper_ml_labels.sql"):
         sources.append(resources.joinpath("migrations").joinpath(name))
     known = set()
     for source in sources:
@@ -127,7 +127,7 @@ def verify_existing_schema(settings: Settings):
             if row["checksum"] != digest:
                 raise RuntimeError("ETH Tester schema migration checksum mismatch")
         required = ("trades", "feature_snapshots", "ingestion_coverage",
-                    "paper_position_state", "paper_account")
+                    "paper_position_state", "paper_account", "paper_ml_labels")
         for table in required:
             found = conn.execute(
                 "SELECT to_regclass(%s) AS reg", ("public." + table,)
