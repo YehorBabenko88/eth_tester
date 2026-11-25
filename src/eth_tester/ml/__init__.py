@@ -221,6 +221,19 @@ def approve_candidate(candidate, champion, train, validation, shadow, gates=Gate
         return False, "weakened admission policy"
     if len(train) < gates.min_train or len(validation) < gates.min_validation or len(shadow) < gates.min_shadow:
         return False, "insufficient independent samples"
+    try:
+        from itertools import chain
+        for partition in (train, validation, shadow):
+            if len(validate(partition, max(r.exit_ms for r in partition))) != len(partition):
+                return False, "unresolved label"
+        ids = [r.event_id for r in chain(train, validation, shadow)]
+        if len(ids) != len(set(ids)):
+            return False, "duplicate observation across partitions"
+        if (max(r.decision_ms for r in train) >= min(r.decision_ms for r in validation)
+                or max(r.decision_ms for r in validation) >= min(r.decision_ms for r in shadow)):
+            return False, "nonchronological partitions"
+    except (ValueError, TypeError, OverflowError):
+        return False, "invalid point-in-time evidence"
     if not max(r.exit_ms for r in train) < min(r.decision_ms for r in validation):
         return False, "purge violation"
     if not max(r.exit_ms for r in validation) < min(r.decision_ms for r in shadow):
