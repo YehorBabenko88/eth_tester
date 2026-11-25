@@ -143,10 +143,13 @@ def confirm_rejection(conn, settings, signal, bar, *, observed_at=None):
         if (not book or not book["valid"] or book["updated_at"].tzinfo is None
                 or not timedelta(0) <= now - book["updated_at"] <= timedelta(seconds=10)):
             return reject("stale_book")
-        bid = sum((_decimal(qty) for qty in book["bids"].values()), Decimal(0))
-        ask = sum((_decimal(qty) for qty in book["asks"].values()), Decimal(0))
-        if min(bid, ask) <= 0:
+        bid_levels = [_decimal(qty) for qty in book["bids"].values()]
+        ask_levels = [_decimal(qty) for qty in book["asks"].values()]
+        if (not bid_levels or not ask_levels or
+                any(qty <= 0 for qty in bid_levels + ask_levels)):
             return reject("invalid_book_liquidity")
+        bid = sum(bid_levels, Decimal(0))
+        ask = sum(ask_levels, Decimal(0))
         sign = 1 if signal.direction == "long" else -1
         mtf = _mtf(conn, symbol, end, sign)
         if mtf is None:
