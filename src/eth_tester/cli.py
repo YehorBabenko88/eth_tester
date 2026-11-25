@@ -9,7 +9,7 @@ def main():
     parser.add_argument("--trade-id",type=int)
     commands=parser.add_subparsers(dest="command",required=True)
     for cmd in ("init","backfill","archives","live","levels","footprint",
-                "telegram","status","chart","backtest","engine","learn","cleanup","analyse"):
+                "telegram","status","chart","backtest","engine","learn","cleanup","analyse","run"):
         commands.add_parser(cmd)
     args=parser.parse_args()
     settings=Settings()
@@ -18,6 +18,9 @@ def main():
     if args.command=="init":
         init_database(settings)
         print("PostgreSQL tables initialized")
+    elif args.command=="run":
+        from .supervisor import supervise
+        asyncio.run(supervise(settings))
     elif args.command=="backfill":
         from .history import backfill_rest
         asyncio.run(backfill_rest(settings))
