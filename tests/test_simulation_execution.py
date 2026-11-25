@@ -99,3 +99,22 @@ def test_invalid_quotes_and_no_depth_fail_closed():
     e.submit('long', 98, 104)
     assert e.quote(q(0, ask_qty='0')) == []
     assert e.position is None
+
+def test_reject_inverted_stop_take_before_order_creation():
+    e = PaperEngine()
+    with pytest.raises(ValueError):
+        e.submit('long', 110, 95)
+    assert e.order is None
+    with pytest.raises(ValueError):
+        e.submit('short', 90, 110)
+    assert e.order is None
+
+
+def test_partial_entry_reserves_existing_and_remaining_risk():
+    e = PaperEngine(equity=D(10000), max_risk_fraction=D('.01'))
+    e.submit('long', 91, 105)
+    e.quote(q(0, ask_qty='2'))
+    assert e.position is not None and e.position.qty == 2
+    # Position accumulated and potential remainder would exceed 1% cap at this stop.
+    e.quote(q(1, ask_qty='50'))
+    assert e.position.qty == 2 and e.order is None
