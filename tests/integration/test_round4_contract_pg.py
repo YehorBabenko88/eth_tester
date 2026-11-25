@@ -53,7 +53,7 @@ def qa_round4_pg():
             )
 
 
-def _strategy_reason(snapshot=None):
+def _strategy_reason(snapshot=None, *, bar_ts=None):
     version, identity = rule_identity()
     reason = {
         "strategy_version": version,
@@ -61,6 +61,10 @@ def _strategy_reason(snapshot=None):
         **identity,
     }
     if snapshot is not None:
+        if bar_ts is None:
+            raise ValueError("Synthetic QA binding requires its original bar")
+        reason["source"] = "closed_candles"
+        reason["signal_bar_ts"] = bar_ts.isoformat()
         reason["orderflow"] = {
             "admissible": True,
             "immutable_feature_snapshot": snapshot,
@@ -117,7 +121,7 @@ def test_missing_market_proof_fails_closed_across_c_b_d_e_f(qa_round4_pg):
     with pytest.raises((ValueError, RuntimeError)):
         open_paper(
             settings, "long", Decimal(100), Decimal(98), Decimal(105),
-            _strategy_reason(forged), observed_at=current,
+            _strategy_reason(forged, bar_ts=bar), observed_at=current,
         )
     with connection(settings) as conn:
         assert conn.execute(
@@ -153,6 +157,9 @@ def test_verified_snapshot_paper_binding_is_exact_and_late_ml_stays_closed(
                 "scope": "disposable_sql_contract_only",
                 "source_receipt_ms": receipt_ms,
                 "source_checked_at_ms": receipt_ms,
+                "evidence_ref": source + ":" + digest,
+                "receipt_is_independently_recorded": True,
+                "fixture": "synthetic_disposable_sql_contract_only",
             }
             conn.execute(
                 """INSERT INTO ingestion_coverage(
@@ -211,7 +218,7 @@ def test_verified_snapshot_paper_binding_is_exact_and_late_ml_stays_closed(
 
     opened_id = open_paper(
         settings, "long", Decimal(100), Decimal(98), Decimal(105),
-        _strategy_reason(verified), observed_at=decision,
+        _strategy_reason(verified, bar_ts=bar), observed_at=decision,
     )
     assert opened_id > 0
     with connection(settings) as conn:
