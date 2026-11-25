@@ -37,10 +37,13 @@ def winrate_certificate(model, holdout, *, strategy_version, minimum_ev=0.0,
         raise ValueError("strategy version provenance required")
     if min_trades < 30 or not holdout:
         return None
-    validated = validate(holdout, max(r.exit_ms for r in holdout))
-    if len(validated) != len(holdout):
+    try:
+        validated = validate(holdout, max(r.exit_ms for r in holdout))
+        if len(validated) != len(holdout):
+            return None
+        evaluate(model, validated, minimum_ev)
+    except (ValueError, TypeError, OverflowError):
         return None
-    evaluate(model, validated, minimum_ev)
     selected = [r for r in validated if model.predict(r.values) != "uncertain"
                 and model.expected_net(r.values) > minimum_ev]
     if len(selected) < min_trades or sum(r.net_return for r in selected) <= 0:
