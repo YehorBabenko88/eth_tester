@@ -354,3 +354,63 @@ def test_bulk_copy_ten_thousand(postgres_lab):
             conn, (sample_trade(f"STRESS-{i:07d}", minute=i % 1440)
                    for i in range(10_000))
         )["deduplicated_rows"] == 10_000
+
+
+
+def test_round2_read_only_schema_startup(postgres_lab):
+    from eth_tester.database import verify_existing_schema
+
+    report = verify_existing_schema(postgres_lab)
+    assert report["verified"] is True
+    assert report["schema_version"] == "0005_paper_settlement_ledger.sql"
+
+
+def test_round2_snapshot_writer_no_backdating_or_unverified_coverage(postgres_lab):
+    from eth_tester.ml import FEATURE_NAMES
+    from eth_tester.storage.snapshots import write_feature_snapshot
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    bar = now - timedelta(minutes=2)
+    available = now - timedelta(minutes=1)
+    observed = now - timedelta(seconds=30)
+    checksum = "a" * 64
+    available_ms = int(available.timestamp() * 1000)
+    features = {name: Decimal("1.5") for name in FEATURE_NAMES}
+    timestamps = {name: available_ms for name in FEATURE_NAMES}
+    proof = {name: {"source": "round2_fixture", "interval": "5",
+                    "checksum": checksum} for name in FEATURE_NAMES}
+    args = dict(symbol="ETHUSDT", tf="5", bar_ts=bar,
+                observed_at=observed, values=features,
+                feature_available_ms=timestamps, source="round2_fixture",
+                source_checksum=checksum, feature_sources=proof)
+    with connection(postgres_lab) as conn:
+        with pytest.raises(ValueError, match="Unverified source coverage"):
+            write_feature_snapshot(conn, certified=True, **args)
+        provisional = write_feature_snapshot(conn, certified=False, **args)
+        provisional_row = conn.execute(
+            "SELECT is_causal,quality FROM feature_snapshots WHERE snapshot_key=%s",
+            (provisional,),
+        ).fetchone()
+        assert not provisional_row["is_causal"]
+        assert provisional_row["quality"] == "partial_unverified"
+        conn.execute(
+            """INSERT INTO ingestion_coverage(
+                 source,symbol,instrument,interval,start_ts,end_ts,status,
+                 observed_rows,checksum,quality)
+               VALUES('round2_fixture','ETHUSDT','linear','5',%s,%s,
+                      'verified',1,%s,'test_verified')""",
+            (bar - timedelta(minutes=1), now, checksum),
+        )
+        snapshot = write_feature_snapshot(conn, certified=True, **args)
+        assert snapshot == write_feature_snapshot(conn, certified=True, **args)
+        row = conn.execute(
+            """SELECT is_causal,quality,computed_at,observed_at,provenance
+               FROM feature_snapshots WHERE snapshot_key=%s""", (snapshot,)
+        ).fetchone()
+        assert row["is_causal"] and row["quality"] == "complete"
+        assert row["computed_at"] >= row["observed_at"]
+        assert row["provenance"]["contract"] == "eth_feature_snapshot_v1"
+        assert conn.execute(
+            "SELECT count(*) AS n FROM feature_snapshots WHERE snapshot_key=%s",
+            (snapshot,),
+        ).fetchone()["n"] == 1

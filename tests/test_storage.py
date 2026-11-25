@@ -39,3 +39,10 @@ def test_backup_must_exist(tmp_path):
     with patch("eth_tester.storage.shutil.which", return_value=None):
         with pytest.raises(RuntimeError):
             verify_backup(Path(tmp_path) / "missing.dump")
+
+
+
+def test_missing_backup_with_available_restore_tool(tmp_path):
+    with patch("eth_tester.storage.shutil.which", return_value="/usr/bin/pg_restore"):
+        with pytest.raises(RuntimeError, match="backup file missing"):
+            verify_backup(Path(tmp_path) / "missing.dump")

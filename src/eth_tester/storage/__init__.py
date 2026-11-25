@@ -51,7 +51,10 @@ def backup_sha256(path):
 def verify_backup(path, *, expected_sha256=None, expected_database=None):
     if not shutil.which("pg_restore"):
         raise RuntimeError("pg_restore unavailable")
-    source = Path(path).resolve(strict=True)
+    try:
+        source = Path(path).resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise RuntimeError('PostgreSQL backup file missing') from exc
     if source.stat().st_size <= 0:
         raise RuntimeError("Empty PostgreSQL backup")
     if expected_sha256 is not None and backup_sha256(source) != expected_sha256:

@@ -17,3 +17,25 @@ Delete: first call `deletion_manifest(url, backup_path)`. Then, only after human
 `tests/test_storage_postgres.py` requires `ETH_TEST_PG_DSN` for a disposable server. It creates and cleans only fresh `eth_tester_ci_<uuid>` test databases. PostgreSQL 17/18 CI and real restored-data comparisons remain prerequisites for acceptance; `ETH_TEST_STORAGE_STRESS=1` enables 10,000-trade COPY stress. No real exchange orders.
 
 Contracts: A Data — ingestion_coverage/trade_candle_volume_checks; C Analytics — level_events/analytics_cursor; F Learning — append-only causal feature_snapshots; E Simulation — paper_order_events/paper_funding_events/optimistic paper_position_state.
+
+
+## Round 2: point-in-time snapshots and startup permissions
+
+Use eth_tester.storage.snapshots.write_feature_snapshot(conn, ...) to emit
+immutable records. It requires the exact eth_tester.ml.FEATURE_NAMES schema,
+per-feature available timestamps and a source SHA256. For certified=True,
+each feature requires independent ingestion_coverage(status='verified',
+checksum=...) at its availability timestamp; missing or partial evidence
+fails closed. Provisional snapshots remain is_causal=false and quality
+partial_unverified. The writer derives available_at from the features and
+writes computed_at using the PostgreSQL clock. A later rebuild cannot
+retroactively claim it was computed before an earlier trading decision.
+Consumers must additionally enforce computed_at, observed_at and available_at
+less than or equal to the decision timestamp.
+
+Use eth_tester.database.verify_existing_schema(settings) for read-only
+LocalService service startup. It checks owner, exact migration versions and
+checksums and the critical tables without DDL. One-time init_database remains
+an explicit administrator operation. Control G owns the supervisor consumer
+change at the MASTER checkpoint. Existing snapshots inserted outside this
+writer are NOT retroactively certified.

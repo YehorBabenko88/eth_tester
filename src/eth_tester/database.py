@@ -95,3 +95,43 @@ def save_cursor(conn, source, symbol, interval, stamp, status="complete"):
       VALUES(%s,%s,%s,%s,now(),%s) ON CONFLICT(source,symbol,instrument,interval)
       DO UPDATE SET cursor_ts=EXCLUDED.cursor_ts,last_success=EXCLUDED.last_success,status=EXCLUDED.status""",
       (source,symbol,interval,stamp,status))
+
+
+def verify_existing_schema(settings: Settings):
+    """Check owner, version and mandatory tables without DDL at service startup."""
+    from hashlib import sha256
+
+    from .migrations import MIGRATIONS
+    from .storage import check_ownership
+
+    name = conninfo_to_dict(settings.database_url).get("dbname", "")
+    if name != "eth_tester" and not name.startswith("eth_tester_"):
+        raise ValueError("Dedicated eth_tester database required")
+    with connection(settings) as conn:
+        check_ownership(conn)
+        found = conn.execute(
+            "SELECT to_regclass('public.eth_schema_migrations') AS reg"
+        ).fetchone()["reg"]
+        if found is None:
+            raise RuntimeError("ETH Tester migrations have not been initialized")
+        rows = conn.execute(
+            "SELECT version,checksum FROM public.eth_schema_migrations ORDER BY version"
+        ).fetchall()
+        versions = [row["version"] for row in rows]
+        if versions != sorted(MIGRATIONS):
+            raise RuntimeError("Unrecognized or incomplete ETH Tester schema")
+        root = files("eth_tester").joinpath("migrations")
+        for row in rows:
+            contents = root.joinpath(row["version"]).read_text(encoding="utf-8")
+            digest = sha256(contents.encode("utf-8")).hexdigest()
+            if row["checksum"] != digest:
+                raise RuntimeError("ETH Tester schema migration checksum mismatch")
+        required = ("trades", "feature_snapshots", "ingestion_coverage",
+                    "paper_position_state", "paper_account")
+        for table in required:
+            found = conn.execute(
+                "SELECT to_regclass(%s) AS reg", ("public." + table,)
+            ).fetchone()["reg"]
+            if found is None:
+                raise RuntimeError("ETH Tester table missing: " + table)
+    return {"database": name, "schema_version": versions[-1], "verified": True}
