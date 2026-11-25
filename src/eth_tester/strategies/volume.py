@@ -135,19 +135,31 @@ def build_profile(trades, start, end, tick_size, *, coverage_verified=False,
         total = sum(bins.values(), Decimal(0))
         poc = min(bins, key=lambda price: (-bins[price], price))
         left = right = poc
+        low_bound, high_bound = min(bins), max(bins)
         allocated = bins[poc]
         target = total * Decimal("0.70")
-        while allocated < target:
+        # The value area must be contiguous and may cross empty internal bins.
+        # Never walk outside the observed price span on a zero-volume tie.
+        max_expansions = int((high_bound - low_bound) / tick)
+        for _ in range(max_expansions):
+            if allocated >= target:
+                break
+            can_expand_low = left > low_bound
+            can_expand_high = right < high_bound
             next_low = left - tick
             next_high = right + tick
-            low_volume = bins.get(next_low, Decimal(0))
-            high_volume = bins.get(next_high, Decimal(0))
+            low_volume = (bins.get(next_low, Decimal(0)) if can_expand_low
+                          else Decimal(-1))
+            high_volume = (bins.get(next_high, Decimal(0)) if can_expand_high
+                           else Decimal(-1))
             if low_volume >= high_volume:
                 left = next_low
-                allocated += low_volume
+                allocated += max(low_volume, Decimal(0))
             else:
                 right = next_high
-                allocated += high_volume
+                allocated += max(high_volume, Decimal(0))
+        if allocated < target:
+            return None
         return VolumeProfile(start, end, tick, poc, left, right, bins, total,
                              count, "externally_verified")
     except (InvalidOperation, TypeError, ValueError, KeyError, OverflowError):
