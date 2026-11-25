@@ -17,6 +17,13 @@ def apply_migrations(conn):
            )"""
     )
     conn.execute("SELECT pg_advisory_xact_lock(hashtext('eth_tester:schema:migrations'))")
+    applied = {
+        row["version"] if isinstance(row, dict) else row[0]
+        for row in conn.execute("SELECT version FROM eth_schema_migrations")
+    }
+    unknown = applied - set(MIGRATIONS)
+    if unknown:
+        raise RuntimeError(f"Database schema newer than this code: {sorted(unknown)}")
     root = files("eth_tester").joinpath("migrations")
     for version in MIGRATIONS:
         statement = root.joinpath(version).read_text(encoding="utf-8")
