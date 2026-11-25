@@ -12,6 +12,24 @@ from .history import (
     collect_funding, collect_oi, collect_account_ratios,
 )
 
+def validate_book_sequence(previous_seq, previous_update, payload):
+    """Reject replayed/out-of-order L2 deltas; snapshot resets continuity."""
+    row = payload.get("data")
+    if not isinstance(row, dict):
+        raise DataIntegrityError("Malformed Bybit orderbook payload")
+    sequence = row.get("seq")
+    update_id = row.get("u")
+    if sequence is None or update_id is None:
+        raise DataIntegrityError("Missing Bybit orderbook sequence/update ID")
+    sequence, update_id = int(sequence), int(update_id)
+    if payload.get("type") != "snapshot":
+        if previous_seq is None or previous_update is None:
+            raise DataIntegrityError("Orderbook delta without exchange snapshot")
+        if sequence <= previous_seq or update_id <= previous_update:
+            raise DataIntegrityError("Out-of-order/replayed Bybit orderbook delta")
+    return sequence, update_id
+
+
 def stamp_ms(value):
     return datetime.fromtimestamp(int(value)/1000,timezone.utc)
 
@@ -89,6 +107,9 @@ async def live_feed(settings):
                 await ws.send(json.dumps({"op":"subscribe","args":topics}))
                 attempt=0
                 book_ready=False
+                book_seq=None
+                book_update=None
+                connected_at=datetime.now(timezone.utc)
                 with connection(settings) as conn:
                     conn.execute("""INSERT INTO feed_health(symbol,topic,status)
                       VALUES(%s,'connection','connected')""",(settings.symbol,))
@@ -101,7 +122,9 @@ async def live_feed(settings):
                         if payload.get("type")=="snapshot":
                             book_ready=True
                         elif not book_ready:
-                            continue
+                            raise DataIntegrityError("Orderbook delta before snapshot")
+                        book_seq, book_update = validate_book_sequence(
+                            book_seq, book_update, payload)
                     if topic.startswith(("publicTrade.","orderbook.","tickers.","allLiquidation.")):
                         with connection(settings) as conn:
                             ingest_ws(conn,settings.symbol,payload)
@@ -109,8 +132,12 @@ async def live_feed(settings):
                                 stamps=[stamp_ms(x['T']) for x in payload['data']]
                                 first=min(stamps)
                                 latest=max(stamps)
-                                if pending_id and (last_trade is None or first > last_trade):
-                                    conn.execute('UPDATE data_gaps SET end_ts=%s WHERE id=%s AND end_ts IS NULL',(first,pending_id))
+                                unseen = [stamp for stamp in stamps
+                                          if last_trade is None or stamp > last_trade]
+                                if pending_id and unseen:
+                                    conn.execute(
+                                        'UPDATE data_gaps SET end_ts=%s WHERE id=%s AND end_ts IS NULL',
+                                        (min(unseen),pending_id))
                                     pending_id=None
                                 last_trade=max(last_trade,latest) if last_trade else latest
                 raise ConnectionError("WebSocket stream closed without an exception")
@@ -119,9 +146,10 @@ async def live_feed(settings):
                 with connection(settings) as conn:
                     conn.execute("INSERT INTO feed_health(symbol,topic,status,detail) VALUES(%s,'connection','disconnected',%s::jsonb)",
                                  (settings.symbol,json.dumps({'reason':str(exc)[:400]})))
-                    if last_trade and pending_id is None:
+                    if pending_id is None:
+                        start_gap=last_trade or connected_at
                         item=conn.execute("INSERT INTO data_gaps(source,symbol,start_ts,explanation) VALUES('publicTrade',%s,%s,'websocket interrupted') RETURNING id",
-                                          (settings.symbol,last_trade)).fetchone()
+                                          (settings.symbol,start_gap)).fetchone()
                         pending_id=item['id']
             except Exception as log_error:
                 print(f'Failed to persist outage: {log_error}',flush=True)
