@@ -105,7 +105,7 @@ def test_real_rollup_poc_delta_and_repeat_load(pg_settings):
             WHERE symbol='ETHUSDT' AND tf='1'""").fetchone()
     assert [(x["price"], x["buy_qty"], x["sell_qty"]) for x in rows] == [
         (D(100), D(2), D(1)), (D(101), D(0), D(2))]
-    assert (feature["poc"], feature["delta"], feature["volume"]) == (D(100), D(0), D(5))
+    assert (feature["poc"], feature["delta"], feature["volume"]) == (D(100), D(-1), D(5))
 
 
 def test_live_footprint_is_idempotent(pg_settings):
