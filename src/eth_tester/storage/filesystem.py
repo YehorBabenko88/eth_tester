@@ -71,7 +71,8 @@ def register_owned_file(root, filename):
     path = _safe_root(root)
     manifest, _ = _load(path)
     relative = Path(filename)
-    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+    if (relative.is_absolute() or not relative.parts or ".." in relative.parts
+            or relative.name in (MARKER, MARKER + ".tmp")):
         raise ValueError("Owned file path must be contained and relative")
     candidate = path / relative
     if candidate.is_symlink() or not candidate.is_file():
@@ -123,6 +124,23 @@ def remove_owned_root(root, *, confirmation, manifest_sha256, workers_stopped=Fa
             relative = current.relative_to(path).as_posix()
             if relative != MARKER:
                 observed.add(relative)
+    known_dirs = {
+        str(Path(relative).parent.as_posix())
+        for relative in known
+        if Path(relative).parent != Path(".")
+    }
+    allowed_dirs = set()
+    for parent in known_dirs:
+        item = Path(parent)
+        while item != Path("."):
+            allowed_dirs.add(item.as_posix())
+            item = item.parent
+    actual_dirs = {
+        p.relative_to(path).as_posix()
+        for p in path.rglob("*") if p.is_dir()
+    }
+    if actual_dirs != allowed_dirs:
+        raise RuntimeError("Unknown or missing directories prevent deletion")
     if observed != known:
         raise RuntimeError(
             f"Unregistered or missing files prevent deletion: {sorted(observed ^ known)}"
