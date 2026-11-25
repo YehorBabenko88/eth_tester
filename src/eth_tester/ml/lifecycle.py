@@ -56,6 +56,13 @@ def run_shadow_cycle(settings, rows, boundaries, previous_trained_count=0,
 def admit_paper_candidate(settings, candidate_id, model, train, validation,
                           shadow, *, champion=None, gates=Gates()):
     """Atomic metadata promotion if independent gates pass; not a trading command."""
+    # Refit the fixed canonical training algorithm. This prevents a caller from
+    # sneaking validation-optimized weights through a favorable shadow report.
+    try:
+        if fit(train) != model:
+            return False, "noncanonical or altered model artifact"
+    except ValueError:
+        return False, "training evidence invalid"
     approved, reason = approve_candidate(model, champion, train, validation, shadow, gates)
     if not approved:
         return False, reason
