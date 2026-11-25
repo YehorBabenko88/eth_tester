@@ -22,6 +22,14 @@ from eth_tester.config import Settings
 pytestmark = pytest.mark.postgres
 
 
+def qa_strategy_reason():
+    """Use the D/MASTER canonical version plus immutable parameter hash."""
+    params = Parameters()
+    identity = params.identity()
+    engine = f"{params.version}:{identity['parameter_sha256'][:12]}"
+    return {"strategy_version": engine, "rules_version": params.version, **identity}
+
+
 @pytest.fixture
 def pg_settings():
     admin_dsn = os.environ.get("ETH_TEST_PG_DSN")
@@ -45,13 +53,11 @@ def test_schema_and_one_open_position_guard(pg_settings):
         assert row["equity"] == pg_settings.initial_equity_usd
         conn.execute("UPDATE bot_control SET enabled=true,paused=false WHERE singleton=true")
     first_id = open_paper(pg_settings, "long", D(100), D("99.5"), D(104),
-                       {"qa": True, "strategy_version": Parameters().version,
-                        **Parameters().identity()})
+                       {**qa_strategy_reason(), "qa": True})
     assert first_id > 0
     with pytest.raises(RuntimeError, match="One trade only"):
         open_paper(pg_settings, "short", D(100), D(102), D(96),
-                   {"qa": True, "strategy_version": Parameters().version,
-                    **Parameters().identity()})
+                   {**qa_strategy_reason(), "qa": True})
     with pytest.raises(psycopg.errors.UniqueViolation):
         with connection(pg_settings) as conn:
             conn.execute("""INSERT INTO paper_trades
@@ -188,7 +194,7 @@ def test_new_paper_admission_rejects_missing_or_tampered_identity(pg_settings):
     """MASTER round 2: no new admission with unknown version/hash."""
     with connection(pg_settings) as conn:
         conn.execute("UPDATE bot_control SET enabled=true,paused=false WHERE singleton=true")
-    valid = {"strategy_version": Parameters().version, **Parameters().identity()}
+    valid = qa_strategy_reason()
     invalid = (
         {"source": "unversioned"},
         {**valid, "parameter_sha256": "0" * 64},
@@ -232,7 +238,8 @@ def test_no_signal_persists_full_versioned_engine_identity(pg_settings, monkeypa
     assert saved is not None
     parameters = Parameters()
     expected_hash = parameters.identity()["parameter_sha256"]
-    assert saved["version"].startswith(parameters.version + ":")
-    assert expected_hash[:12] in saved["version"]
-    assert saved["reason"]["strategy_version"] == parameters.version
+    engine_identity = f"{parameters.version}:{expected_hash[:12]}"
+    assert saved["version"] == engine_identity
+    assert saved["reason"]["strategy_version"] == engine_identity
+    assert saved["reason"]["rules_version"] == parameters.version
     assert saved["reason"]["parameter_sha256"] == expected_hash
