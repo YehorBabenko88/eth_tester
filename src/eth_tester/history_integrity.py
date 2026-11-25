@@ -111,42 +111,58 @@ async def collect_klines(settings, client, kind, tf):
                     evidence={"error": str(exc), "kind": kind, "tf": tf},
                     instrument=settings.category)
             raise
-        with connection(settings) as conn:
-            if status == "verified":
-                for stamp, row in values.items():
-                    store_candle(conn, settings.symbol, kind, tf, stamp, row)
+        try:
+            with connection(settings) as conn:
+                if status == "verified":
+                    for stamp, row in values.items():
+                        store_candle(conn, settings.symbol, kind, tf, stamp, row)
+                    conn.execute(
+                        """UPDATE data_gaps SET resolved_at=now()
+                           WHERE source=%s AND symbol=%s AND start_ts=%s AND end_ts=%s
+                           AND resolved_at IS NULL""",
+                        (gap_source, settings.symbol, as_utc(pos), as_utc(end)))
+                else:
+                    record_gap(conn, settings.symbol, gap_source, pos, end,
+                               f"Historical candle request returned {status}")
+                write_coverage(
+                    conn, source=source, symbol=settings.symbol, interval=tf,
+                    start_ms=pos, end_exclusive_ms=next_open(tf, end),
+                    status="verified" if status == "verified" else "unavailable",
+                    observed_rows=len(values), expected_rows=expected,
+                    checksum=checksum if values else None,
+                    quality="exchange_closed_grid_checked" if values else "not_observed",
+                    evidence={"kind": kind, "tf": tf, "endpoint": KINDS[kind],
+                              "requested_start_ms": pos, "requested_end_ms": end,
+                              "row_count": len(values)},
+                    instrument=settings.category)
+                missing = conn.execute(
+                    """SELECT count(*) AS total FROM data_gaps
+                       WHERE source=%s AND symbol=%s AND resolved_at IS NULL""",
+                    (gap_source, settings.symbol)).fetchone()["total"]
+                quality = "observed_partial" if missing else "verified"
+                save_cursor(conn, source, settings.symbol, tf,
+                            as_utc(next_open(tf, end)), status=quality)
                 conn.execute(
-                    """UPDATE data_gaps SET resolved_at=now()
-                       WHERE source=%s AND symbol=%s AND start_ts=%s AND end_ts=%s
-                       AND resolved_at IS NULL""",
-                    (gap_source, settings.symbol, as_utc(pos), as_utc(end)))
-            else:
+                    """UPDATE ingestion_cursor SET meta=COALESCE(meta,'{}'::jsonb) || jsonb_build_object(
+                      'window_start',%s::text,'window_end',%s::text,
+                      'window_status',%s::text,'unresolved_windows',%s::bigint)
+                       WHERE source=%s AND symbol=%s AND instrument='linear'
+                         AND interval=%s""",
+                    (as_utc(pos).isoformat(), as_utc(end).isoformat(),
+                     status, missing, source, settings.symbol, tf))
+        except DataIntegrityError as exc:
+            # The failed candle transaction rolls back. Preserve independent
+            # conflict evidence in a new transaction before surfacing failure.
+            with connection(settings) as conn:
                 record_gap(conn, settings.symbol, gap_source, pos, end,
-                           f"Historical candle request returned {status}")
-            write_coverage(
-                conn, source=source, symbol=settings.symbol, interval=tf,
-                start_ms=pos, end_exclusive_ms=next_open(tf, end),
-                status="verified" if status == "verified" else "unavailable",
-                observed_rows=len(values), expected_rows=expected,
-                checksum=checksum if values else None,
-                quality="exchange_closed_grid_checked" if values else "not_observed",
-                evidence={"kind": kind, "tf": tf, "endpoint": KINDS[kind],
-                          "requested_start_ms": pos, "requested_end_ms": end,
-                          "row_count": len(values)},
-                instrument=settings.category)
-            missing = conn.execute(
-                """SELECT count(*) AS total FROM data_gaps
-                   WHERE source=%s AND symbol=%s AND resolved_at IS NULL""",
-                (gap_source, settings.symbol)).fetchone()["total"]
-            quality = "observed_partial" if missing else "verified"
-            save_cursor(conn, source, settings.symbol, tf,
-                        as_utc(next_open(tf, end)), status=quality)
-            conn.execute(
-                """UPDATE ingestion_cursor SET meta=COALESCE(meta,'{}'::jsonb) || jsonb_build_object(
-                  'window_start',%s::text,'window_end',%s::text,
-                  'window_status',%s::text,'unresolved_windows',%s::bigint)
-                   WHERE source=%s AND symbol=%s AND instrument='linear'
-                     AND interval=%s""",
-                (as_utc(pos).isoformat(), as_utc(end).isoformat(),
-                 status, missing, source, settings.symbol, tf))
+                           f"Stored market-data conflict: {exc}")
+                write_coverage(
+                    conn, source=source, symbol=settings.symbol, interval=tf,
+                    start_ms=pos, end_exclusive_ms=next_open(tf, end),
+                    status="gap", observed_rows=len(values), expected_rows=expected,
+                    checksum=checksum, quality="conflict_rejected",
+                    evidence={"error": str(exc), "kind": kind, "tf": tf,
+                              "reason": "stored_immutable_candle_conflict"},
+                    instrument=settings.category)
+            raise
         pos = next_open(tf, end)
