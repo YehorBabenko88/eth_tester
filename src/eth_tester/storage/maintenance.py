@@ -102,34 +102,56 @@ def cleanup_owned_temp(root, *, now=None, older_than_seconds=3600, max_files=100
                 raise RuntimeError('Exact owned-temp marker required')
         finally:
             os.close(marker_fd)
-        deleted = 0
+        # A scan-budget failure is a PRE-MUTATION failure. Bounded preflight
+        # captures at most the requested file identities, never an unbounded
+        # directory list. The descriptor is pinned across both phases.
+        candidates = []
         scanned = 0
         visited = 0
-        # scandir(fd) streams, unlike sorted(Path.iterdir()); no unbounded list.
         with os.scandir(root_fd) as entries:
             for item in entries:
                 visited += 1
                 if visited > 10000:
-                    raise RuntimeError('Owned temp scan budget exceeded')
-                if deleted >= max_files:
-                    break
+                    raise RuntimeError('Owned temp scan budget exceeded; no files deleted')
                 name = item.name
                 if not _TEMP_PATTERN.fullmatch(name):
                     continue
                 scanned += 1
                 try:
                     info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or info.st_uid != st.st_uid
+                        or info.st_mtime > instant - older_than_seconds):
+                    continue
+                if len(candidates) < max_files:
+                    candidates.append((name, info.st_dev, info.st_ino,
+                                       info.st_size, info.st_mtime_ns))
+        deleted = 0
+        try:
+            for name, dev, ino, size, mtime in candidates:
+                try:
+                    info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
                     if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                            or info.st_uid != st.st_uid
+                            or (info.st_dev, info.st_ino, info.st_size,
+                                info.st_mtime_ns) != (dev, ino, size, mtime)
                             or info.st_mtime > instant - older_than_seconds):
                         continue
                     os.unlink(name, dir_fd=root_fd)
                     deleted += 1
                 except FileNotFoundError:
                     continue
+        except OSError as exc:
+            raise RuntimeError(
+                f'Owned temp sweep partially completed; deleted={deleted}; '
+                'manual inspection required') from exc
         return {'status': 'ok', 'deleted_owned_temp_files': deleted,
                 'matched_candidates_scanned': scanned,
                 'raw_market_data_deleted': 0, 'backups_deleted': 0,
-                'bounded': deleted == max_files}
+                'bounded': scanned > len(candidates) or deleted == max_files,
+                'scan_complete': True}
     finally:
         os.close(root_fd)
 

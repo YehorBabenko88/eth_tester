@@ -6,7 +6,6 @@ Do not expose database passwords in process command lines.
 import hashlib
 import os
 from pathlib import Path
-import shutil
 import subprocess
 
 import psycopg
@@ -49,75 +48,56 @@ def backup_sha256(path):
 
 
 def verify_backup(path, *, expected_sha256=None, expected_database=None):
-    if not shutil.which("pg_restore"):
-        raise RuntimeError("pg_restore unavailable")
-    try:
-        source = Path(path).resolve(strict=True)
-    except (FileNotFoundError, NotADirectoryError) as exc:
-        raise RuntimeError('PostgreSQL backup file missing') from exc
-    if source.stat().st_size <= 0:
-        raise RuntimeError("Empty PostgreSQL backup")
-    if expected_sha256 is not None and backup_sha256(source) != expected_sha256:
-        raise RuntimeError("PostgreSQL backup checksum mismatch")
-    result = subprocess.run(
-        ["pg_restore", "--list", str(source)],
-        capture_output=True, text=True, check=True, timeout=120,
-    )
-    if "eth_storage_identity" not in result.stdout:
-        raise RuntimeError("ETH Tester ownership marker absent from backup")
-    if expected_database is not None:
-        names = [line.split("dbname:", 1)[1].strip() for line in result.stdout.splitlines()
-                 if line.lstrip().startswith(";") and "dbname:" in line]
-        if names != [expected_database]:
-            raise RuntimeError("Backup source database does not match target")
-    return True
+    """TOC sanity check ONLY; not a successful full restore attestation."""
+    from .secure_backup import verified_archive
+    with verified_archive(path, expected_sha256=expected_sha256,
+                          expected_database=expected_database):
+        return True
 
 
 def backup_database(url, destination):
-    validate_db_name(url)
-    target = Path(destination).resolve()
-    if target.exists():
-        raise FileExistsError(target)
-    if not shutil.which("pg_dump"):
-        raise RuntimeError("pg_dump unavailable")
+    """Build a verified archive in an owner-controlled directory, publish last."""
+    from .secure_backup import dump_privately
+    name = validate_db_name(url)
     with psycopg.connect(url, connect_timeout=10) as conn:
         check_ownership(conn)
-    target.parent.mkdir(parents=True, exist_ok=True)
     cli_dsn, env = _pg_cli_conninfo(url)
-    try:
-        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "wb") as out:
-            subprocess.run(
-                ["pg_dump", "--format=custom", "--no-password",
-                 "--dbname", cli_dsn],
-                env=env, stdout=out, check=True, timeout=7200,
-            )
-        verify_backup(target, expected_database=validate_db_name(url))
-        return target
-    except BaseException:
-        target.unlink(missing_ok=True)
-        raise
+    return dump_privately(url, destination, cli_dsn=cli_dsn,
+                          env=env, expected_database=name)
 
 
 def restore_database(url, backup_path, *, expected_sha256=None):
-    """Restore only into a database which does not already exist."""
+    """Restore a pinned verified archive only into a NEW dedicated database.
+
+    The same private descriptor is passed to pg_restore both for TOC and data.
+    A failed restoration remains for explicit investigation and is NOT claimed
+    to be recovered. This operation does not drop any existing database.
+    """
+    from .secure_backup import verified_archive
     name = validate_db_name(url)
-    verify_backup(backup_path, expected_sha256=expected_sha256)
-    admin_url = make_conninfo(url, dbname="postgres")
-    with psycopg.connect(admin_url, autocommit=True, connect_timeout=10) as admin:
-        if admin.execute("SELECT 1 FROM pg_database WHERE datname=%s", (name,)).fetchone():
-            raise FileExistsError(f"Database {name} already exists")
-        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
-    cli_dsn, env = _pg_cli_conninfo(url)
-    # A failed restore remains intact for explicit operator inspection.
-    subprocess.run(
-        ["pg_restore", "--no-owner", "--no-privileges", "--no-password",
-         "--exit-on-error", "--single-transaction", "--dbname", cli_dsn,
-         str(Path(backup_path).resolve(strict=True))],
-        env=env, check=True, timeout=7200,
-    )
-    with psycopg.connect(url, connect_timeout=10) as conn:
-        check_ownership(conn)
+    with verified_archive(backup_path, expected_sha256=expected_sha256) as (
+            binary, fd, pinned_source, checksum):
+        admin_url = make_conninfo(url, dbname="postgres")
+        with psycopg.connect(admin_url, autocommit=True, connect_timeout=10) as admin:
+            if admin.execute(
+                    "SELECT 1 FROM pg_database WHERE datname=%s", (name,)
+            ).fetchone():
+                raise FileExistsError(f"Database {name} already exists")
+            admin.execute(
+                sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name))
+            )
+        cli_dsn, env = _pg_cli_conninfo(url)
+        subprocess.run(
+            [binary, "--no-owner", "--no-privileges", "--no-password",
+             "--exit-on-error", "--single-transaction", "--dbname",
+             cli_dsn, pinned_source],
+            env=env, pass_fds=(fd,), check=True, timeout=7200,
+        )
+        with psycopg.connect(url, connect_timeout=10) as conn:
+            check_ownership(conn)
+    from ..config import Settings
+    from ..database import verify_existing_schema
+    verify_existing_schema(Settings(_env_file=None, database_url=url))
 
 
 def deletion_manifest(url, backup_path):

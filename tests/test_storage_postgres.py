@@ -296,9 +296,26 @@ def test_paper_event_idempotency_and_monotonic_cursor(postgres_lab):
         )
 
 
-def test_verified_backup_restore_and_scoped_delete(postgres_lab, tmp_path):
-    if not shutil.which("pg_dump") or not shutil.which("pg_restore"):
-        pytest.skip("pg_dump and pg_restore are mandatory for backup integration")
+def test_verified_backup_restore_and_scoped_delete(postgres_lab, tmp_path, monkeypatch):
+    # File-descriptor pinning is POSIX /proc-only. Windows fails CLOSED, not
+    # through an unsafe PATH/native-handle fallback.
+    if os.name != "posix" or not Path("/proc/self/fd").is_dir():
+        pytest.skip("Round14 secure backup needs POSIX /proc FD support")
+    from eth_tester.storage.secure_backup import trusted_tool
+    selected = os.environ.get("ETH_TESTER_PG_BIN_DIR", "")
+    if not selected:
+        cli = shutil.which("pg_dump")
+        if not cli:
+            pytest.fail("Real PG backup test cannot find approved pg_dump/pg_restore")
+        candidate = Path(os.path.realpath(cli)).parent
+        if not (candidate / "pg_restore").is_file():
+            pytest.fail("Real PG backup test requires ETH_TESTER_PG_BIN_DIR with native tools")
+        monkeypatch.setenv("ETH_TESTER_PG_BIN_DIR", str(candidate))
+    try:
+        trusted_tool("pg_dump")
+        trusted_tool("pg_restore")
+    except (RuntimeError, OSError) as exc:
+        pytest.fail("Real PG backup test lacks trusted executable: " + str(exc))
     archive = Path(tmp_path) / "owned.dump"
     backup_database(postgres_lab.database_url, archive)
     checksum = backup_sha256(archive)

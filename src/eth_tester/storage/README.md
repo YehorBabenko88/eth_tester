@@ -268,3 +268,65 @@ assertions. Windows-native service, backup/restore, PostgreSQL disk
 pressure, Telegram delivery and 24-hour public-data soak remain NO_GO
 until separately exercised. Telegram persistent outbox design is not
 implemented or certified in Round11.
+
+
+## Round 14 — guarded POSIX backup and bounded temp preflight
+
+All backup/verify/restore invocations **fail closed on Windows** and on POSIX
+without /proc/self/fd and O_NOFOLLOW; native Windows file identity, ACL and
+reparse safety are not yet implemented or qualified. This is a deliberate
+availability limitation, not evidence of Windows support. There is NO fallback
+to a writable PATH or bare pg_dump/pg_restore executable.
+
+An operator must provision a verified, absolute, root- or service-owned
+PostgreSQL client binary directory and set ETH_TESTER_PG_BIN_DIR to its path,
+e.g. the actual PostgreSQL 17/18 native /usr/lib/postgresql/<version>/bin
+directory. Tool binaries must be regular executable, not symlinks, and may not
+be group/other writable. Each ancestor directory must satisfy owned/trusted
+permissions; a root-owned sticky /tmp is an explicit exception. Do not use
+a pg_wrapper symlink or insecure project virtualenv bin path.
+
+The BACKUP DESTINATION PARENT must already exist, be owned by the current
+service UID, have no group/other write permission, and have trusted ancestors.
+No automatic mkdir of arbitrary user-provided backup paths is performed.
+An exclusive random temporary archive is written there with 0600 permissions,
+fsynced, sanity-checked using trusted pg_restore against a private pinned
+snapshot, then linked to the final name without overwriting any existing
+destination. Failed temp cleanup only unlinks a matching original inode;
+foreign substituted file names are left intact. After final publication,
+the parent directory is fsynced. A failure after publication is NOT proof of
+rollback and must be checked by the operator.
+
+For VERIFY and RESTORE the original archive file is opened O_NOFOLLOW,
+copied from that pinned FD into a private 0700 folder, revalidated for source
+identity, and kept open through both pg_restore --list and the actual
+--single-transaction --exit-on-error restore. A sha256 mismatch or changed
+private archive fails closed. pg_restore consumes /proc/self/fd/<fd> via
+subprocess pass_fds, not a second open of a mutable user path. The restore
+target must not exist; a failed restore is kept for explicit inspection.
+After a completed restore, owner marker and schema migration checks run.
+
+IMPORTANT: verifying a pg_restore table of contents and a SHA alone is **NOT**
+a full restore/recovery attestation. The restored data, tables, receipts,
+migration checksums, paper ledger, funded cash flow and operator-owned
+backups must still be independently tested on genuine disposable PG17 and
+PG18 before permitting destructive database deletion. A source archive is
+not promoted to ML or funding certainty by backup verification.
+
+The POSIX temp sweep now verifies the complete <=10000-entry directory
+budget BEFORE any unlink, collects a bounded set of allowlisted old regular
+file identities, and rechecks those identities immediately before deletion
+using the same pinned directory descriptor. If the scan budget is exceeded,
+the function raises with **zero deletes**; it cannot delete a few files and
+then throw an unaccounted scan-limit error. Unexpected unlink failures report
+how many files had already been deleted; even with inode checks, filesystem
+operations are never advertised as crash-atomic. Keep G unattended cleanup
+DISABLED until full OS/PG/24h evidence, and leave ETH_TESTER_OWNED_TEMP_DIR
+UNSET on Windows.
+
+Regression coverage: tests/test_storage_round14_published.py runs synthetic
+POSIX filesystem/OS-subprocess tests and skips native Windows unsupported
+paths; tests/test_storage_postgres.py requires a real disposable PostgreSQL
+server (ETH_TEST_PG_DSN) and a trusted installed PG binary directory. A
+skipped PG run is NOT an accepted backup/restore proof. This round contains
+no DB schema migration and never authorizes real trading.
