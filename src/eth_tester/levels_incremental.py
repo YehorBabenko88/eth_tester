@@ -32,7 +32,8 @@ def _restore(conn, settings, tf, flank, cursor, tolerance):
         ORDER BY ts DESC LIMIT %s""",
         (settings.symbol, tf, cursor, 2 * flank)).fetchall()
     for bar in reversed(tail):
-        engine.history.append(bar)
+        engine.history.append({"ts": bar["ts"], "high": Decimal(bar["high"]),
+                               "low": Decimal(bar["low"]), "close": Decimal(bar["close"])})
     active = conn.execute("""SELECT side,origin_ts,confirmed_at,level_price,status,
             broken_at,retested_at,invalidated_at
         FROM levels
