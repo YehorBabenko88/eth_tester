@@ -150,6 +150,12 @@ def rollup_day(settings, day, tf, digest):
                   AND cursor_ts>=%s""",
                 (predecessor["ts"] if predecessor and predecessor["cvd"] is not None else None,
                  settings.symbol, tf, affected[0]))
+            # Keep no stale CVD visible while an archive correction is
+            # being recomputed; a dirty checkpoint can take several cycles.
+            conn.execute("""UPDATE features SET cvd=NULL
+                WHERE symbol=%s AND tf=%s AND ts>=%s
+                  AND cvd IS NOT NULL""",
+                (settings.symbol, tf, affected[0]))
         conn.execute("""INSERT INTO aggregation_job(symbol,tf,day,archive_sha256,rows)
             VALUES(%s,%s,%s,%s,%s)
             ON CONFLICT(symbol,tf,day) DO UPDATE SET
