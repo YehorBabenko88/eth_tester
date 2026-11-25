@@ -88,3 +88,31 @@ def test_weekly_rollup_daily_archive_correction(c_pg):
     with connection(c_pg) as conn:
         bins=conn.execute("SELECT price FROM footprint WHERE tf='W' ORDER BY price").fetchall()
     assert [x["price"] for x in bins]==[Decimal(100)]
+
+
+def test_indicator_asof_and_trade_vwap(c_pg):
+    from eth_tester.indicator_incremental import indicator_worker_step
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    with connection(c_pg) as conn:
+        for i, hi, lo, close in [(0, 101, 99, 100),
+                                  (1, 103, 99, 102),
+                                  (2, 105, 101, 104)]:
+            conn.execute("""INSERT INTO candles(
+                symbol,kind,tf,ts,open,high,low,close,volume,source)
+                VALUES('ETHUSDT','trade','1',%s,%s,%s,%s,%s,3,'qa')""",
+                (start + timedelta(minutes=i), close, hi, lo, close))
+        conn.execute("""INSERT INTO footprint(
+            symbol,tf,bucket,price,buy_qty,sell_qty,buy_notional,
+            sell_notional,trades)
+            VALUES('ETHUSDT','1',%s,100,2,1,200,100,3)""", (start,))
+    assert indicator_worker_step(c_pg, "1", period=2) == 3
+    assert indicator_worker_step(c_pg, "1", period=2) == 0
+    with connection(c_pg) as conn:
+        items = conn.execute("""SELECT ts,metadata FROM features
+            WHERE symbol='ETHUSDT' AND tf='1' ORDER BY ts""").fetchall()
+    assert items[0]["metadata"]["trade_vwap"] == "100"
+    assert items[0]["metadata"]["trade_vwap_quality"] == "observed_volume_unverified"
+    assert items[0]["metadata"]["causally_certified"] is False
+    assert items[1]["metadata"]["atr"] is not None
+    assert items[2]["metadata"]["realized_volatility"] is not None
