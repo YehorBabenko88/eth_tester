@@ -105,3 +105,11 @@ def test_invalid_baseline_volume_and_oi_grid():
     assert not _matches_volume(D("NaN"), D(9))
     assert _valid_oi(FakeConn().oi, START + timedelta(minutes=1))
     assert not _valid_oi(FakeConn().oi, START + timedelta(hours=1))
+
+def test_book_rejects_negative_level_even_if_total_positive():
+    conn = FakeConn()
+    conn.book["bids"] = {"100": "200", "99": "-1"}
+    assert evaluate(conn)[1]["reason"] == "invalid_book_liquidity"
+    conn = FakeConn()
+    conn.book["asks"] = {"102": "0"}
+    assert evaluate(conn)[1]["reason"] == "invalid_book_liquidity"
