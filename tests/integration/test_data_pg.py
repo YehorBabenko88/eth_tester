@@ -7,7 +7,7 @@ from eth_tester.data_quality import DataIntegrityError
 from eth_tester.database import connection
 from eth_tester.history_integrity import collect_klines, as_utc
 from eth_tester.history_series import collect_oi
-from test_postgres import pg_settings  # reuse QA-owned disposable DB fixture
+from .test_postgres import pg_settings  # reuse QA-owned disposable DB fixture
 
 pytestmark = pytest.mark.postgres
 UTC = timezone.utc
