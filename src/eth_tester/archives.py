@@ -1,7 +1,7 @@
 import asyncio
 import csv
 from datetime import datetime,timedelta,timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR
 import gzip
 import hashlib
 import json
@@ -27,8 +27,16 @@ def parse_trade(row):
     if side.lower() not in ("buy","sell"):
         raise ValueError("Invalid aggressor side")
     numeric_time=Decimal(str(timestamp))
-    seconds=numeric_time/1000 if numeric_time>100000000000 else numeric_time
-    stamp=datetime.fromtimestamp(float(seconds),timezone.utc)
+    if not numeric_time.is_finite() or numeric_time <= 0:
+        raise ValueError("Invalid historical trade timestamp")
+    # Archive CSV may contain sub-millisecond fractions in epoch seconds;
+    # V5 WebSocket / recent REST trade IDs use epoch milliseconds.
+    # Normalize indexed ts to integer UTC milliseconds to make identities
+    # comparable, while retaining the original full precision in raw JSON.
+    epoch_ms = numeric_time if numeric_time > 100000000000 else numeric_time*1000
+    epoch_ms = int(epoch_ms.to_integral_value(rounding=ROUND_FLOOR))
+    stamp=(datetime.fromtimestamp(epoch_ms//1000,timezone.utc)
+           +timedelta(milliseconds=epoch_ms%1000))
     p,q=Decimal(price),Decimal(qty)
     if p<=0 or q<=0:
         raise ValueError("Nonpositive trade price/size")
