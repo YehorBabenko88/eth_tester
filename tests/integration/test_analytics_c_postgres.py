@@ -295,3 +295,29 @@ def test_round4_storage_v1_direct_insert_record_not_reusable(c_pg):
              start+timedelta(minutes=2), start+timedelta(minutes=3), source))
         with pytest.raises(CertificationRejected, match="canonical_storage_v2"):
             _verify_b_writer_v2(conn, "legacy-c-direct", source)
+
+
+def test_round6_live_window_never_promotes_partial_archive_or_creates_ml_snapshot(c_pg):
+    """Real PostgreSQL, genuine closed-bar clock; absence of B witness stays pending."""
+    from eth_tester.live_paper_window import inspect_latest_live_bar
+    from eth_tester.snapshot_producer import certify_snapshot
+
+    now = datetime.now(UTC)
+    closed = now.replace(second=0, microsecond=0) - timedelta(minutes=1)
+    with connection(c_pg) as conn:
+        conn.execute("""INSERT INTO candles(
+            symbol,kind,tf,ts,open,high,low,close,volume,source,closed)
+            VALUES('ETHUSDT','trade','1',%s,100,101,99,100,3,'public',true)""",
+            (closed,))
+    pending = inspect_latest_live_bar(c_pg)
+    assert pending["status"] in ("pending", "expired"), pending
+    if pending["status"] == "pending":
+        assert pending["reason"] in (
+            "b_authoritative_source_witness_missing", "candle_not_closed")
+        assert pending.get("ml_eligible") is False or (
+            pending["reason"] == "candle_not_closed")
+    historic = certify_snapshot(c_pg, "1")
+    assert historic["status"] == "rejected", historic
+    with connection(c_pg) as conn:
+        assert conn.execute("""SELECT count(*) AS n FROM feature_snapshots
+            WHERE symbol='ETHUSDT' AND is_causal""").fetchone()["n"] == 0

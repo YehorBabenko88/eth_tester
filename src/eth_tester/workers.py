@@ -8,6 +8,7 @@ from .book_analysis import replay_orderbook
 from .cvd_incremental import update_cvd
 from .indicator_incremental import indicator_worker_step
 from .snapshot_producer import certify_snapshot
+from .live_paper_window import inspect_latest_live_bar
 from .database import connection
 from .rollups import aggregate_pending
 
@@ -16,9 +17,45 @@ LIVE_FRAMES = tuple(tf for tf in FRAMES if tf not in ("W", "M"))
 
 async def analytics_worker(settings):
     cycle = 0
+    async def run_fast_window():
+        # Independent 5s status sampler; no B witness, no admission, no ML.
+        while True:
+            try:
+                sample = await asyncio.to_thread(inspect_latest_live_bar, settings)
+                with connection(settings) as conn:
+                    conn.execute("""INSERT INTO bot_heartbeat(component,status,detail)
+                        VALUES('live_paper_window','partial',%s::jsonb)
+                        ON CONFLICT(component) DO UPDATE SET
+                        status=EXCLUDED.status,detail=EXCLUDED.detail,
+                        updated_at=clock_timestamp()""",
+                        (json.dumps(sample),))
+            except Exception as exc:
+                try:
+                    with connection(settings) as conn:
+                        conn.execute("""INSERT INTO bot_heartbeat(component,status,detail)
+                            VALUES('live_paper_window','degraded',%s::jsonb)
+                            ON CONFLICT(component) DO UPDATE SET
+                            status=EXCLUDED.status,detail=EXCLUDED.detail,
+                            updated_at=clock_timestamp()""",
+                            (json.dumps({"reason": str(exc)[:200]}),))
+                except Exception:
+                    pass  # Next independent sample retries DB availability.
+            await asyncio.sleep(5)
+
+    fast_task = asyncio.create_task(run_fast_window())
+    try:
+        await _analytics_cycles(settings)
+    finally:
+        fast_task.cancel()
+        await asyncio.gather(fast_task, return_exceptions=True)
+
+
+async def _analytics_cycles(settings):
+    cycle = 0
     while True:
         failures = []
         certification_pending = []
+        live_paper = {"status": "pending", "reason": "not_checked"}
 
         async def run(name, function, *args):
             try:
@@ -28,6 +65,13 @@ async def analytics_worker(settings):
                 return None
 
         try:
+            # The fast 1m availability gate runs ahead of expensive 13-TF work.
+            # Until B publishes independently verified source witnesses this
+            # remains an explicit pending state, NEVER certified/ML eligible.
+            checked = await run("live_paper_window", inspect_latest_live_bar,
+                                settings)
+            if checked is not None:
+                live_paper = checked
             await run("orderbook", replay_orderbook, settings)
             # Archive chunks are checksum/idempotency gated. One day per cycle
             # bounds DB load and makes backfill resume after interruption.
@@ -46,7 +90,9 @@ async def analytics_worker(settings):
                     proof = await run(f"snapshot:{tf}", certify_snapshot, settings, tf)
                     if proof and proof.get("status") == "rejected":
                         certification_pending.append({"tf": tf, "reason": proof["reason"]})
-            status = "degraded" if failures else "ok"
+            status = ("degraded" if failures else
+                      "partial" if certification_pending or
+                      live_paper.get("status") != "ready" else "ok")
             with connection(settings) as conn:
                 conn.execute("""INSERT INTO bot_heartbeat(component,status,detail)
                     VALUES('analytics',%s,%s::jsonb)
@@ -55,6 +101,8 @@ async def analytics_worker(settings):
                     (status, json.dumps({"cycle": cycle,
                                          "errors": len(failures),
                                          "completed": not failures,
+                                         "live_paper": live_paper,
+                                         "ml_certified": False,
                                          "certification_pending": certification_pending})))
                 if failures:
                     conn.execute("""INSERT INTO bot_events(severity,event,data)
