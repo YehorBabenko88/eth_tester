@@ -85,7 +85,6 @@ def test_net_comparison_uses_trade_costs():
 def test_gates_fail_closed_without_shadow_and_drift():
     tr = training()
     val = [sample(i) for i in range(200, 240)]
-    shadow = [sample(i) for i in range(300, 340)]
     model = fit(tr, steps=20)
     ok, why = approve_candidate(model, None, tr, val, [], Gates())
     assert not ok and "samples" in why
