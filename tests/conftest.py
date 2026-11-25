@@ -4,6 +4,10 @@ import socket
 import pytest
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "postgres: requires a real disposable PostgreSQL database")
+
+
 @pytest.fixture(autouse=True)
 def prohibit_external_tcp(monkeypatch):
     original = socket.socket.connect
