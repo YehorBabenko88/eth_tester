@@ -148,3 +148,29 @@ CREATE TABLE IF NOT EXISTS strategy_signals (
  created_at timestamptz NOT NULL DEFAULT now(),
  PRIMARY KEY(symbol,tf,bar_ts,version)
 );
+
+CREATE TABLE IF NOT EXISTS market_ticker_events (
+ id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, symbol text NOT NULL,
+ exchange_ts timestamptz, received_ts timestamptz NOT NULL DEFAULT now(),
+ mark_price numeric, index_price numeric, last_price numeric,
+ open_interest numeric, funding_rate numeric,
+ bid_price numeric, ask_price numeric,
+ event_type text NOT NULL, raw jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ticker_time ON market_ticker_events(symbol,received_ts DESC);
+CREATE TABLE IF NOT EXISTS liquidation_events (
+ id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, symbol text NOT NULL,
+ ts timestamptz NOT NULL, side text NOT NULL,
+ price numeric NOT NULL, qty numeric NOT NULL,
+ raw jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS liquidation_time ON liquidation_events(symbol,ts DESC);
+CREATE TABLE IF NOT EXISTS orderbook_wall_events (
+ id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, symbol text NOT NULL,
+ ts timestamptz NOT NULL, side text NOT NULL, price numeric NOT NULL,
+ prior_qty numeric NOT NULL, new_qty numeric NOT NULL,
+ action text NOT NULL, attribution text NOT NULL DEFAULT 'unknown',
+ source_id bigint,
+ UNIQUE(symbol,source_id,side,price)
+);
+CREATE INDEX IF NOT EXISTS wall_event_time ON orderbook_wall_events(symbol,ts DESC);
