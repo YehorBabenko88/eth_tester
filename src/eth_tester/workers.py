@@ -6,6 +6,7 @@ from .analytics import build_footprint, build_levels, enrich_features
 from .analytics_core import FRAMES
 from .book_analysis import replay_orderbook
 from .cvd_incremental import update_cvd
+from .indicator_incremental import indicator_worker_step
 from .database import connection
 from .rollups import aggregate_pending
 
@@ -39,6 +40,7 @@ async def analytics_worker(settings):
                                   enrich_features, settings, tf, 2)
                 if cycle % 3 == 0:
                     await run(f"cvd:{tf}", update_cvd, settings, tf)
+                    await run(f"indicators:{tf}", indicator_worker_step, settings, tf)
             status = "degraded" if failures else "ok"
             with connection(settings) as conn:
                 conn.execute("""INSERT INTO bot_heartbeat(component,status,detail)
