@@ -86,7 +86,13 @@ async def collect_klines(settings, client, kind, tf):
             lookback = open_time(tf, lookback - 1)
         pos = max(start, lookback)
     else:
-        pos = start
+        # Import lazily: depth probes depend on this module's time-grid helpers.
+        from .data_depth import discover_candle_depth
+
+        observed_start = await discover_candle_depth(settings, client, kind, tf)
+        if observed_start is None:
+            return  # unavailable is logged, never marked as downloaded
+        pos = max(start, observed_start)
     now = ms(datetime.now(UTC))
     end_history = latest_closed(tf, now)
     while pos <= end_history:
