@@ -339,3 +339,238 @@ def test_volume_match_cannot_auto_resolve_publictrade_gap(data_settings):
         row = conn.execute("""SELECT resolved_at FROM data_gaps
             WHERE source='publicTrade' AND symbol='ETHUSDT'""").fetchone()
         assert row["resolved_at"] is None
+
+def test_sha_archive_membership_excludes_ws_only_not_ws_overlap(data_settings):
+    """Exact tape members survive source=websocket; extra WS prints stay out."""
+    from eth_tester.storage.archive_receipts import persist_archive_stage_bins
+    from eth_tester.archive_quality import compare_persisted_archive_bins
+
+    day = date(2026, 1, 8)
+    at = datetime.combine(day, datetime.min.time(), UTC)
+    sha = "f" * 64
+    with connection(data_settings) as conn:
+        for identity, qty in (("ws-overlap", Decimal("0.2")),
+                              ("ws-extra", Decimal("99"))):
+            conn.execute("""INSERT INTO trades(
+                symbol,ts,trade_id,price,qty,side,notional,source)
+                VALUES('ETHUSDT',%s,%s,100,%s,'Buy',%s,'websocket')""",
+                (at, identity, qty, qty*100))
+        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        for identity, qty in (("ws-overlap", Decimal("0.2")),
+                              ("archive-only", Decimal("0.3"))):
+            conn.execute("""INSERT INTO eth_stage(
+                symbol,ts,trade_id,price,qty,side,notional,source)
+                VALUES('ETHUSDT',%s,%s,100,%s,'Buy',%s,'archive')""",
+                (at, identity, qty, qty*100))
+        result = merge_staged_trades(conn, "eth_stage")
+        assert result["input_rows"] == 2
+        persist_archive_stage_bins(
+            conn, "ETHUSDT", day, sha, 2,
+            stage_name="eth_stage", instrument="linear")
+        rows = conn.execute("""SELECT sum(trade_count) AS n,
+                sum(base_qty) AS qty,sum(quote_notional) AS notional
+            FROM archive_source_price_bins
+            WHERE symbol='ETHUSDT' AND archive_day=%s
+              AND archive_sha256=%s""",
+            (day,sha)).fetchone()
+        assert rows["n"] == 2
+        assert rows["qty"] == Decimal("0.5")
+        assert rows["notional"] == Decimal("50")
+        assert conn.execute(
+            "SELECT source FROM trades WHERE trade_id='ws-overlap'"
+        ).fetchone()["source"] == "websocket"
+        first = compare_persisted_archive_bins(conn, "ETHUSDT", day, sha)
+        assert first["status"] == "incomplete_candles"
+        assert first["receipt"]["ml_snapshot_eligible"] is False
+        assert first["receipt"]["proves_all_trade_ids"] is False
+
+
+def test_archive_sha_pinned_recheck_after_official_candles(data_settings):
+    """Late official bars improve a NEW report, never retroactively change source."""
+    from eth_tester.storage.archive_receipts import persist_archive_stage_bins
+    from eth_tester.archive_quality import compare_persisted_archive_bins
+
+    day = date(2026, 1, 9)
+    at = datetime.combine(day, datetime.min.time(), UTC)
+    sha = "7" * 64
+    with connection(data_settings) as conn:
+        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        conn.execute("""INSERT INTO eth_stage(
+            symbol,ts,trade_id,price,qty,side,notional,source)
+            VALUES('ETHUSDT',%s,'late-candle-print',100,2,
+                   'Sell',200,'archive')""", (at,))
+        merge_staged_trades(conn, "eth_stage")
+        persist_archive_stage_bins(
+            conn, "ETHUSDT", day, sha, 1,
+            stage_name="eth_stage", instrument="linear")
+        earlier = compare_persisted_archive_bins(conn, "ETHUSDT", day, sha)
+        assert earlier["status"] == "incomplete_candles"
+        candle_rows = [
+            (at+timedelta(minutes=i), Decimal("2") if i==0 else Decimal(0),
+             Decimal("200") if i==0 else Decimal(0))
+            for i in range(1440)
+        ]
+        with conn.cursor() as cursor:
+            cursor.executemany("""INSERT INTO candles(
+                symbol,kind,tf,ts,open,high,low,close,volume,turnover,source)
+                VALUES('ETHUSDT','trade','1',%s,100,100,100,100,%s,%s,'qa')""",
+                candle_rows)
+        latest = compare_persisted_archive_bins(conn, "ETHUSDT", day, sha)
+        assert latest["status"] == "verified"
+        assert latest["match"] == 1440
+        assert latest["receipt"]["archive_sha256"] == sha
+        assert latest["receipt"]["ml_snapshot_eligible"] is False
+        assert latest["receipt"]["checked_at"] >= earlier["receipt"]["checked_at"]
+        assert earlier["receipt"]["status"] == "incomplete_candles"
+        assert latest["receipt"]["archive_bins_sha256"] == (
+            earlier["receipt"]["archive_bins_sha256"])
+
+
+def test_completed_archive_rehydrates_missing_membership_without_sha_change(data_settings):
+    """Old complete acquisition can be SHA-replayed; no retrospective ML proof."""
+    import asyncio
+    import gzip
+    from hashlib import sha256
+    import httpx
+    from eth_tester.archives import download_archive
+
+    day = date(2026, 1, 10)
+    csv_text = (
+        "timestamp,trdMatchID,side,price,size,symbol\\n"
+        "1768003200,rehydrate-id,Buy,100,1,ETHUSDT\\n"
+    ).replace("\\n", "\n")
+    payload = gzip.compress(csv_text.encode("utf8"))
+    digest = sha256(payload).hexdigest()
+    with connection(data_settings) as conn:
+        conn.execute("""INSERT INTO ingestion_job(
+            source,symbol,day,state,attempts,bytes_downloaded,row_count,sha256)
+            VALUES('trades_archive','ETHUSDT',%s,'complete',1,%s,1,%s)""",
+            (day, len(payload), digest))
+    count = {"requests": 0}
+
+    def handler(request):
+        count["requests"] += 1
+        return httpx.Response(200, content=payload, request=request)
+
+    settings = data_settings.model_copy(update={"minimum_free_gb": 0})
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            assert await download_archive(settings, day, client) == "complete"
+            assert await download_archive(settings, day, client) == "cached"
+    asyncio.run(run())
+    assert count["requests"] == 1
+    with connection(settings) as conn:
+        stored = conn.execute("""SELECT state,sha256 FROM ingestion_job
+            WHERE source='trades_archive' AND symbol='ETHUSDT' AND day=%s""",
+            (day,)).fetchone()
+        assert stored["state"] == "complete"
+        assert stored["sha256"] == digest
+        member = conn.execute("""SELECT sum(trade_count) AS n
+            FROM archive_source_price_bins WHERE archive_day=%s
+              AND archive_sha256=%s""", (day,digest)).fetchone()
+        assert member["n"] == 1
+        assert conn.execute("""SELECT count(*) AS n FROM feature_snapshots
+            WHERE quality='complete'""").fetchone()["n"] == 0
+
+def test_real_pg_fast_closed_minute_receipt_is_db_clock_not_bar_close(data_settings):
+    """Fast real PG producer with mock Bybit payload: no historical backdate."""
+    import asyncio
+    from eth_tester.history_integrity import collect_latest_closed_trade_minute
+
+    class ClosedResponse:
+        async def get(self, path, **params):
+            assert path == "kline" and params["interval"] == "1"
+            assert params["start"] == params["end"]
+            return {"list": [[str(params["start"]), "100", "101", "99",
+                              "100", "1.25", "125"]]}
+    report = asyncio.run(
+        collect_latest_closed_trade_minute(data_settings, ClosedResponse()))
+    assert report["status"] == "closed_grid_observed"
+    assert report["bar_end_ms"] <= report["source_receipt_ms"]
+    assert report["proves_all_trade_ids"] is False
+    stamp = datetime.fromtimestamp(report["bar_start_ms"] / 1000, UTC)
+    with connection(data_settings) as conn:
+        candle = conn.execute("""SELECT volume,turnover,closed FROM candles
+            WHERE symbol='ETHUSDT' AND kind='trade' AND tf='1' AND ts=%s""",
+            (stamp,)).fetchone()
+        assert candle["closed"] is True
+        assert candle["volume"] == Decimal("1.25")
+        assert candle["turnover"] == Decimal("125")
+        evidence = conn.execute("""SELECT status,quality,checked_at,evidence
+            FROM ingestion_coverage
+            WHERE source='kline:trade' AND symbol='ETHUSDT'
+              AND interval='1' AND start_ts=%s""",
+            (stamp,)).fetchone()
+    assert evidence["status"] == "verified"
+    assert evidence["quality"] == "exchange_closed_grid_checked"
+    assert evidence["evidence"]["proves_all_trade_ids"] is False
+    assert evidence["evidence"]["source_receipt_ms"] >= report["bar_end_ms"]
+    assert int(evidence["checked_at"].timestamp()*1000) >= (
+        report["source_receipt_ms"])
+
+
+def test_real_pg_recent_oi_receipt_stays_partial(data_settings):
+    """Actual PostgreSQL B OI witness, never fabricated full 5m historical grid."""
+    import asyncio
+    from eth_tester.history_series import collect_recent_oi_receipt
+
+    class OIResponse:
+        async def get(self, path, **params):
+            assert path == "open-interest" and params["intervalTime"] == "5min"
+            return {"list": [{"timestamp": str(params["endTime"]),
+                              "openInterest": "317.25"}]}
+    result = asyncio.run(collect_recent_oi_receipt(data_settings, OIResponse()))
+    assert result["status"] == "oi_observed_partial"
+    assert result["ml_snapshot_eligible"] is False
+    assert result["source_event_ms"] <= result["source_receipt_ms"]
+    stamp = datetime.fromtimestamp(result["source_event_ms"] / 1000, UTC)
+    with connection(data_settings) as conn:
+        stored = conn.execute("""SELECT value FROM open_interest
+            WHERE symbol='ETHUSDT' AND interval='5min' AND ts=%s""",
+            (stamp,)).fetchone()
+        assert stored["value"] == Decimal("317.25")
+        witness = conn.execute("""SELECT status,quality,evidence,checked_at
+            FROM ingestion_coverage
+            WHERE source='oi' AND symbol='ETHUSDT'
+              AND interval='5min' AND start_ts<=%s AND end_ts>%s
+            ORDER BY checked_at DESC LIMIT 1""",
+            (stamp, stamp)).fetchone()
+    assert witness["status"] == "partial"
+    assert witness["evidence"]["oi_receipt_and_grid_verified"] is False
+    assert witness["evidence"]["source_receipt_ms"] == (
+        result["source_receipt_ms"])
+    assert witness["checked_at"] >= stamp
+
+def test_old_complete_archive_changed_remote_bytes_cannot_mutate_job(data_settings):
+    """Preexisting SHA is immutable even if the public host replaces a gz."""
+    import asyncio
+    import gzip
+    import httpx
+    from eth_tester.archives import download_archive
+
+    day = date(2026, 1, 11)
+    old_sha = "1" * 64
+    with connection(data_settings) as conn:
+        conn.execute("""INSERT INTO ingestion_job(
+            source,symbol,day,state,attempts,sha256,row_count)
+            VALUES('trades_archive','ETHUSDT',%s,'complete',3,%s,1)""",
+            (day,old_sha))
+    payload = gzip.compress(b"timestamp,trdMatchID,side,price,size,symbol\n"
+                            b"1768089600,x,Buy,100,1,ETHUSDT\n")
+    def response(request):
+        return httpx.Response(200, content=payload, request=request)
+    async def attempt():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+            await download_archive(
+                data_settings.model_copy(update={"minimum_free_gb":0}), day, client)
+    with pytest.raises(DataIntegrityError, match="SHA256 changed"):
+        asyncio.run(attempt())
+    with connection(data_settings) as conn:
+        original = conn.execute("""SELECT state,sha256,attempts
+            FROM ingestion_job WHERE source='trades_archive'
+              AND symbol='ETHUSDT' AND day=%s""", (day,)).fetchone()
+        assert original["state"] == "complete"
+        assert original["sha256"] == old_sha
+        assert original["attempts"] == 3
+        assert conn.execute("""SELECT count(*) AS n FROM trades
+            WHERE symbol='ETHUSDT'""").fetchone()["n"] == 0

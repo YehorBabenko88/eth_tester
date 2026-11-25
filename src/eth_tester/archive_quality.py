@@ -214,3 +214,68 @@ def persist_minute_evidence(conn, symbol, day, archive_sha256, instrument="linea
     report["certificate"]["source_receipt_ms"] = int(pinned.timestamp() * 1000)
     report["certificate"]["source_checked_at_ms"] = int(pinned.timestamp() * 1000)
     return report
+
+def compare_persisted_archive_bins(conn, symbol, day, archive_sha256,
+                                   instrument="linear"):
+    """Recheck one immutable archive tape against LATER official closed candles.
+
+    Reads B's SHA-bound source membership, never global trades or source='archive'.
+    The original acquisition receipt must not be edited; the caller/B stores
+    a NEW versioned comparison receipt at the actual recheck instant.
+    """
+    if symbol != "ETHUSDT" or instrument != "linear":
+        raise ValueError("Only ETHUSDT linear base/quote recheck is supported")
+    if not isinstance(archive_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", archive_sha256):
+        raise ValueError("Exact 64-character archive SHA256 required")
+    start = datetime.combine(day, datetime.min.time(), UTC)
+    end = start + timedelta(days=1)
+    membership = conn.execute(
+        """SELECT count(*) AS bins,coalesce(sum(trade_count),0) AS prints
+           FROM archive_source_price_bins
+           WHERE symbol=%s AND instrument=%s AND archive_day=%s
+             AND archive_sha256=%s""",
+        (symbol, instrument, day, archive_sha256)).fetchone()
+    if not membership or membership["bins"] == 0 or membership["prints"] <= 0:
+        raise DataIntegrityError("Exact-SHA archive stage membership unavailable")
+    candles = conn.execute(
+        """SELECT ts,open,high,low,close,volume,turnover,source
+           FROM candles WHERE symbol=%s AND kind='trade' AND tf='1'
+           AND closed AND ts>=%s AND ts<%s ORDER BY ts""",
+        (symbol, start, end)).fetchall()
+    prints = conn.execute(
+        """SELECT minute_ts AS ts,sum(trade_count) AS trade_count,
+                  sum(base_qty) AS base_qty,
+                  sum(quote_notional) AS quote_qty
+           FROM archive_source_price_bins
+           WHERE symbol=%s AND instrument=%s AND archive_day=%s
+             AND archive_sha256=%s
+           GROUP BY minute_ts ORDER BY minute_ts""",
+        (symbol, instrument, day, archive_sha256)).fetchall()
+    if sum(int(row["trade_count"]) for row in prints) != int(membership["prints"]):
+        raise DataIntegrityError("Archive membership print counts disagree")
+    comparisons = build_minute_evidence(day, candles, prints)
+    result = summarize_minutes(comparisons)
+    checked = conn.execute(
+        "SELECT clock_timestamp() AS ts").fetchone()["ts"]
+    if checked.tzinfo is None or checked < end:
+        raise DataIntegrityError("Archive recheck receipt is not after closed day")
+    result["receipt"] = {
+        "contract": "eth_archive_revalidation_v1",
+        "symbol": symbol, "instrument": instrument,
+        "archive_day": day.isoformat(), "archive_sha256": archive_sha256,
+        "status": result["status"],
+        "archive_source": "immutable_sha_bound_price_bins",
+        "stage_trade_prints": int(membership["prints"]),
+        "source_event_start_ms": int(start.timestamp() * 1000),
+        "source_event_end_exclusive_ms": int(end.timestamp() * 1000),
+        "checked_at": checked.astimezone(UTC).isoformat(),
+        "candle_sha256": digest_rows(candles),
+        "archive_bins_sha256": digest_rows(prints),
+        "matched_minutes": result["match"],
+        "expected_closed_minutes": 1440,
+        "proves_all_trade_ids": False,
+        "ml_snapshot_eligible": False,
+        "historical_decision_backdating": False,
+    }
+    return result

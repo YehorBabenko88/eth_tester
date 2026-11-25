@@ -51,12 +51,26 @@ async def download_archive(settings,day,client):
         state=conn.execute("""SELECT state,sha256 FROM ingestion_job
          WHERE source='trades_archive' AND symbol=%s AND day=%s""",
           (symbol,day)).fetchone()
-        if state and state["state"]=="complete":
-            return "complete"
-        conn.execute("""INSERT INTO ingestion_job(source,symbol,day,state,attempts)
-          VALUES('trades_archive',%s,%s,'running',1)
-          ON CONFLICT(source,symbol,day) DO UPDATE SET
-          state='running',attempts=ingestion_job.attempts+1,updated_at=now()""",(symbol,day))
+        replay_complete = bool(state and state["state"] == "complete")
+        original_sha = state["sha256"] if replay_complete else None
+        if replay_complete:
+            # A pre-migration "complete" archive may lack SHA-bound membership.
+            # If membership exists, do not download again. The separate
+            # versioned candle recheck reads durable B price bins.
+            membership = conn.execute(
+                """SELECT 1 FROM archive_source_price_bins
+                   WHERE symbol=%s AND instrument=%s
+                     AND archive_day=%s AND archive_sha256=%s
+                   LIMIT 1""",
+                (symbol, settings.category, day, original_sha)).fetchone()
+            if membership:
+                return "cached"
+        else:
+            conn.execute("""INSERT INTO ingestion_job(source,symbol,day,state,attempts)
+              VALUES('trades_archive',%s,%s,'running',1)
+              ON CONFLICT(source,symbol,day) DO UPDATE SET
+              state='running',attempts=ingestion_job.attempts+1,updated_at=now()""",
+              (symbol,day))
     free=disk_usage(tempfile.gettempdir()).free
     if free < settings.minimum_free_gb*1024**3:
         raise RuntimeError(f"Disk space too low: {free/1024**3:.1f} GiB")
@@ -80,6 +94,11 @@ async def download_archive(settings,day,client):
         with path.open("rb") as reader:
             if hashlib.file_digest(reader, "sha256").hexdigest() != checksum.hexdigest():
                 raise DataIntegrityError("Downloaded archive SHA256 mismatch on disk")
+        if replay_complete and checksum.hexdigest() != original_sha:
+            # Preserve the original completed job and its immutable receipts.
+            # An exchange archive changed on the server; do not overwrite
+            # provenance or retroactively assert the newer bytes are the same.
+            raise DataIntegrityError("Previously completed archive SHA256 changed")
         count=0
         # Atomic COPY staging: never mark partial or damaged gzip archive complete.
         with connection(settings) as conn:
@@ -103,9 +122,19 @@ async def download_archive(settings,day,client):
                 merged = merge_staged_trades(conn, "eth_stage")
                 if merged["input_rows"] != count:
                     raise DataIntegrityError("Archive COPY row count disagrees with stage")
-            certify_archive_day(
-                conn, settings, day, checksum.hexdigest(), stage_name="eth_stage",
-                row_count=count, byte_count=size, url=url)
+                # B-owned append-only membership is derived exclusively from
+                # THIS validated gzip COPY stage, not global trades.source.
+                from .storage.archive_receipts import persist_archive_stage_bins
+                persist_archive_stage_bins(
+                    conn, symbol, day, checksum.hexdigest(), count,
+                    stage_name="eth_stage", instrument=settings.category)
+            if not replay_complete:
+                certify_archive_day(
+                    conn, settings, day, checksum.hexdigest(), stage_name="eth_stage",
+                    row_count=count, byte_count=size, url=url)
+            # Rehydrating an old successfully downloaded day must not rewrite
+            # any original minute volume receipt if later candles differ.
+            # B's separately versioned comparison ledger will re-evaluate it.
             conn.execute("""UPDATE ingestion_job SET state='complete',bytes_downloaded=%s,
               row_count=%s,sha256=%s,error=NULL,updated_at=now()
               WHERE source='trades_archive' AND symbol=%s AND day=%s""",
@@ -221,5 +250,6 @@ async def backfill_archives(settings):
                         raise
                     await asyncio.sleep(min(90, 2**attempt*3))
             print(f"{day} {state} {i+1}/{total} ({100*(i+1)/max(total,1):.1f}%)",flush=True)
-            await asyncio.sleep(1/max(0.05,settings.archive_downloads_per_second))
+            if state != "cached":
+                await asyncio.sleep(1/max(0.05,settings.archive_downloads_per_second))
     print('Resolved full-day archived tick gaps:',resolve_archived_gaps(settings),flush=True)

@@ -234,3 +234,78 @@ async def collect_oi(settings, client, interval):
 async def collect_account_ratios(settings, client, period):
     await _collect_period(settings, client, "account-ratio", "account_ratio",
                           period, ("buyRatio", "sellRatio"), "ratios")
+
+def _record_bounded_oi_observation(conn, symbol, interval, event_ts,
+                                   source_checksum):
+    """B-owned immutable OI receipt, independent of mutable REST cursor."""
+    from .storage.live_evidence import record_oi_observation
+    return record_oi_observation(
+        conn, symbol, interval, event_ts, source_checksum)
+
+
+async def collect_recent_oi_receipt(settings, client):
+    """Bounded near-live 5m OI observation, not historical grid certification.
+
+    The exchange timestamp and PostgreSQL receive clock are deliberately distinct.
+    A sampled REST tail is PARTIAL even if all returned rows are internally valid.
+    """
+    interval = "5min"
+    step = PERIOD_MS[interval]
+    with connection(settings) as conn:
+        queried = conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
+    if queried.tzinfo is None:
+        raise DataIntegrityError("OI observation clock must be timezone-aware")
+    now_ms = ms(queried)
+    last_closed = (now_ms // step - 1) * step
+    first = last_closed - 2 * step
+    response = await client.get(
+        "open-interest", category=settings.category, symbol=settings.symbol,
+        intervalTime=interval, startTime=first, endTime=last_closed, limit=10)
+    raw = response.get("list", [])
+    if not isinstance(raw, list):
+        raise DataIntegrityError("Malformed near-live OI response")
+    observed, _ = validate_period_page(
+        raw, interval, first, last_closed, values=("openInterest",))
+    if not observed:
+        raise DataIntegrityError("Near-live OI response has no closed samples")
+    if any(not v[0].is_finite() or v[0] < 0 for v in observed.values()):
+        raise DataIntegrityError("Invalid near-live OI value")
+    with connection(settings) as conn:
+        received = conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
+        if received.tzinfo is None:
+            raise DataIntegrityError("OI DB receipt clock missing UTC offset")
+        receipt_ms = ms(received)
+        if receipt_ms < max(observed):
+            raise DataIntegrityError("OI source event is later than DB receipt")
+        for stamp, record in observed.items():
+            result = conn.execute(
+                """INSERT INTO open_interest(symbol,interval,ts,value)
+                   VALUES(%s,%s,%s,%s)
+                   ON CONFLICT(symbol,interval,ts)
+                   DO UPDATE SET value=EXCLUDED.value
+                   WHERE open_interest.value=EXCLUDED.value RETURNING ts""",
+                (settings.symbol, interval, as_utc(stamp), record[0])).fetchone()
+            if result is None:
+                raise DataIntegrityError("Conflicting immutable near-live OI")
+        checksum = digest_rows(raw)
+        write_coverage(
+            conn, source="oi", symbol=settings.symbol, interval=interval,
+            start_ms=first, end_exclusive_ms=last_closed+step,
+            status="partial", observed_rows=len(observed), expected_rows=3,
+            checksum=checksum, quality="bounded_oi_samples_not_complete_grid",
+            evidence={"endpoint": "open-interest", "interval": interval,
+                      "source_event_max_ms": max(observed),
+                      "source_receipt_ms": receipt_ms,
+                      "source_receipt_kind": "postgres_clock_timestamp",
+                      "oi_receipt_observed": True,
+                      "oi_receipt_and_grid_verified": False,
+                      "ml_snapshot_eligible": False},
+            instrument=settings.category)
+        # B's durable OI witness is created only AFTER source row + receipt
+        # are present, all inside this exact transaction.
+        _record_bounded_oi_observation(
+            conn, settings.symbol, interval, as_utc(max(observed)), checksum)
+    return {"status": "oi_observed_partial", "source": "oi",
+            "source_event_ms": max(observed),
+            "source_receipt_ms": receipt_ms, "checksum": checksum,
+            "observed_rows": len(observed), "ml_snapshot_eligible": False}

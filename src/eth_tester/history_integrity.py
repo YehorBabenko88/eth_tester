@@ -172,3 +172,58 @@ async def collect_klines(settings, client, kind, tf):
                     instrument=settings.category)
             raise
         pos = next_open(tf, end)
+
+async def collect_latest_closed_trade_minute(settings, client):
+    """Fast, bounded real Bybit V5 1m REST receipt, independent of backfill.
+
+    This witnesses the exchange *closed candle grid only*, NEVER all trade IDs.
+    The source event time is bar close; actual receipt/check are PostgreSQL time.
+    """
+    with connection(settings) as conn:
+        now = conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
+    if now.tzinfo is None:
+        raise DataIntegrityError("Database clock must be timezone aware")
+    now_ms = ms(now)
+    start = open_time("1", now_ms) - FIXED_MS["1"]
+    end = next_open("1", start)
+    result = await client.get(
+        "kline", category=settings.category, symbol=settings.symbol,
+        interval="1", start=start, end=start, limit=1)
+    raw = result.get("list", [])
+    if not isinstance(raw, list):
+        raise DataIntegrityError("Invalid live closed-minute response")
+    with connection(settings) as conn:
+        received = conn.execute(
+            "SELECT clock_timestamp() AS ts").fetchone()["ts"]
+        if received.tzinfo is None:
+            raise DataIntegrityError("Database receipt clock missing UTC offset")
+        receipt_ms = ms(received)
+        values, quality = validate_candle_page(raw, "1", start, start, receipt_ms)
+        if quality != "verified" or set(values) != {start}:
+            raise DataIntegrityError("Latest requested 1m exchange candle not closed")
+        numbers = values[start]
+        if len(numbers) < 6 or any(v is None for v in numbers[:6]):
+            raise DataIntegrityError("Missing official base volume or quote turnover")
+        volume, turnover = numbers[4], numbers[5]
+        if (not volume.is_finite() or not turnover.is_finite()
+                or volume < 0 or turnover < 0):
+            raise DataIntegrityError("Invalid 1m base/quote volume")
+        store_candle(conn, settings.symbol, "trade", "1", start, numbers)
+        checksum = digest_rows(raw)
+        write_coverage(
+            conn, source="kline:trade", symbol=settings.symbol, interval="1",
+            start_ms=start, end_exclusive_ms=end,
+            status="verified", observed_rows=1, expected_rows=1,
+            checksum=checksum, quality="exchange_closed_grid_checked",
+            evidence={"endpoint": "kline", "tf": "1", "closed_bar_only": True,
+                      "source_event_start_ms": start,
+                      "source_event_end_exclusive_ms": end,
+                      "source_receipt_ms": receipt_ms,
+                      "source_receipt_kind": "postgres_clock_timestamp",
+                      "proves_all_trade_ids": False,
+                      "ml_snapshot_eligible": False},
+            instrument=settings.category)
+    return {"status": "closed_grid_observed", "source": "kline:trade",
+            "bar_start_ms": start, "bar_end_ms": end,
+            "source_receipt_ms": receipt_ms, "checksum": checksum,
+            "proves_all_trade_ids": False}
