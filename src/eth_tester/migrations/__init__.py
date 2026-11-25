@@ -5,7 +5,7 @@ Never rewrite an existing market-data table during automatic initialization.
 from importlib.resources import files
 import hashlib
 
-MIGRATIONS = ("0001_partitioned_archive.sql",)
+MIGRATIONS = ("0001_partitioned_archive.sql", "0002_quality_and_provenance.sql")
 
 
 def apply_migrations(conn):
