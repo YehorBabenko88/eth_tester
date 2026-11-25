@@ -2,8 +2,8 @@ from decimal import Decimal as D
 from eth_tester.strategies import Parameters, pattern
 from eth_tester.strategy import economics, price_signal
 
-def bar(o,h,l,c):
-    return dict(open=D(o),high=D(h),low=D(l),close=D(c))
+def bar(o,h,low,c):
+    return dict(open=D(o),high=D(h),low=D(low),close=D(c))
 
 def test_patterns():
     level=D(100)
