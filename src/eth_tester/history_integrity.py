@@ -3,8 +3,10 @@ from datetime import datetime, timezone
 
 from .data_quality import (
     DataIntegrityError, FIXED_MS, next_open, open_time, validate_candle_page,
+    window_grid,
 )
 from .database import connection, cursor_ts, save_cursor
+from .data_coverage import digest_rows, write_coverage
 
 UTC = timezone.utc
 KINDS = {"trade": "kline", "mark": "mark-price-kline",
@@ -92,8 +94,23 @@ async def collect_klines(settings, client, kind, tf):
         result = await client.get(
             KINDS[kind], category=settings.category, symbol=settings.symbol,
             interval=tf, start=pos, end=end, limit=1000)
-        values, status = validate_candle_page(
-            result.get("list", []), tf, pos, end, now)
+        raw = result.get("list", [])
+        expected = len(list(window_grid(tf, pos, end, now)))
+        checksum = digest_rows(raw)
+        try:
+            values, status = validate_candle_page(raw, tf, pos, end, now)
+        except DataIntegrityError as exc:
+            with connection(settings) as conn:
+                record_gap(conn, settings.symbol, gap_source, pos, end,
+                           f"Integrity failure: {exc}")
+                write_coverage(
+                    conn, source=source, symbol=settings.symbol, interval=tf,
+                    start_ms=pos, end_exclusive_ms=next_open(tf, end),
+                    status="gap", observed_rows=len(raw), expected_rows=expected,
+                    checksum=checksum, quality="rejected",
+                    evidence={"error": str(exc), "kind": kind, "tf": tf},
+                    instrument=settings.category)
+            raise
         with connection(settings) as conn:
             if status == "verified":
                 for stamp, row in values.items():
@@ -106,6 +123,17 @@ async def collect_klines(settings, client, kind, tf):
             else:
                 record_gap(conn, settings.symbol, gap_source, pos, end,
                            f"Historical candle request returned {status}")
+            write_coverage(
+                conn, source=source, symbol=settings.symbol, interval=tf,
+                start_ms=pos, end_exclusive_ms=next_open(tf, end),
+                status="verified" if status == "verified" else "unavailable",
+                observed_rows=len(values), expected_rows=expected,
+                checksum=checksum if values else None,
+                quality="exchange_closed_grid_checked" if values else "not_observed",
+                evidence={"kind": kind, "tf": tf, "endpoint": KINDS[kind],
+                          "requested_start_ms": pos, "requested_end_ms": end,
+                          "row_count": len(values)},
+                instrument=settings.category)
             missing = conn.execute(
                 """SELECT count(*) AS total FROM data_gaps
                    WHERE source=%s AND symbol=%s AND resolved_at IS NULL""",
@@ -114,7 +142,7 @@ async def collect_klines(settings, client, kind, tf):
             save_cursor(conn, source, settings.symbol, tf,
                         as_utc(next_open(tf, end)), status=quality)
             conn.execute(
-                """UPDATE ingestion_cursor SET meta=jsonb_build_object(
+                """UPDATE ingestion_cursor SET meta=COALESCE(meta,'{}'::jsonb) || jsonb_build_object(
                   'window_start',%s::text,'window_end',%s::text,
                   'window_status',%s::text,'unresolved_windows',%s::bigint)
                    WHERE source=%s AND symbol=%s AND instrument='linear'
