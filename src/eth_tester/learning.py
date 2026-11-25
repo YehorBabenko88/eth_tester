@@ -65,7 +65,7 @@ def train_shadow(settings,minimum=100,epochs=20):
     return result["id"],stats
 
 
-def train_causal_shadow(settings, as_of_ms, *, source="snapshots",
+def train_causal_shadow(settings, as_of_ms, *, source="snapshots", tf="5",
                         min_rows=180, min_new=100, previous_count=0,
                         embargo_ms=0):
     """Retrain only when enough independently labeled, point-in-time data exist.
@@ -81,7 +81,7 @@ def train_causal_shadow(settings, as_of_ms, *, source="snapshots",
     if min_rows < 30 or embargo_ms < 0:
         raise ValueError("invalid training policy")
     if source == "snapshots":
-        rows, rejected = load_causal_feature_examples(settings, as_of_ms)
+        rows, rejected = load_causal_feature_examples(settings, as_of_ms, tf=tf)
     elif source == "backtest":
         rows, rejected = load_backtest_examples(settings, as_of_ms)
     elif source == "paper":
