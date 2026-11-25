@@ -128,7 +128,13 @@ def existing_trade_chart(settings, trade_id, *, root=None):
     """
     if type(trade_id) is not int or not 0 < trade_id < 2**63:
         raise ValueError("Valid positive paper trade ID required")
-    if not _chart_dirfd_supported():
+    if os.name == "nt":
+        # Never query a ledger path before the native safety gate is satisfied.
+        # The gating switch MUST remain off pending actual Windows QA evidence.
+        from .windows_chart_handle import windows_chart_qa_enabled
+        if not windows_chart_qa_enabled():
+            raise FileNotFoundError("Native Windows chart handle not QA approved")
+    elif not _chart_dirfd_supported():
         raise FileNotFoundError("Cached chart viewing disabled on unverified OS")
     with connection(settings) as conn:
         row = conn.execute("""SELECT id,closed_at,entry_chart,exit_chart
@@ -146,6 +152,9 @@ def existing_trade_chart(settings, trade_id, *, root=None):
             or not trusted.is_absolute() or ".." in trusted.parts
             or Path(os.path.abspath(recorded)) != trusted / expected_name):
         raise FileNotFoundError("Unexpected or absent persisted paper chart path")
+    if os.name == "nt":
+        from .windows_chart_handle import open_chart_windows_native
+        return open_chart_windows_native(trusted, expected_name)
     return _open_chart_posix_directory_fd(trusted, expected_name)
 
 
@@ -155,7 +164,8 @@ def detail_trade(settings, trade_id):
     with connection(settings) as conn:
         row = conn.execute("""SELECT id,symbol,state,direction,signal_ts,opened_at,
                  closed_at,entry,exit,qty,stop,take,gross_pnl,net_pnl,
-                 fee_paid,funding_paid,slippage_paid,exit_reason,reason
+                 fee_paid,funding_paid,slippage_paid,exit_reason,reason,
+                 funding_verified
                  FROM paper_trades WHERE symbol=%s AND id=%s""",
                            (settings.symbol, trade_id)).fetchone()
     if row is None:
@@ -166,6 +176,8 @@ def detail_trade(settings, trade_id):
             f"Stop {row['stop']}; Take {row['take']}; причина выхода {row['exit_reason']}\n"
             f"Gross {row['gross_pnl']}; Net {row['net_pnl']}; комиссии {row['fee_paid']}; "
             f"funding {row['funding_paid']}; slippage {row['slippage_paid']}\n"
+            f"Расходы: funding_verified={row.get('funding_verified') is True}; "
+            "Net и equity предварительные, не сертифицированный результат.\n"
             f"Причины и доказательства (не сертификат ML):\n{_json(row['reason'], limit=24000)}")
 
 
@@ -202,6 +214,7 @@ def read_view(settings, name):
                     f"номинал: {positions['notional']}\n"
                     f"Engine/разрыв потока: {_json(engine, 600)}\n"
                     f"Последний paper_trade_review_v1 (НЕ ML): {_json(review, 600)}\n"
+                    "Equity и risk могут зависеть от неподтверждённых funding/mark.\n"
                     "Реальные ордера запрещены")
         if name == "signals":
             rows = conn.execute("""SELECT bar_ts,tf,decision,version
