@@ -207,3 +207,13 @@ No live orders were placed. **CODE / RUNTIME / ML NO_GO**.
 - There is NO durable Telegram outbox/attempt/ack/idempotent inbound offset yet. Existing `drop_pending_updates=True` can lose commands during downtime; alerts and daily reports must not be represented as reliably delivered. Correct interface belongs to B/G in a later checkpoint.
 
 Test evidence: local isolated G source-byte-matched `service_health.py`, `supervisor.py`, `telegram_views.py`, plus source-equivalent Telegram controller mocks; **83 isolated test invocations passed** across old/new G suites (13 overlap between two R11 files). These are NOT a full checkout, real PostgreSQL17/18, Windows/Telegram/Bybit network, 24/7 soak, or profitable forward validation. The exact GitHub commit must be checked separately in CI. **NO PRODUCTION GO**.
+
+## Round 13 G: cached paper-chart directory replacement protection
+
+The owner-only Telegram `/chart ID` read is now **POSIX-only** with a root-to-leaf chain of pinned directory descriptors (`dir_fd` + `O_DIRECTORY` + `O_NOFOLLOW`), avoiding a second pathname lookup after a mutable parent has been replaced. It rejects a swapped ancestor, symlinked leaf, non-regular file, wrong owner, file over 20 MiB, bad PNG signature and mismatched exact ledger path. It sends the same verified descriptor to the Telegram reply and performs only the original parameterized `SELECT`. No trade-chart content hashes or execution proofs are asserted.
+
+**Windows / reparse-point fail closed:** no native verified safe-directory-handle implementation has been accepted, so `/chart ID` reports that cached PNG viewing is unavailable; no fallback to the previous unsafe `Path.resolve + os.open` sequence. This does not disable paper-trading, halt workers or change the immutable trade ledger.
+
+`/maintenance` counts only old `feed_health` diagnostics eligible under B's `topic <> 'connection'` rule and accurately states that automatic cleanup remains disabled even with the former opt-in. It never authorizes or invokes deletion.
+
+Actual local isolated G source/test run at Round 13: 95 passed (83 carried G regressions + 12 new POSIX/Windows-fail-closed tests); compileall passed. No real PostgreSQL, Telegram API, native Windows, multi-user filesystem service ACL or CI green has been proven. The full exact-SHA CI result must be independently checked by MASTER/H. No Codex, production deployment or real orders.

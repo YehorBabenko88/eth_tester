@@ -13,6 +13,8 @@ from pathlib import Path
 
 from .database import connection
 
+_OPEN_SUPPORTS_DIR_FD = os.open in getattr(os, "supports_dir_fd", ())
+
 COMMANDS = frozenset(("trade", "signals", "models", "research", "risk",
                       "health", "coverage", "maintenance"))
 
@@ -63,14 +65,71 @@ def sanitize_message(message):
     return _DATABASE_URL.sub(r"\1[REDACTED]", value)
 
 
-def existing_trade_chart(settings, trade_id, *, root=None):
-    """Read only a previously stored chart from an exact local owned directory.
+def _chart_dirfd_supported():
+    return (os.name == "posix" and hasattr(os, "O_NOFOLLOW")
+            and hasattr(os, "O_DIRECTORY") and _OPEN_SUPPORTS_DIR_FD)
 
-    In particular NEVER call charts.render_trade: that function changes the
-    paper_trades ledger and overwrites PNG bytes when Telegram merely reads.
+
+def _open_chart_posix_directory_fd(trusted, leaf):
+    """Open a previously saved chart without re-resolving mutable parent paths.
+
+    Each ancestor is visited relative to an already pinned directory handle.
+    Windows has no verified handle/reparse-point implementation here: fail closed.
+    This is an illustration reader, not a cryptographic evidence validator.
+    """
+    if not _chart_dirfd_supported():
+        raise FileNotFoundError("Verified chart path opening unavailable on this OS")
+    original = Path(trusted)
+    if not original.is_absolute() or ".." in original.parts:
+        raise FileNotFoundError("Chart root must have an unambiguous absolute path")
+    if not leaf.startswith("paper_trade_") or not leaf.endswith(".png") or "/" in leaf:
+        raise FileNotFoundError("Unexpected chart filename")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(os.path.sep, directory_flags)
+    try:
+        # Walk from '/' without traversing symlinks in *any* ancestor.
+        for part in original.parts[1:]:
+            if part in ("", ".", ".."):
+                raise FileNotFoundError("Unsafe chart root component")
+            try:
+                new_descriptor = os.open(part, directory_flags, dir_fd=descriptor)
+            except OSError as exc:
+                raise FileNotFoundError("Unverified chart parent directory") from exc
+            os.close(descriptor)
+            descriptor = new_descriptor
+        chart_flags = (os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+                       | getattr(os, "O_NONBLOCK", 0))
+        try:
+            fd = os.open(leaf, chart_flags, dir_fd=descriptor)
+        except OSError as exc:
+            raise FileNotFoundError("Unverified chart file") from exc
+        try:
+            details = os.fstat(fd)
+            if (not stat.S_ISREG(details.st_mode) or details.st_size > 20 * 1024 * 1024
+                    or details.st_uid != os.geteuid()):
+                raise FileNotFoundError("Chart is unowned, oversized or not a regular file")
+            if os.read(fd, 8) != b"\x89PNG\r\n\x1a\n":
+                raise FileNotFoundError("Previously stored chart has invalid PNG header")
+            os.lseek(fd, 0, os.SEEK_SET)
+            return os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+    finally:
+        os.close(descriptor)
+
+
+def existing_trade_chart(settings, trade_id, *, root=None):
+    """SELECT-only read of the exact cached trade PNG, with race-proof POSIX path.
+
+    No E charts.render_trade or paper_trades UPDATE; Windows must fail closed.
+    Directory pinning prevents a parent symlink swap after validation, but
+    does not establish an original-content hash or exchange fill authenticity.
     """
     if type(trade_id) is not int or not 0 < trade_id < 2**63:
         raise ValueError("Valid positive paper trade ID required")
+    if not _chart_dirfd_supported():
+        raise FileNotFoundError("Cached chart viewing disabled on unverified OS")
     with connection(settings) as conn:
         row = conn.execute("""SELECT id,closed_at,entry_chart,exit_chart
             FROM paper_trades WHERE id=%s AND symbol=%s""",
@@ -80,30 +139,14 @@ def existing_trade_chart(settings, trade_id, *, root=None):
     stage = "exit" if row.get("closed_at") is not None else "entry"
     recorded = row.get(stage + "_chart")
     trusted = Path(root) if root is not None else Path.cwd() / "runtime" / "charts"
-    if not trusted.is_dir() or trusted.is_symlink():
-        raise FileNotFoundError("Owned paper chart root unavailable")
-    expected = trusted / f"paper_trade_{trade_id}_{stage}.png"
-    if not recorded or expected.is_symlink() or not expected.is_file():
-        raise FileNotFoundError("Previously stored paper chart unavailable")
-    # The recorded path must match the exact predetermined trade/stage name.
-    if Path(recorded).resolve(strict=True) != expected.resolve(strict=True):
-        raise FileNotFoundError("Unexpected paper chart identity")
-    # No FOLLOW on the leaf, and verify PNG signature on the opened descriptor.
-    # The trusted parent must be ACL-protected against path substitution.
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(expected, flags)
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise FileNotFoundError("Paper chart is not a regular file")
-        if os.read(fd, 8) != b"\x89PNG\r\n\x1a\n":
-            raise FileNotFoundError("Stored paper chart has invalid PNG header")
-        os.lseek(fd, 0, os.SEEK_SET)
-        # Keep the SAME verified descriptor through Telegram send; never
-        # reopen by pathname after a race-prone check.
-        return os.fdopen(fd, "rb")
-    except BaseException:
-        os.close(fd)
-        raise
+    expected_name = f"paper_trade_{trade_id}_{stage}.png"
+    # DB path is only an identity string: never resolve it through mutable
+    # symlinks. Opening must use the pinned-descriptor walk below.
+    if (not isinstance(recorded, str) or ".." in Path(recorded).parts
+            or not trusted.is_absolute() or ".." in trusted.parts
+            or Path(os.path.abspath(recorded)) != trusted / expected_name):
+        raise FileNotFoundError("Unexpected or absent persisted paper chart path")
+    return _open_chart_posix_directory_fd(trusted, expected_name)
 
 
 def detail_trade(settings, trade_id):
@@ -195,10 +238,11 @@ def read_view(settings, name):
                 AND event <> 'paper_trade_review_v1'
                 AND coalesce(data->>'retention','') <> 'preserve'""").fetchone()
             feed = conn.execute("""SELECT count(*) AS n FROM feed_health
-                WHERE ts < clock_timestamp()-interval '90 days'""").fetchone()
+                WHERE ts < clock_timestamp()-interval '90 days'
+                AND topic <> 'connection'""").fetchone()
             return ("Обслуживание: ТОЛЬКО диагностика\n"
-                    f"Старых bot_events: {rows['n']}, feed_health: {feed['n']}\n"
-                    "Периодическая очистка максимум 10000 строк/таблицу; "
+                    f"Очищаемых старых bot_events: {rows['n']}, feed_health (кроме connection): {feed['n']}\n"
+                    "Автоматическая очистка отключена; ручной пакет максимум 10000 строк/таблицу; "
                     "сделки, свечи, архивы, ML-метки не удаляются.\n"
                     "Дистанционное удаление БД отключено.")
     raise ValueError("Unreachable view")
