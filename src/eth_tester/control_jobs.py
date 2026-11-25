@@ -7,11 +7,35 @@ exclusively to Learning F / Storage B.
 
 import json
 import logging
+import re
 
 from .database import connection
 
 LOGGER = logging.getLogger(__name__)
 JOBS = frozenset(("label-horizons", "train-causal-shadow"))
+_MAX_COUNT = 10**12
+# Exact, documented source-validation categories only. F's arbitrary exception
+# text, query content, paths, tokens and user data must NEVER enter telemetry.
+_SAFE_REJECTION_KEYS = frozenset((
+    "not_independently_certified_historical_snapshot",
+    "missing_or_ambiguous_historical_candle_witness",
+    "historical_receipt_not_independently_witnessed",
+    "late_or_backdated_horizon_source",
+    "unresolved_candle_gap",
+    "incomplete_historically_verified_closed_bar_grid",
+    "future_bar_gap_or_wrong_source",
+    "no precommitted immutable label policy",
+    "bounded-live paper evidence is ML ineligible",
+    "paper_trade_closed_after_label_horizon",
+    "full_future_candle_horizon_not_elapsed",
+    "source_not_immutable",
+    "scan_limit_reached",
+))
+_COUNT_FIELDS = frozenset((
+    "usable", "required", "processed", "inserted", "skipped", "rejected",
+    "labelled", "eligible", "candidate_id", "created", "scanned",
+    "next_after_id", "previous_eligible_count", "as_of_ms",
+))
 
 
 def _label_horizons(settings):
@@ -36,21 +60,32 @@ def _causal_shadow(settings):
 
 
 def _sanitize(result):
+    """Keep F counters; reduce free-form rejection evidence to safe categories."""
     if not isinstance(result, dict):
         raise RuntimeError("Research worker did not return explicit status")
     status = result.get("status")
-    if not isinstance(status, str) or not status or len(status) > 96:
+    if not isinstance(status, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,95}", status) is None:
         raise RuntimeError("Research worker returned invalid status")
     if result.get("approved") is True:
         raise RuntimeError("Automatic model approval is prohibited")
-    detail = {"paper_only": True, "ml_certified_by_control": False}
-    for field in ("status", "usable", "required", "processed", "inserted",
-                  "skipped", "rejected", "labelled", "eligible", "candidate_id"):
+    detail = {"paper_only": True, "ml_certified_by_control": False,
+              "status": status}
+    for field in _COUNT_FIELDS:
         value = result.get(field)
-        if field == "status":
-            detail[field] = status
-        elif type(value) is int and 0 <= value < 10**12:
+        if type(value) is int and 0 <= value < _MAX_COUNT:
             detail[field] = value
+    rejected = result.get("rejections")
+    if rejected is not None:
+        if not isinstance(rejected, dict) or len(rejected) > 256:
+            raise RuntimeError("Research worker returned invalid rejection map")
+        counts = {}
+        for key, count in rejected.items():
+            if type(count) is not int or count < 0 or count >= _MAX_COUNT:
+                raise RuntimeError("Research worker returned invalid rejection count")
+            name = key if type(key) is str and key in _SAFE_REJECTION_KEYS else "other"
+            counts[name] = counts.get(name, 0) + count
+        detail["rejection_counts"] = dict(sorted(counts.items()))
+        detail["rejected_total"] = sum(counts.values())
     return status, detail
 
 

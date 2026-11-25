@@ -22,31 +22,49 @@ def utc_age_seconds(now, stamp):
 
 
 def assess(observations, *, now):
-    """Report independent evidence shortages, never return production GO."""
+    """Keep bounded paper and historical ML evidence as independent axes."""
     observations = dict(observations)
-    reasons = []
+    paper_reasons = []
+    ml_reasons = []
     age = {}
     limits = {"last_trade": 15, "last_candle": 240,
-              "analytics_heartbeat": 420, "engine_heartbeat": 60}
+              "analytics_heartbeat": 420, "engine_heartbeat": 60,
+              "paper_publisher_heartbeat": 20}
     for key, maximum in limits.items():
         age[key] = utc_age_seconds(now, observations.get(key))
         if age[key] is None or age[key] > maximum:
-            reasons.append(f"{key}_missing_or_stale")
+            paper_reasons.append(f"{key}_missing_or_stale")
     if observations.get("feed_status") != "connected":
-        reasons.append("feed_not_connected")
-    if observations.get("unresolved_trade_gaps") is None or observations["unresolved_trade_gaps"] > 0:
-        reasons.append("trade_gap_not_cleared")
+        paper_reasons.append("feed_not_connected")
+    gaps = observations.get("unresolved_trade_gaps")
+    if type(gaps) is not int or gaps < 0 or gaps > 0:
+        paper_reasons.append("trade_gap_not_cleared")
+    if observations.get("paper_publisher_status") not in ("published", "ready"):
+        paper_reasons.append("bounded_paper_publisher_not_confirmed")
+    if (observations.get("current_bounded_paper_evidence_count") or 0) == 0:
+        paper_reasons.append("no_current_bounded_paper_evidence")
     if (observations.get("certified_snapshot_count_24h") or 0) == 0:
-        reasons.append("no_verified_immutable_snapshot_v2")
+        ml_reasons.append("no_verified_immutable_snapshot_v2")
     if (observations.get("post_horizon_label_count") or 0) == 0:
-        reasons.append("no_issued_post_horizon_labels")
+        ml_reasons.append("no_issued_post_horizon_labels")
     if (observations.get("shadow_model_count") or 0) == 0:
-        reasons.append("no_registered_shadow_model")
+        ml_reasons.append("no_registered_shadow_model")
+    reasons = sorted(set(paper_reasons + ml_reasons))
     return {
         "paper_only": True,
         "production_go": False,
         "status": "insufficient_evidence" if reasons else "needs_independent_runtime_acceptance",
-        "reasons": sorted(set(reasons)),
+        "reasons": reasons,
+        "bounded_paper": {
+            "state": "blocked" if paper_reasons else "evidence_present_not_accepted",
+            "reasons": sorted(set(paper_reasons)),
+            "ml_eligible": False,
+        },
+        "historical_ml": {
+            "state": "blocked" if ml_reasons else "historical_evidence_present_not_accepted",
+            "reasons": sorted(set(ml_reasons)),
+            "bounded_paper_source_is_eligible": False,
+        },
         "ages_s": age,
         "observed_at": now.astimezone(UTC).isoformat(),
         "metrics": {k: v for k, v in observations.items() if not isinstance(v, datetime)},
@@ -62,10 +80,21 @@ QUERIES = {
                             "WHERE component='analytics'", False),
     "engine_heartbeat": ("SELECT max(updated_at) AS value FROM bot_heartbeat "
                          "WHERE component='paper_engine'", False),
+    "paper_publisher_heartbeat": (
+        "SELECT max(updated_at) AS value FROM bot_heartbeat "
+        "WHERE component='live_paper_window'", False),
+    "paper_publisher_status": (
+        "SELECT detail->>'status' AS value FROM bot_heartbeat "
+        "WHERE component='live_paper_window' ORDER BY updated_at DESC LIMIT 1", False),
     "feed_status": ("SELECT status AS value FROM feed_health WHERE symbol=%s "
                     "AND topic='connection' ORDER BY ts DESC LIMIT 1", True),
     "unresolved_trade_gaps": ("SELECT count(*) AS value FROM data_gaps WHERE symbol=%s "
                               "AND source='publicTrade' AND resolved_at IS NULL", True),
+    "current_bounded_paper_evidence_count": (
+        "SELECT count(*) AS value FROM paper_live_evidence WHERE symbol=%s "
+        "AND contract='eth_paper_live_evidence_v1' AND quality='live_observed_bounded' "
+        "AND paper_only IS TRUE AND ml_eligible IS FALSE "
+        "AND computed_at<=clock_timestamp() AND expires_at>=clock_timestamp()", True),
     "certified_snapshot_count_24h": (
         "SELECT count(*) AS value FROM feature_snapshots WHERE symbol=%s "
         "AND quality='complete' AND is_causal=true "

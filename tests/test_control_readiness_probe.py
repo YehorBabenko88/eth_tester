@@ -17,6 +17,9 @@ def complete():
         "last_candle": NOW-timedelta(seconds=60),
         "analytics_heartbeat": NOW-timedelta(seconds=100),
         "engine_heartbeat": NOW-timedelta(seconds=10),
+        "paper_publisher_heartbeat": NOW-timedelta(seconds=5),
+        "paper_publisher_status": "published",
+        "current_bounded_paper_evidence_count": 1,
         "feed_status": "connected",
         "unresolved_trade_gaps": 0,
         "certified_snapshot_count_24h": 2,
@@ -40,6 +43,7 @@ def test_live_feed_is_not_sufficient_for_ml():
     result = probe.assess(obs, now=NOW)
     assert result['status'] == 'insufficient_evidence'
     assert 'no_issued_post_horizon_labels' in result['reasons']
+    assert result['bounded_paper']['state'] == 'evidence_present_not_accepted'
 
 
 def test_missing_trade_stream_blocks():

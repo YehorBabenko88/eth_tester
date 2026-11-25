@@ -4,7 +4,7 @@ No worker restart changes bot_control, so operator-stopped paper entries stay st
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
@@ -132,6 +132,13 @@ class Supervisor:
                 self._record(name, "exited", exit_code=code)
                 if recurring_seconds is not None and code == 0:
                     delay = 3.0
+                    # An intentional periodic sleep must not appear as a crash.
+                    self._record(
+                        name, "waiting_for_next_run", exit_code=0,
+                        interval_seconds=recurring_seconds,
+                        next_run_at=(datetime.now(timezone.utc) +
+                                     timedelta(seconds=recurring_seconds)).isoformat(),
+                    )
                     await self.sleep(recurring_seconds)
                     continue
                 if time.monotonic() - started >= 60:
