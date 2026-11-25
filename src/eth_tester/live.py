@@ -24,7 +24,7 @@ def ingest_ws(conn,symbol,payload):
             price,qty=Decimal(row["p"]),Decimal(row["v"])
             conn.execute("""INSERT INTO trades(symbol,ts,trade_id,price,qty,side,notional,source,raw)
              VALUES(%s,%s,%s,%s,%s,%s,%s,'websocket',%s::jsonb)
-             ON CONFLICT(symbol,ts,trade_id) DO NOTHING""",
+             ON CONFLICT(symbol,trade_id) DO NOTHING""",
              (symbol,stamp_ms(row["T"]),row["i"],price,qty,side,price*qty,json.dumps(row)))
     elif topic.startswith("orderbook."):
         row=data if isinstance(data,dict) else {}
