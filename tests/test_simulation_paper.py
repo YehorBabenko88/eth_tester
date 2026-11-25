@@ -41,6 +41,9 @@ def test_open_uses_actual_event_timestamp_and_version(monkeypatch):
         def __exit__(self, *_): return None
         def execute(self, sql, params=None):
             calls.append((sql, params))
+            if 'FROM paper_position_state' in sql:
+                return Result({'paper_trade_id': None, 'version': 0,
+                               'pending_exit': False, 'processed_cursor': None})
             if 'SELECT enabled' in sql: return Result({'enabled': True, 'paused': False})
             if 'SELECT 1 FROM paper_trades' in sql: return Result(None)
             if 'SELECT equity' in sql: return Result({'equity': D(10000)})
@@ -57,6 +60,8 @@ def test_open_uses_actual_event_timestamp_and_version(monkeypatch):
     insert = [params for sql, params in calls if 'INSERT INTO paper_trades' in sql][0]
     assert insert[2] == BASE and insert[3] == BASE
     assert insert[-1] == 'eth_rules_v2'
+    assert any('INSERT INTO paper_order_events' in sql for sql, _ in calls)
+    assert any('UPDATE paper_position_state' in sql for sql, _ in calls)
 
 
 def test_close_rejects_nan_before_database(monkeypatch):
