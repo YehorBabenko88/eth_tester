@@ -9,7 +9,7 @@
 - Public WebSocket for raw trade prints, depth-configurable orderbook, ticker/mark/index/OI/funding snapshots and all-liquidation events. Exponential reconnection, persistent tick-gap records and REST refresh.
 - Local dedicated PostgreSQL database with indexed raw trades, OHLCV, funding, OI, ratios, tickers, liquidation, book messages, reconstructed L2 state, large wall changes, footprint, POC, delta, windowed CVD, tape speed, levels, models, signals, backtests and paper trades. Idempotent daily footprint contributions rebuild multi-day (W/M) clusters without double-counting.
 - Deterministic confirmed-pivot rejection signals; one simulated position at a time, $1,000 notional, TP/SL, risk cap, fees, slippage and approximate funding. Conservative OHLC backtests enter at the *next* bar and assume stop hit first when both TP/SL fit within the same bar.
-- Telegram allowlisted /pause /resume /stop /stats /disk /progress /levels /trade /chart ID /gaps; remote database deletion deliberately restricted.
+- Telegram allowlisted /pause /resume /stop /stats /disk /progress /levels /trade /chart ID /gaps; entry/exit evidence PNGs auto-generated when a paper trade opens/closes if candle history is available. Remote database deletion deliberately restricted.
 - Chronological training of experimental shadow logistic models from closed paper trades only. Model is **not** auto-deployed or used to promise profits.
 
 ## Install on Windows PowerShell
