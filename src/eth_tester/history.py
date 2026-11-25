@@ -1,7 +1,7 @@
 from datetime import datetime,timezone
 import json
 from .bybit import MarketClient
-from .database import connection,cursor_ts,save_cursor
+from .database import connection
 from .data_quality import FIXED_MS
 from .history_integrity import collect_klines
 from .history_series import collect_funding, collect_oi, collect_account_ratios
