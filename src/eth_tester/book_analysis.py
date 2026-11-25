@@ -1,4 +1,5 @@
 """Replay raw order book deltas; decreases cannot be attributed to fills vs cancellations."""
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from .database import connection
@@ -37,6 +38,26 @@ def significant(changes,side,threshold):
             events.append((side,price,old,new,action))
     return events
 
+def snapshot_metrics(bids, asks, *, observed_at, as_of, max_age=timedelta(seconds=10)):
+    """Valid-at-time L2 imbalance; never interpret removals as executions."""
+    if observed_at is None or as_of is None or observed_at.tzinfo is None or as_of.tzinfo is None:
+        return {"valid": False, "reason": "missing_utc_timestamps", "imbalance": None}
+    age = as_of - observed_at
+    if not timedelta(0) <= age <= max_age:
+        return {"valid": False, "reason": "stale_or_future_book", "imbalance": None}
+    bid = {Decimal(str(p)): Decimal(str(q)) for p, q in bids.items()}
+    ask = {Decimal(str(p)): Decimal(str(q)) for p, q in asks.items()}
+    if not bid or not ask or any(q <= 0 for q in (*bid.values(), *ask.values())):
+        return {"valid": False, "reason": "empty_or_invalid_book", "imbalance": None}
+    if max(bid) >= min(ask):
+        return {"valid": False, "reason": "crossed_book", "imbalance": None}
+    b, a = sum(bid.values(), Decimal(0)), sum(ask.values(), Decimal(0))
+    return {"valid": True, "reason": "valid_depth_snapshot",
+            "imbalance": (b - a) / (b + a), "best_bid": max(bid),
+            "best_ask": min(ask), "spread": min(ask) - max(bid),
+            "bid_qty": b, "ask_qty": a, "age_seconds": Decimal(str(age.total_seconds()))}
+
+
 def replay_orderbook(settings,batch=2000):
     total=0
     while True:
@@ -49,18 +70,20 @@ def replay_orderbook(settings,batch=2000):
             asks=dict(row["asks"]) if row else {}
             valid=row["valid"] if row else False
             last_u=row["last_update_id"] if row else None
+            latest_received=None
             events=conn.execute("""SELECT id,recv_ts,event_type,bids,asks,update_id
              FROM book_events WHERE symbol=%s AND id>%s ORDER BY id LIMIT %s""",
              (settings.symbol,last,batch)).fetchall()
             if not events:
                 return total
             for item in events:
+                latest_received=item["recv_ts"]
                 typ=item["event_type"]
                 u=item["update_id"]
                 if typ=="snapshot":
                     bids=parse_levels(item["bids"])
                     asks=parse_levels(item["asks"])
-                    valid=True
+                    valid=bool(bids and asks and max(map(Decimal,bids)) < min(map(Decimal,asks)))
                 elif typ=="delta":
                     if not valid:
                         last=item["id"]
@@ -80,6 +103,11 @@ def replay_orderbook(settings,batch=2000):
                         continue
                     b=apply_updates(bids,item["bids"])
                     a=apply_updates(asks,item["asks"])
+                    if bids and asks and max(map(Decimal,bids)) >= min(map(Decimal,asks)):
+                        valid=False
+                        conn.execute("""INSERT INTO data_gaps(source,symbol,start_ts,end_ts,
+                          explanation) VALUES('orderbook',%s,%s,%s,'crossed L2 book')""",
+                          (settings.symbol,item["recv_ts"],item["recv_ts"]))
                     for side,price,old,new,action in (
                         significant(b,"bid",settings.min_wall_qty)+
                         significant(a,"ask",settings.min_wall_qty)):
@@ -91,11 +119,12 @@ def replay_orderbook(settings,batch=2000):
                 last=item["id"]
                 last_u=u
             conn.execute("""INSERT INTO market_book_state(symbol,last_event_id,bids,asks,
-               last_update_id,valid) VALUES(%s,%s,%s::jsonb,%s::jsonb,%s,%s)
+               last_update_id,valid,updated_at) VALUES(%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)
                ON CONFLICT(symbol) DO UPDATE SET last_event_id=EXCLUDED.last_event_id,
                bids=EXCLUDED.bids,asks=EXCLUDED.asks,last_update_id=EXCLUDED.last_update_id,
-               valid=EXCLUDED.valid,updated_at=now()""",
-               (settings.symbol,last,json.dumps(bids),json.dumps(asks),last_u,valid))
+               valid=EXCLUDED.valid,updated_at=EXCLUDED.updated_at""",
+               (settings.symbol,last,json.dumps(bids),json.dumps(asks),last_u,valid,
+                latest_received))
             total+=len(events)
         if len(events)<batch:
             return total
