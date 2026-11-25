@@ -352,3 +352,145 @@ def test_round6_direct_caller_flags_cannot_forge_paper_live_evidence(source_lab)
         assert conn.execute(
             "SELECT count(*) AS n FROM paper_live_evidence"
         ).fetchone()["n"] == 0
+
+
+def test_round8_issued_live_receipt_rejected_after_disconnect_or_l2_gap(source_lab):
+    """Real disposable PG; synthetic receipts prove transaction contract ONLY.
+
+    Start from B's actual publish API, not a directly hand-crafted evidence
+    row. The original row stays immutable; later gaps and invalid replay
+    deny admission. This test never opens a real market order.
+    """
+    import eth_tester.storage.live_evidence as evidence
+
+    now = datetime.now(UTC)
+    start = now.replace(second=0, microsecond=0)-timedelta(minutes=1)
+    end = start+timedelta(minutes=1)
+    session = "r8-" + uuid4().hex[:14]
+    original_id, fresh_id = "R8-ORIGINAL-"+uuid4().hex[:12], "R8-LATEST-"+uuid4().hex[:12]
+    with connection(source_lab) as conn:
+        for trade_id, event_at in (
+            (original_id, end-timedelta(milliseconds=100)),
+            (fresh_id, datetime.now(UTC)-timedelta(milliseconds=100)),
+        ):
+            conn.execute(
+                """INSERT INTO trades(symbol,ts,trade_id,price,qty,side,
+                    notional,source,raw)
+                   VALUES('ETHUSDT',%s,%s,3000,0.01,'Buy',30,'websocket',%s::jsonb)""",
+                (event_at, trade_id, json.dumps({"r8": trade_id})),
+            )
+            evidence.record_trade_receipts(
+                conn, "ETHUSDT", session, [trade_id],
+            )
+        conn.execute(
+            """INSERT INTO candles(symbol,kind,tf,ts,open,high,low,close,
+                volume,turnover,closed,source)
+               VALUES('ETHUSDT','trade','1',%s,3000,3000,3000,3000,
+                      0.01,30,true,'bybit_v5')""",
+            (start,),
+        )
+        snapshot = conn.execute(
+            """INSERT INTO book_events(symbol,recv_ts,update_id,sequence_no,
+                event_type,bids,asks,valid)
+               VALUES('ETHUSDT',clock_timestamp(),1000,1000,'snapshot',
+                      '[["2999","1"]]'::jsonb,'[["3001","1"]]'::jsonb,true)
+               RETURNING id""",
+        ).fetchone()["id"]
+        delta = conn.execute(
+            """INSERT INTO book_events(symbol,recv_ts,update_id,sequence_no,
+                event_type,bids,asks,valid)
+               VALUES('ETHUSDT',clock_timestamp(),1001,1001,'delta',
+                      '[]'::jsonb,'[]'::jsonb,true)
+               RETURNING id,recv_ts""",
+        ).fetchone()
+        conn.execute(
+            """INSERT INTO market_book_state(
+                 symbol,last_event_id,bids,asks,last_update_id,valid,updated_at)
+               VALUES('ETHUSDT',%s,'{"2999":"1"}'::jsonb,
+                      '{"3001":"1"}'::jsonb,1001,true,%s)
+               ON CONFLICT(symbol) DO UPDATE SET
+                 last_event_id=EXCLUDED.last_event_id,bids=EXCLUDED.bids,
+                 asks=EXCLUDED.asks,last_update_id=EXCLUDED.last_update_id,
+                 valid=EXCLUDED.valid,updated_at=EXCLUDED.updated_at""",
+            (delta["id"], delta["recv_ts"]),
+        )
+        book_id = evidence.record_book_lineage(
+            conn, "ETHUSDT", session, snapshot, delta["id"],
+        )
+        oi_at = datetime.now(UTC)-timedelta(minutes=1)
+        conn.execute(
+            """INSERT INTO open_interest(symbol,interval,ts,value)
+               VALUES('ETHUSDT','5min',%s,1000)""", (oi_at,),
+        )
+        oi_id = evidence.record_oi_observation(
+            conn, "ETHUSDT", "5min", oi_at, "a"*64,
+        )
+        conn.execute(
+            """INSERT INTO feed_health(symbol,topic,ts,status,detail)
+               VALUES('ETHUSDT','connection',clock_timestamp(),
+                      'connected',%s::jsonb)""",
+            (json.dumps({"session_id": session}),),
+        )
+        key = evidence.publish_bounded_paper_evidence(
+            conn, "ETHUSDT", start, session, book_id, oi_id,
+        )
+        decision = conn.execute(
+            "SELECT clock_timestamp() AS ts"
+        ).fetchone()["ts"]
+        valid = evidence.require_bounded_paper_evidence(
+            conn, symbol="ETHUSDT", bar_ts=start,
+            evidence_key=key, decision_at=decision, at_admission=True,
+        )
+        assert valid["snapshot_key"] == key
+        assert valid["paper_only"] is True
+        assert valid["ml_eligible"] is False
+
+        # Changing actual L2 state after B's immutable publication must not
+        # admit a paper trade merely because the old SHA is still present.
+        with pytest.raises(ValueError, match="L2"):
+            with conn.transaction():
+                conn.execute(
+                    """UPDATE market_book_state SET valid=false
+                       WHERE symbol='ETHUSDT'""",
+                )
+                evidence.require_bounded_paper_evidence(
+                    conn, symbol="ETHUSDT", bar_ts=start,
+                    evidence_key=key, decision_at=decision,
+                    at_admission=True,
+                )
+        # A real recorded book-only interruption is a decisive rejection.
+        with pytest.raises(ValueError, match="gap|interruption"):
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO data_gaps(
+                         source,symbol,start_ts,end_ts,explanation)
+                       VALUES('orderbook','ETHUSDT',%s,clock_timestamp(),
+                              'synthetic_disposable_pg_r8')""",
+                    (end,),
+                )
+                evidence.require_bounded_paper_evidence(
+                    conn, symbol="ETHUSDT", bar_ts=start,
+                    evidence_key=key, decision_at=decision,
+                    at_admission=True,
+                )
+        # Even a still-valid original B-issued key cannot survive a fresh
+        # disconnect after the proof; no mutating old evidence or backdating.
+        with pytest.raises(ValueError, match="WebSocket"):
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO feed_health(symbol,topic,ts,status,detail)
+                       VALUES('ETHUSDT','connection',clock_timestamp(),
+                              'disconnected',%s::jsonb)""",
+                    (json.dumps({"session_id": session}),),
+                )
+                evidence.require_bounded_paper_evidence(
+                    conn, symbol="ETHUSDT", bar_ts=start,
+                    evidence_key=key, decision_at=decision,
+                    at_admission=True,
+                )
+        assert conn.execute(
+            "SELECT count(*) AS n FROM paper_trades"
+        ).fetchone()["n"] == 0
+        assert conn.execute(
+            "SELECT count(*) AS n FROM paper_order_events"
+        ).fetchone()["n"] == 0

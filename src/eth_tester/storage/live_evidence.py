@@ -447,16 +447,18 @@ def publish_bounded_paper_evidence(
     return key
 
 def require_bounded_paper_evidence(conn, *, symbol, bar_ts, evidence_key,
-                                   decision_at):
+                                   decision_at, at_admission=False):
     """Read-only prospective check for D/E; never returns ML eligibility."""
     _hash(evidence_key)
     start, decision = _utc(bar_ts), _utc(decision_at)
     row = conn.execute(
         """SELECT snapshot_key,source_checksum,contract,symbol,tf,bar_ts,
                   bar_close_at,observed_at,computed_at,expires_at,
-                  quality,paper_only,ml_eligible,evidence,
+                  quality,paper_only,ml_eligible,evidence,trade_session,
+                  trade_count,book_receipt_id,oi_receipt_id,base_volume,
+                  quote_turnover,trade_last_receipt_at,
                   is_ml_certified,is_historical_certified,exchange_complete
-           FROM paper_live_evidence WHERE snapshot_key=%s""",
+           FROM paper_live_evidence WHERE snapshot_key=%s FOR SHARE""",
         (evidence_key,),
     ).fetchone()
     if (row is None or row["symbol"] != symbol or row["tf"] != "1"
@@ -484,6 +486,10 @@ def require_bounded_paper_evidence(conn, *, symbol, bar_ts, evidence_key,
             evidence.get("ml_eligible") is not False or
             evidence.get("exchange_complete") is not False):
         raise ValueError("Tampered immutable live observation identity")
+    from .admission import recheck_admission_sources
+    recheck_admission_sources(conn, row=row, symbol=symbol,
+                              bar_start=start, decision=decision,
+                              at_admission=at_admission)
     return {"snapshot_key": row["snapshot_key"],
             "source_checksum": row["source_checksum"],
             "quality": row["quality"], "contract": row["contract"],
