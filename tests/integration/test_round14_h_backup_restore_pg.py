@@ -5,7 +5,6 @@ is inspected, removed or reconfigured; no exchange operations exist here.
 """
 import hashlib
 import os
-import shutil
 from uuid import uuid4
 
 import pytest
@@ -56,10 +55,30 @@ def h14_disposable_pg():
                 )
 
 
+def _require_trusted_native_postgres_cli():
+    """Configured real PG must use explicit B-approved native binaries.
+
+    Never recover by selecting pg_dump/pg_restore from PATH. Unsupported
+    Windows archive access intentionally remains fail-closed.
+    """
+    if os.name != "posix":
+        pytest.skip("B secure native PostgreSQL backup currently POSIX-only")
+    from eth_tester.storage.secure_backup import trusted_tool
+    for binary in ("pg_dump", "pg_restore"):
+        try:
+            trusted_tool(binary)
+        except (OSError, ValueError, RuntimeError) as exc:
+            pytest.fail(
+                f"No B-trusted {binary}: {type(exc).__name__}. "
+                "Configure ETH_TESTER_PG_BIN_DIR to owned absolute bin dir; "
+                "PATH search is forbidden", pytrace=False,
+            )
+
+
 def test_native_backup_sha_and_full_restored_research_record(h14_disposable_pg, tmp_path):
     settings, source_dsn, target_dsn, target_name, owned = h14_disposable_pg
-    if not shutil.which("pg_dump") or not shutil.which("pg_restore"):
-        pytest.skip("Native PostgreSQL backup/restore tools unavailable")
+    _require_trusted_native_postgres_cli()
+    tmp_path.chmod(0o700)
     marker = "QA_H14_NOT_REAL_TRADING_" + uuid4().hex
     with connection(settings) as conn:
         conn.execute(
@@ -92,6 +111,8 @@ def test_native_backup_sha_and_full_restored_research_record(h14_disposable_pg, 
 
 def test_corrupted_archive_cannot_create_restored_database(h14_disposable_pg, tmp_path):
     _settings, _source_dsn, target_dsn, target_name, _owned = h14_disposable_pg
+    _require_trusted_native_postgres_cli()
+    tmp_path.chmod(0o700)
     corrupt = tmp_path / "not-a-backup"
     corrupt.write_bytes(b"corrupt and untrusted")
     digest = hashlib.sha256(b"different authentic archive").hexdigest()
