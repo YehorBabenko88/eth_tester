@@ -13,6 +13,7 @@ from .database import connection
 from .data_quality import DataIntegrityError, reconcile_minute_volume
 from .data_coverage import write_coverage
 from .archive_quality import persist_minute_evidence
+from .storage.bulk import merge_staged_trades
 
 def parse_trade(row):
     timestamp=row.get("timestamp") or row.get("timestamp_ms") or row.get("time")
@@ -86,43 +87,11 @@ async def download_archive(settings,day,client):
                             count+=1
                 if not count:
                     raise DataIntegrityError("Empty archive cannot be complete")
-                duplicate = cur.execute("""
-                    SELECT trade_id FROM eth_stage GROUP BY trade_id
-                    HAVING count(DISTINCT (ts,price,qty,side)) > 1 LIMIT 1
-                    """).fetchone()
-                if duplicate:
-                    raise DataIntegrityError(
-                        f"Conflicting archive trade duplicate: {duplicate['trade_id']}")
-                conflict = cur.execute("""
-                    SELECT s.trade_id FROM eth_stage s
-                    JOIN trades t ON t.symbol=s.symbol AND t.trade_id=s.trade_id
-                    WHERE t.ts IS DISTINCT FROM s.ts
-                       OR t.price IS DISTINCT FROM s.price
-                       OR t.qty IS DISTINCT FROM s.qty
-                       OR t.side IS DISTINCT FROM s.side LIMIT 1
-                    """).fetchone()
-                if conflict:
-                    raise DataIntegrityError(
-                        f"Archive/live trade identity conflict: {conflict['trade_id']}")
-                written = cur.execute("""
-                    WITH imported AS (
-                      INSERT INTO trades(symbol,ts,trade_id,price,qty,side,notional,source,raw)
-                      SELECT DISTINCT ON (trade_id)
-                        symbol,ts,trade_id,price,qty,side,notional,source,raw
-                      FROM eth_stage ORDER BY trade_id
-                      ON CONFLICT(symbol,trade_id)
-                      DO UPDATE SET price=EXCLUDED.price
-                      WHERE trades.ts=EXCLUDED.ts
-                        AND trades.price=EXCLUDED.price
-                        AND trades.qty=EXCLUDED.qty AND trades.side=EXCLUDED.side
-                      RETURNING trade_id
-                    )
-                    SELECT (SELECT count(*) FROM imported) AS saved,
-                           (SELECT count(DISTINCT trade_id) FROM eth_stage) AS expected
-                    """).fetchone()
-                if written["saved"] != written["expected"]:
-                    raise DataIntegrityError(
-                        "Concurrent archive/live trade conflict; import rolled back")
+                # Storage B owns the identity conflict guard. It validates staged
+                # and existing trade IDs, including the atomic conflict path.
+                merged = merge_staged_trades(conn, "eth_stage")
+                if merged["input_rows"] != count:
+                    raise DataIntegrityError("Archive COPY row count disagrees with stage")
             day_start=datetime.combine(day,datetime.min.time(),timezone.utc)
             write_coverage(
                 conn, source="trades_archive", symbol=symbol, interval="",
