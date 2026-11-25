@@ -6,7 +6,6 @@ snapshot: recorded proof must be persisted with the original trade reason.
 from datetime import datetime, timezone
 import json
 import math
-import re
 
 from . import CLASSES, Example, FEATURE_NAMES, validate
 from ..database import connection
@@ -99,138 +98,81 @@ def load_paper_examples(settings, as_of_ms, *, limit=100000):
 
 
 def from_snapshot_records(records, as_of_ms):
-    """Accept only the exact immutable snapshot captured with the original signal.
+    """Bounded diagnostic decoder; missing LEFT JOIN records are counted, not hidden.
 
-    Feature observation, computation and source receipt must predate the decision.
-    An independently complete horizon label must be available by as_of_ms.
-    A row with missing evidence is rejected, never reconstructed from hindsight.
+    A label must be independently appended after the full bar horizon.
+    A source row never becomes point-in-time valid merely because it existed
+    somewhere in history before this *query*.
     """
-    if not isinstance(as_of_ms, int) or as_of_ms <= 0:
-        raise ValueError("invalid evaluation cutoff")
-    result, rejected = [], {}
+    from .contract import milliseconds, validate_label, validate_snapshot
+
+    if type(as_of_ms) is not int or as_of_ms <= 0:
+        raise ValueError("invalid as-of cutoff")
+    accepted, rejected = [], {}
     for record in records:
         try:
             reason = record["reason"]
             if isinstance(reason, str):
                 reason = json.loads(reason)
-            if not isinstance(reason, dict):
-                raise ValueError("missing signal provenance")
-            snapshot_key = record["snapshot_key"]
-            source = record["source_checksum"]
-            if not isinstance(snapshot_key, str) or not snapshot_key:
-                raise ValueError("invalid snapshot key")
-            if reason.get("ml_snapshot_key") != snapshot_key:
-                raise ValueError("snapshot not bound to original signal")
-            if (not isinstance(source, str) or not re.fullmatch(r"[0-9a-f]{64}", source)
-                    or reason.get("ml_source_checksum") != source):
-                raise ValueError("mismatched or invalid source checksum")
-            if record["snapshot_quality"] != "complete" or record["is_causal"] is not True:
-                raise ValueError("uncertified source")
-            decision = epoch_ms(record["decision_at"])
-            opening = epoch_ms(record["opened_at"])
-            closing = epoch_ms(record["closed_at"])
-            available = epoch_ms(record["available_at"])
-            observed = epoch_ms(record["observed_at"])
-            computed = epoch_ms(record["computed_at"])
-            bar = epoch_ms(record["bar_ts"])
-            if not (0 < bar <= available <= observed <= computed <= decision
-                    <= opening < closing):
-                raise ValueError("hindsight or backdated snapshot")
-            provenance = record["provenance"]
-            if isinstance(provenance, str):
-                provenance = json.loads(provenance)
-            if not isinstance(provenance, dict):
-                raise ValueError("missing producer provenance")
-            if provenance.get("source_coverage_verified") is not True:
-                raise ValueError("unverified source coverage")
-            receipt = provenance.get("source_receipt_ms")
-            if not isinstance(receipt, int) or not available <= receipt <= observed:
-                raise ValueError("invalid source receipt")
-            available_by_feature = provenance["feature_available_ms"]
-            if not isinstance(available_by_feature, dict):
-                raise ValueError("missing per-feature times")
-            feature_times = tuple(available_by_feature[name] for name in FEATURE_NAMES)
-            if any(not isinstance(t, int) or t < bar or t > available
-                   for t in feature_times):
-                raise ValueError("future or invalid feature availability")
-            values_json = record["values_json"]
-            if isinstance(values_json, str):
-                values_json = json.loads(values_json)
-            if not isinstance(values_json, dict):
-                raise ValueError("missing feature values")
-            values = tuple(float(values_json[name]) for name in FEATURE_NAMES)
-            if any(not math.isfinite(v) for v in values):
-                raise ValueError("nonfinite features")
-            label = reason["ml_label"]
-            if not isinstance(label, dict):
-                raise ValueError("missing independent structural label")
-            outcome = label.get("outcome")
-            horizon = label.get("horizon_end_ms")
-            issued = label.get("issued_at_ms")
-            if (label.get("method") != "fixed_horizon_barrier_v1"
-                    or label.get("coverage_verified") is not True
-                    or not isinstance(label.get("source_checksum"), str)
-                    or not re.fullmatch(r"[0-9a-f]{64}", label["source_checksum"])
-                    or outcome not in CLASSES
-                    or not isinstance(horizon, int) or not isinstance(issued, int)
-                    or not closing <= horizon <= issued <= as_of_ms):
-                raise ValueError("unverified or unfinished structural label")
-            if reason.get("ml_outcome", outcome) != outcome:
-                raise ValueError("conflicting structural label")
-            notional = float(record["notional"])
-            gross_total = float(record["gross_pnl"])
-            fees = float(record["fees"])
+            values, times, decision = validate_snapshot(record, reason)
+            closed = milliseconds(record["closed_at"])
+            trade_id = record["paper_trade_id"]
+            outcome, horizon = validate_label(
+                record, reason, as_of_ms, closed, trade_id)
+            nominal = float(record["notional"])
+            gross = float(record["gross_pnl"])
+            fee = float(record["fees"])
             funding = float(record["funding"])
-            net_total = float(record["net_pnl"])
-            if (not all(map(math.isfinite, (notional, gross_total, fees,
-                                           funding, net_total)))
-                    or not 0 < notional <= 1000):
-                raise ValueError("invalid paper notional or PnL")
-            gross = gross_total / notional
-            costs = (fees + funding) / notional
-            if abs(gross - costs - net_total / notional) > 1e-7:
-                raise ValueError("pnl mismatch")
-            event_id = record["event_id"]
-            if not isinstance(event_id, str) or not event_id:
-                raise ValueError("invalid event id")
-            result.append(Example(event_id, decision, horizon, values,
-                                  feature_times, outcome, gross, costs))
-        except (KeyError, ValueError, TypeError, OverflowError,
-                ZeroDivisionError) as exc:
-            error = str(exc)
-            rejected[error] = rejected.get(error, 0) + 1
-    return validate(result, as_of_ms), rejected
+            net = float(record["net_pnl"])
+            if (not all(math.isfinite(x) for x in (nominal, gross, fee, funding, net))
+                    or not 0 < nominal <= 1000
+                    or abs(gross - fee - funding - net) > max(1e-7, nominal*1e-9)):
+                raise ValueError("inconsistent paper cost/notional basis")
+            if decision >= closed:
+                raise ValueError("position closed before ML decision")
+            accepted.append(Example(
+                f"paper:{trade_id}", decision, horizon, values, times, outcome,
+                gross / nominal, (fee + funding) / nominal))
+        except (KeyError, TypeError, ValueError, OverflowError,
+                ZeroDivisionError, AttributeError) as exc:
+            name = f"{type(exc).__name__}: {str(exc)[:100]}"
+            rejected[name] = rejected.get(name, 0) + 1
+    return validate(accepted, as_of_ms), rejected
 
 
-def load_causal_feature_examples(settings, as_of_ms, *, tf="5", limit=100000):
-    """Use only the exact captured snapshot; no nearest historical fallback.
+def load_causal_feature_examples(settings, as_of_ms, *, tf="1", limit=100000):
+    """Read closed paper, exact immutable snapshot and post-horizon label.
 
-    Source receipts must be genuine. The B-owned schema does not independently
-    prevent a privileged SQL writer from backdating computed_at, so an audited
-    producer contract is mandatory before this data can be called certified.
+    LEFT JOIN is intentional: missing/mismatched/late evidence still counts
+    as rejected data instead of disappearing from an inner-join training set.
     """
-    if not isinstance(as_of_ms, int) or as_of_ms <= 0 or not 1 <= limit <= 1000000:
-        raise ValueError("invalid extraction bound")
+    if (type(as_of_ms) is not int or as_of_ms <= 0
+            or not isinstance(tf, str) or not tf
+            or not isinstance(limit, int) or not 1 <= limit <= 1000000):
+        raise ValueError("invalid causal extraction bound")
     with connection(settings) as conn:
+        present = conn.execute(
+            "SELECT to_regclass('public.paper_ml_labels') IS NOT NULL AS installed"
+        ).fetchone()
+        if not present["installed"]:
+            return [], {"missing_post_horizon_label_ledger": 1}
         rows = conn.execute(
-            """SELECT ('paper:' || p.id) AS event_id, p.reason,
-               p.signal_ts AS decision_at, p.opened_at, p.closed_at,
-               p.notional, p.gross_pnl, p.fee_paid AS fees,
-               p.funding_paid AS funding, p.net_pnl,
-               f.snapshot_key,f.bar_ts,f.available_at,f.observed_at,f.computed_at,
-               f.source_checksum,f.quality AS snapshot_quality,f.is_causal,
-               f.values_json,f.provenance
+            """SELECT p.id AS paper_trade_id, p.reason,
+                 p.signal_ts AS decision_at,p.opened_at,p.closed_at,
+                 p.notional,p.gross_pnl,p.fee_paid AS fees,
+                 p.funding_paid AS funding,p.net_pnl,
+                 f.snapshot_key,f.bar_ts,f.available_at,f.observed_at,f.computed_at,
+                 f.source_checksum,f.quality AS snapshot_quality,f.is_causal,
+                 f.values_json,f.provenance,
+                 to_jsonb(l) AS label_ledger
                FROM paper_trades p
-               JOIN feature_snapshots f ON
-                 f.snapshot_key=(p.reason->>'ml_snapshot_key')
-                 AND f.source_checksum=(p.reason->>'ml_source_checksum')
+               LEFT JOIN feature_snapshots f
+                 ON f.snapshot_key=(p.reason->>'ml_snapshot_key')
                  AND f.symbol=p.symbol AND f.tf=%s
-                 AND f.is_causal AND f.quality='complete'
-                 AND f.available_at<=p.signal_ts
-                 AND f.observed_at<=p.signal_ts
-                 AND f.computed_at<=p.signal_ts
-               WHERE p.symbol=%s AND p.state='closed' AND p.opened_at IS NOT NULL
-                 AND p.closed_at<=to_timestamp(%s/1000.0)
+               LEFT JOIN paper_ml_labels l ON l.paper_trade_id=p.id
+               WHERE p.symbol=%s AND p.state='closed'
+                 AND p.opened_at IS NOT NULL
+                 AND p.closed_at<=to_timestamp(%s / 1000.0)
                ORDER BY p.signal_ts,p.id LIMIT %s""",
             (tf, settings.symbol, as_of_ms, limit)).fetchall()
     return from_snapshot_records(rows, as_of_ms)

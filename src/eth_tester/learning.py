@@ -35,7 +35,7 @@ def train_shadow(settings, minimum=100, epochs=20):
     )
 
 
-def train_causal_shadow(settings, as_of_ms, *, source="snapshots", tf="5",
+def train_causal_shadow(settings, as_of_ms, *, source="snapshots", tf="1",
                         min_rows=180, min_new=100, previous_count=0,
                         embargo_ms=0):
     """Retrain only when enough independently labeled, point-in-time data exist.
