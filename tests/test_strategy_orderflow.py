@@ -317,3 +317,16 @@ def test_snapshot_is_asof_actual_decision_and_never_selected_by_hindsight():
     conn.snapshot["snapshot_key"] = "not-a-hash"
     assert _certified_snapshot(conn, "ETHUSDT", START,
                                START + timedelta(minutes=1), NOW) is None
+
+def test_oi_utc_grid_rejects_fractional_and_non_utc():
+    from datetime import datetime, timedelta, timezone
+    from eth_tester.orderflow import _valid_oi
+    cutoff = datetime(2026, 11, 25, 12, 15, tzinfo=timezone.utc)
+    rows = [{"ts": cutoff - timedelta(minutes=5), "value": "100"},
+            {"ts": cutoff - timedelta(minutes=10), "value": "99"}]
+    assert _valid_oi(rows, cutoff)
+    assert not _valid_oi([dict(rows[0], ts=rows[0]["ts"] +
+                                    timedelta(microseconds=1)), rows[1]], cutoff)
+    tz = timezone(timedelta(hours=1))
+    assert not _valid_oi([dict(rows[0], ts=rows[0]["ts"].astimezone(tz)),
+                          rows[1]], cutoff)

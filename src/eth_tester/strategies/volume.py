@@ -38,6 +38,60 @@ class VolumeProfile:
     available_at: datetime | None = None
     source_checksum: str | None = None
 
+    def __post_init__(self):
+        # Direct construction cannot bypass bounded resource limits.
+        self._bounded_bins()
+
+    def _bounded_bins(self):
+        try:
+            values = self.by_price
+            if not isinstance(values, dict) or not 1 <= len(values) <= 20001:
+                raise ValueError("unsafe_profile_bins")
+            tick = number(self.tick_size)
+            if tick <= 0:
+                raise ValueError("unsafe_tick_size")
+            prices = tuple(values)
+            if (any(type(p) is not Decimal or not p.is_finite() or p <= 0
+                    for p in prices)
+                    or any(type(q) is not Decimal or not q.is_finite() or q < 0
+                           for q in values.values())):
+                raise ValueError("invalid_profile_bins")
+            span = (max(prices) - min(prices)) / tick
+            if (span > 20000 or span != span.to_integral_value()
+                    or any(p / tick != (p / tick).to_integral_value()
+                           for p in prices)):
+                raise ValueError("unsafe_profile_span")
+            if (self.poc not in values
+                    or not min(prices) <= self.value_area_low <= self.poc
+                    <= self.value_area_high <= max(prices)
+                    or number(self.total_quantity) !=
+                    sum(values.values(), Decimal(0))
+                    or self.total_quantity <= 0
+                    or type(self.trade_count) is not int
+                    or self.trade_count <= 0
+                    or self.coverage not in
+                    ("externally_verified", "self_reported_unverified")):
+                raise ValueError("inconsistent_profile")
+            if (self.start.tzinfo is None or self.end.tzinfo is None
+                    or self.start.utcoffset() != timedelta(0)
+                    or self.end.utcoffset() != timedelta(0)
+                    or self.start >= self.end):
+                raise ValueError("invalid_profile_window")
+            if self.coverage == "externally_verified" and (
+                    self.available_at is None
+                    or self.available_at.tzinfo is None
+                    or self.available_at.utcoffset() != timedelta(0)
+                    or self.available_at < self.end
+                    or not isinstance(self.source_checksum, str)
+                    or len(self.source_checksum) != 64
+                    or any(c not in "0123456789abcdef"
+                           for c in self.source_checksum)):
+                raise ValueError("unverified_profile_identity")
+            return int(span) + 1
+        except (TypeError, KeyError, InvalidOperation, ArithmeticError,
+                AttributeError, OverflowError) as exc:
+            raise ValueError("invalid_profile_geometry") from exc
+
     def zones(self, kind):
         """Contiguous tick zones inside the actually observed price range.
 
@@ -45,11 +99,11 @@ class VolumeProfile:
         """
         if kind not in ("high", "low"):
             raise ValueError("unknown_zone_kind")
+        count = self._bounded_bins()
         peak = max(self.by_price.values())
         threshold = peak * (Decimal("0.65") if kind == "high"
                             else Decimal("0.35"))
         floor = min(self.by_price)
-        count = int((max(self.by_price) - floor) / self.tick_size) + 1
         zones = []
         opening = None
         quantity = Decimal(0)
@@ -81,6 +135,7 @@ class VolumeProfile:
 
     @property
     def high_volume_nodes(self):
+        self._bounded_bins()
         peak = max(self.by_price.values())
         return tuple(sorted(price for price, qty in self.by_price.items()
                             if price != self.poc and qty >= peak * Decimal("0.65")
@@ -89,6 +144,7 @@ class VolumeProfile:
 
     @property
     def low_volume_nodes(self):
+        self._bounded_bins()
         peak = max(self.by_price.values())
         return tuple(sorted(price for price, qty in self.by_price.items()
                             if Decimal(0) < qty <= peak * Decimal("0.35")
@@ -267,7 +323,7 @@ def untouched_poc(profile, closed_bars, *, through, bar_span=timedelta(minutes=1
     try:
         for index, bar in enumerate(bars):
             if (bar["ts"] != profile.end + index * bar_span
-                    or bar.get("closed", True) is not True):
+                    or bar.get("closed") is not True):
                 return False
             if number(bar["low"]) <= profile.poc <= number(bar["high"]):
                 return False
@@ -297,7 +353,7 @@ def volume_signal(closed_candles, profile, fee_rate=Decimal("0.00055"),
             or last["ts"].utcoffset() != timedelta(0)
             or profile.available_at > last["ts"] + timedelta(minutes=1)):
         return None
-    if any(b.get("closed", True) is not True for b in candles):
+    if any(b.get("closed") is not True for b in candles):
         return None
     try:
         price = number(last["close"])

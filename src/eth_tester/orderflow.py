@@ -35,13 +35,15 @@ def _valid_oi(rows, cutoff):
     if len(rows) != 2:
         return False
     latest, previous = rows
-    if any(item["ts"].tzinfo is None for item in rows):
+    if any(not isinstance(item.get("ts"), datetime)
+           or item["ts"].tzinfo is None
+           or item["ts"].utcoffset() != timedelta(0)
+           or item["ts"].second or item["ts"].microsecond
+           or item["ts"].minute % 5 for item in rows):
         return False
     if (latest["ts"] <= previous["ts"] or
             latest["ts"] - previous["ts"] != timedelta(minutes=5) or
             not timedelta(0) <= cutoff - latest["ts"] <= timedelta(minutes=10)):
-        return False
-    if any(int(item["ts"].timestamp()) % 300 != 0 for item in rows):
         return False
     try:
         return all(_decimal(item["value"]) > 0 for item in rows)
@@ -90,7 +92,11 @@ def _mtf(conn, symbol, end, sign):
         if (len(bars) != 3 or end - bars[0]["ts"] > 2 * span
                 or any(a["ts"] - b["ts"] != span for a, b in zip(bars, bars[1:]))):
             return None
-        if any(item["ts"].tzinfo is None for item in bars):
+        if any(not isinstance(item.get("ts"), datetime)
+               or item["ts"].tzinfo is None
+               or item["ts"].utcoffset() != timedelta(0)
+               or item["ts"].second or item["ts"].microsecond
+               or item["ts"].minute % minutes for item in bars):
             return None
         try:
             trends[tf] = sign * (_decimal(bars[0]["close"]) -

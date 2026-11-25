@@ -85,7 +85,7 @@ def _validated_bars(closed_candles, *, decision_at=None):
             raise ValueError("utc_minute_aligned_candle_required")
         if previous is not None and stamp - previous != timedelta(minutes=1):
             raise ValueError("missing_or_out_of_order_bar")
-        if raw.get("closed", True) is not True:
+        if raw.get("closed") is not True:
             raise ValueError("open_candle_unavailable")
         if decision_at is not None and stamp + timedelta(minutes=1) > decision_at:
             raise ValueError("future_candle_relative_to_observation")
@@ -218,6 +218,22 @@ def _evaluate_shadow_ensemble_impl(closed_candles, *, taker_fee_rate=Decimal("0.
     """
     try:
         bars = _validated_bars(closed_candles, decision_at=decision_at)
+        # Reproducible input identity, never independent source certification.
+        input_sha256 = sha256(json.dumps([
+            [bar["ts"].isoformat(), *(str(bar[k]) for k in
+                                     ("open", "high", "low", "close", "volume"))]
+            for bar in bars
+        ], separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+
+        def seal(result):
+            result["input_sha256"] = input_sha256
+            result["input_bar_count"] = len(bars)
+            result["input_window_closed_at"] = (
+                bars[-1]["ts"] + timedelta(minutes=1)).isoformat()
+            result["decision_cutoff_at"] = (
+                decision_at.isoformat() if decision_at is not None else None)
+            result["source_identity_authoritative"] = False
+            return _canonical(result)
         fee, slip = _decimal(taker_fee_rate), _decimal(slippage_bps)
         if fee < 0 or fee >= Decimal("0.05") or slip < 0 or slip >= Decimal(100):
             raise ValueError("fee_or_slippage_outside_research_limits")
@@ -234,14 +250,14 @@ def _evaluate_shadow_ensemble_impl(closed_candles, *, taker_fee_rate=Decimal("0.
                    "mtf_5m": _complete_mtf(bars, 5, as_of=as_of),
                    "mtf_15m": _complete_mtf(bars, 15, as_of=as_of)}
         if atr_fraction < _MIN_ATR_FRACTION or atr_fraction > _MAX_ATR_FRACTION:
-            return _canonical(_empty("unsafe_volatility_regime",
+            return seal(_empty("unsafe_volatility_regime",
                 bar_ts=last["ts"].isoformat(), context=context))
         if (typical_range <= 0 or last["high"] - last["low"] >
                 typical_range * Decimal(4)):
-            return _canonical(_empty("range_shock_or_unreliable_baseline",
+            return seal(_empty("range_shock_or_unreliable_baseline",
                 bar_ts=last["ts"].isoformat(), regime="shock", context=context))
         if any(bar["volume"] <= 0 for bar in bars[-5:]):
-            return _canonical(_empty("no_recent_volume_observed",
+            return seal(_empty("no_recent_volume_observed",
                 bar_ts=last["ts"].isoformat(), context=context))
         net_move = last["close"] - bars[-16]["close"]
         regime = ("trending_up" if net_move >= 3*atr else
@@ -302,23 +318,30 @@ def _evaluate_shadow_ensemble_impl(closed_candles, *, taker_fee_rate=Decimal("0.
             abs(Decimal(item["level"]) - last["close"]),
             item["direction"], item["origin"], item["level"],
         ))
+        full_count = len(candidates)
+        eligible_all = [x for x in candidates if x["eligibility"] ==
+                        "unvalidated_shadow_candidate"]
+        opposed = len({x["direction"] for x in eligible_all}) > 1
+        overflow = full_count > _MAX_RESEARCH_CANDIDATES
         candidates = candidates[:_MAX_RESEARCH_CANDIDATES]
         result = _empty("no_causal_pattern", bar_ts=last["ts"].isoformat(),
                         regime=regime, context=context)
         result["candidates"] = candidates
-        viable = [x for x in candidates if x["eligibility"] ==
-                  "unvalidated_shadow_candidate"]
-        if viable and len({c["direction"] for c in viable}) > 1:
+        result["evaluated_candidate_count"] = full_count
+        result["candidate_overflow"] = overflow
+        if opposed:
             result["reason"] = "conflicting_shadow_directions"
-        elif viable:
+        elif overflow:
+            result["reason"] = "candidate_cap_exceeded_no_trade"
+        elif eligible_all:
             result["status"] = "shadow_candidates"
             result["reason"] = "await_independent_calibration_and_live_proof"
-            result["selected"] = viable[0]["pattern"]
+            result["selected"] = eligible_all[0]["pattern"]
         elif candidates:
             result["reason"] = "all_candidates_unconfirmed_or_mtf_conflicted"
         # Selected is a name for *shadow research only*, never permission for
         # E to open or F to label/train a paper trade.
-        return _canonical(result)
+        return seal(result)
     except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation,
             DivisionByZero, OverflowError, ArithmeticError) as exc:
         code = str(exc)

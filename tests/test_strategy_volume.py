@@ -254,3 +254,32 @@ def test_daily_archive_requires_every_minute_and_matching_checksum():
     assert build_profile(trades, START, END + timedelta(minutes=1),
                          D(1), coverage_verified=True, expected_trade_count=4,
                          provenance=replaced) is None
+
+def test_huge_direct_profile_rejected_before_zone_iteration():
+    import pytest
+    from eth_tester.strategies.volume import VolumeProfile
+    with pytest.raises(ValueError, match="unsafe_profile_span"):
+        VolumeProfile(START, END, D("0.00000001"), D(100), D(100),
+                      D(100), {D(100): D(5), D("100000000"): D(1)},
+                      D(6), 2, "self_reported_unverified")
+
+
+def test_mutated_direct_profile_still_bounded():
+    import pytest
+    profile = build_profile(samples(), START, END, D(1),
+                            coverage_verified=True, expected_trade_count=3)
+    profile.by_price[D("100000000")] = D(1)
+    with pytest.raises(ValueError, match="unsafe_profile_span"):
+        profile.zones("low")
+
+
+def test_missing_closed_volume_bar_denied():
+    profile = build_profile(samples(), START, END, D(1),
+                            coverage_verified=True, expected_trade_count=3,
+                            provenance=verified_provenance())
+    bars = [candle(1, "100.1", "100.8", "100.5"),
+            candle(2, "100.1", "100.9", "100.4"),
+            candle(3, "100.1", "100.8", "100.5"),
+            candle(4, "99.9", "100.6", "100.2", "100.1")]
+    bars[0].pop("closed")
+    assert volume_signal(bars, profile) is None

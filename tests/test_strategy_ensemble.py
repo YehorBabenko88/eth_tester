@@ -283,3 +283,50 @@ def test_mutually_opposed_shadow_candidates_cannot_select_direction(monkeypatch)
     assert result["reason"] == "conflicting_shadow_directions"
     assert result["selected"] is None
     monkeypatch.setattr(engine, "_patterns", original)
+
+def test_closed_flag_missing_is_not_confirmed():
+    bars = candles()
+    bars[0].pop("closed")
+    outcome = evaluate_shadow_ensemble(
+        bars, decision_at=bars[-1]["ts"] + timedelta(minutes=1))
+    check_no_promotion(outcome)
+    assert outcome["reason"] == "open_candle_unavailable"
+    assert outcome.get("input_sha256") is None
+
+
+def test_hidden_opposite_direction_fails_closed(monkeypatch):
+    import eth_tester.strategies.ensemble as m
+    bars = candles()
+    bars[-1].update(open=D(100), high=D("100.5"), low=D("99.5"), close=D(100))
+    pivot = (bars[60]["ts"], bars[63]["ts"])
+    candidates = [("breakout", "long", "resistance", D("101.1"), *pivot)
+                  for _ in range(9)]
+    candidates.append(("breakout", "short", "support", D("100.9"), *pivot))
+    monkeypatch.setattr(m, "_patterns", lambda *a, **kw: candidates)
+    result = evaluate_shadow_ensemble(bars)
+    check_no_promotion(result)
+    assert result["reason"] == "conflicting_shadow_directions"
+    assert result["selected"] is None
+    assert result["candidate_overflow"] is True
+    assert result["evaluated_candidate_count"] == 10
+
+
+def test_same_direction_overflow_has_no_research_selection(monkeypatch):
+    import eth_tester.strategies.ensemble as m
+    bars = candles()
+    monkeypatch.setattr(m, "_patterns", lambda *a, **kw: [
+        ("breakout", "long", "resistance", D("101.1"),
+         bars[60]["ts"], bars[63]["ts"]) for _ in range(9)])
+    result = evaluate_shadow_ensemble(bars)
+    assert result["reason"] == "candidate_cap_exceeded_no_trade"
+    check_no_promotion(result)
+
+
+def test_raw_volume_revision_changes_fingerprint():
+    bars = candles()
+    original = evaluate_shadow_ensemble(bars)
+    altered = deepcopy(bars)
+    altered[1]["volume"] += D("0.0001")
+    revised = evaluate_shadow_ensemble(altered)
+    assert original["input_sha256"] != revised["input_sha256"]
+    assert original["source_identity_authoritative"] is False
