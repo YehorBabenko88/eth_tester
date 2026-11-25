@@ -48,7 +48,7 @@ def backup_sha256(path):
     return digest.hexdigest()
 
 
-def verify_backup(path, *, expected_sha256=None):
+def verify_backup(path, *, expected_sha256=None, expected_database=None):
     if not shutil.which("pg_restore"):
         raise RuntimeError("pg_restore unavailable")
     source = Path(path).resolve(strict=True)
@@ -62,6 +62,11 @@ def verify_backup(path, *, expected_sha256=None):
     )
     if "eth_storage_identity" not in result.stdout:
         raise RuntimeError("ETH Tester ownership marker absent from backup")
+    if expected_database is not None:
+        names = [line.split("dbname:", 1)[1].strip() for line in result.stdout.splitlines()
+                 if line.lstrip().startswith(";") and "dbname:" in line]
+        if names != [expected_database]:
+            raise RuntimeError("Backup source database does not match target")
     return True
 
 
@@ -84,7 +89,7 @@ def backup_database(url, destination):
                  "--dbname", cli_dsn],
                 env=env, stdout=out, check=True, timeout=7200,
             )
-        verify_backup(target)
+        verify_backup(target, expected_database=validate_db_name(url))
         return target
     except BaseException:
         target.unlink(missing_ok=True)
@@ -115,7 +120,7 @@ def restore_database(url, backup_path, *, expected_sha256=None):
 def deletion_manifest(url, backup_path):
     """Read-only deletion preflight. A manifest is NOT deletion approval."""
     name = validate_db_name(url)
-    verify_backup(backup_path)
+    verify_backup(backup_path, expected_database=name)
     with psycopg.connect(url, connect_timeout=10) as conn:
         check_ownership(conn)
         oid, size = conn.execute(
@@ -140,7 +145,7 @@ def drop_owned_database(
         raise ValueError("Exact irreversible database deletion phrase required")
     if not backup_path or not backup_sha or not expected_database_oid:
         raise ValueError("Verified backup SHA and matching database OID are mandatory")
-    verify_backup(backup_path, expected_sha256=backup_sha)
+    verify_backup(backup_path, expected_sha256=backup_sha, expected_database=name)
     with psycopg.connect(url, connect_timeout=10) as conn:
         check_ownership(conn)
         database_oid = conn.execute(
