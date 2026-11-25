@@ -37,3 +37,62 @@ def render_trade(settings,trade_id,output_dir="runtime/charts"):
         field="exit_chart" if trade["closed_at"] else "entry_chart"
         conn.execute(f"UPDATE paper_trades SET {field}=%s WHERE id=%s",(str(path),trade_id))
     return path
+
+
+def render_backtest_evidence(candles, deals, output_dir='runtime/backtest_charts', run_id='local'):
+    """Produce separate immutable-looking entry/exit PNGs for each scenario trade.
+
+    Source OHLC is explicitly labeled: these are NOT evidence of exchange fills.
+    The hosting runner must persist paths and archive/checksum as needed.
+    """
+    import re
+
+    times = [row['ts'] for row in candles]
+    if not times or len(times) != len(set(times)) or times != sorted(times):
+        raise ValueError('unique ordered candles required for chart evidence')
+    at = {ts: i for i, ts in enumerate(times)}
+    safe_run = re.sub(r'[^a-zA-Z0-9_-]', '_', str(run_id))[:80]
+    folder = Path(output_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    outputs = []
+    for number, trade in enumerate(deals, 1):
+        if trade['opened_at'] not in at or trade['closed_at'] not in at:
+            raise ValueError('trade timestamp not matched to provided candles')
+        enter, leave = at[trade['opened_at']], at[trade['closed_at']]
+        if enter > leave:
+            raise ValueError('exit precedes entry')
+        lo = max(0, enter - 30)
+        hi = min(len(times), leave + 11)
+        view = candles[lo:hi]
+        files = {}
+        for stage in ('entry', 'exit'):
+            fig, ax = plt.subplots(figsize=(13, 6))
+            try:
+                for index, bar in enumerate(view, lo):
+                    up = float(bar['close']) >= float(bar['open'])
+                    color = '#26735c' if up else '#b34f50'
+                    ax.plot((index, index), (float(bar['low']), float(bar['high'])),
+                            color=color, linewidth=1)
+                    ax.plot((index, index), (float(bar['open']), float(bar['close'])),
+                            color=color, linewidth=4)
+                ax.scatter((enter,), (float(trade['entry']),), marker='^' if trade['direction'] == 'long' else 'v',
+                           color='#1b5e9a', s=100, zorder=5, label='ENTRY (scenario)')
+                if stage == 'exit':
+                    ax.scatter((leave,), (float(trade['exit']),), marker='x',
+                               color='#bc5829', s=110, zorder=5, label='EXIT (scenario)')
+                ax.axhline(float(trade['stop']), linestyle='--', alpha=.65, label='Stop')
+                ax.axhline(float(trade['take']), linestyle=':', alpha=.65, label='Take')
+                ax.set_title(f"ETHUSDT {trade['direction']} #{number} {stage} | {trade['outcome']}")
+                ax.set_xlabel('Candle ordinal (chronological)')
+                ax.set_ylabel('Price (USDT)')
+                ax.text(.01, .02, 'PAPER / OHLC SCENARIO — NOT VERIFIED EXECUTION',
+                        transform=ax.transAxes, fontsize=9, alpha=.75)
+                ax.legend(loc='upper right')
+                fig.tight_layout()
+                location = folder / f'{safe_run}_trade_{number:05d}_{stage}.png'
+                fig.savefig(location, dpi=130)
+                files[stage + '_chart'] = str(location)
+            finally:
+                plt.close(fig)
+        outputs.append(files)
+    return outputs
