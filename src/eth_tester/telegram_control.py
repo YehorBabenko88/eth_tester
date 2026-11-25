@@ -43,6 +43,21 @@ async def run_telegram(settings):
                 rows=conn.execute("""SELECT id,direction,entry,exit,net_pnl FROM paper_trades
                   ORDER BY id DESC LIMIT 5""").fetchall()
                 msg="\n".join(str(dict(r)) for r in rows) or "No trades"
+            elif name=="/chart":
+                if not context.args or not context.args[0].isdigit():
+                    msg="Usage: /chart 123"
+                else:
+                    from .charts import render_trade
+                    try:
+                        image_path=await asyncio.to_thread(render_trade,settings,int(context.args[0]))
+                        with open(image_path,"rb") as photo:
+                            await update.message.reply_photo(photo=photo,caption="Paper trade chart")
+                        return
+                    except (ValueError,RuntimeError) as exc:
+                        msg=f"Chart unavailable: {exc}"
+            elif name=="/gaps":
+                gaps=conn.execute("SELECT source,start_ts FROM data_gaps WHERE resolved_at IS NULL LIMIT 5").fetchall()
+                msg=str([dict(g) for g in gaps]) if gaps else "No marked data gaps"
             elif name=="/delete":
                 msg="Safety restriction: no remote database erasure; use a local administrator"
             else:
@@ -50,7 +65,7 @@ async def run_telegram(settings):
         await update.message.reply_text(msg[:4000])
     app=Application.builder().token(settings.tg_bot_token).build()
     for cmd in ("start","help","pause","resume","stop","stats","disk",
-                "progress","levels","trade","delete"):
+                "progress","levels","trade","chart","gaps","delete"):
         app.add_handler(CommandHandler(cmd,command))
     async with app:
         await app.start()
