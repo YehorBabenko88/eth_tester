@@ -100,9 +100,15 @@ async def run_recent_recovery(settings, *, interval_seconds=20):
             try:
                 await recover_recent_public_trades(settings, client)
             except Exception as exc:
-                with connection(settings) as conn:
-                    conn.execute(
-                        """INSERT INTO feed_health(symbol,topic,status,detail)
-                           VALUES(%s,'recent_rest_recovery','error',%s::jsonb)""",
-                        (settings.symbol, json.dumps({"error": str(exc)[:500]})))
+                try:
+                    with connection(settings) as conn:
+                        conn.execute(
+                            """INSERT INTO feed_health(symbol,topic,status,detail)
+                               VALUES(%s,'recent_rest_recovery','error',%s::jsonb)""",
+                            (settings.symbol, json.dumps({"error": str(exc)[:500]})))
+                except Exception as log_error:
+                    # PostgreSQL may also be unavailable during the same outage;
+                    # do not let telemetry failure kill the recovery task.
+                    print(f"Recent recovery error: {exc}; telemetry: {log_error}",
+                          flush=True)
             await asyncio.sleep(interval_seconds)
