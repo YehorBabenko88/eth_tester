@@ -83,6 +83,18 @@ def sample_trade(identifier, *, price="3000", minute=0):
             "archive", {"trade_id": identifier})
 
 
+def test_concurrent_database_init_is_idempotent(postgres_lab):
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        assert all(result is None for result in
+                   pool.map(init_database, [postgres_lab] * 3))
+    with connection(postgres_lab) as conn:
+        assert conn.execute(
+            "SELECT count(*) AS n FROM eth_schema_migrations"
+        ).fetchone()["n"] == 5
+
+
 def test_copy_replay_and_conflict_rejection(postgres_lab):
     with connection(postgres_lab) as conn:
         records = [sample_trade("BPG-001"), sample_trade("BPG-002", minute=1)]
