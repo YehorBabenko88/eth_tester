@@ -36,10 +36,12 @@ class NakedPOCBook:
         profile_close = close_time(origin_ts, tf)
         if available_at < profile_close:
             raise ValueError("POC may not exist before the source bucket closes")
-        if observed_at is not None and available_at < observed_at:
-            raise ValueError("Feature cannot be available before it is observed")
-        if quality != "verified":
+        if quality != "verified" or observed_at is None:
             return None
+        if observed_at.tzinfo is None:
+            raise ValueError("Observed timestamp must be timezone-aware")
+        if available_at < observed_at:
+            raise ValueError("Feature cannot be available before it is observed")
         key = (tf, origin_ts, decimal(price))
         if key in self.records:
             return self.records[key]
