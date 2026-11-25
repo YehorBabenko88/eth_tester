@@ -21,6 +21,10 @@ PERMANENT = ("live", "analyse", "engine")
 PERIODIC = {"backfill": 86400, "archives": 86400, "aggregate": 21600}
 
 
+def _is_windows():
+    return os.name == "nt"
+
+
 def runtime_path():
     custom = os.environ.get("ETH_TESTER_RUNTIME_DIR")
     if custom:
@@ -38,6 +42,10 @@ class Supervisor:
         self.children = {}
         self.status = {}
 
+    def _argv(self, name):
+        """Overridable argv for isolated subprocess regression tests."""
+        return (self.python, "-m", "eth_tester.cli", name)
+
     def _record(self, name, state, **extra):
         self.status[name] = {
             "state": state,
@@ -51,18 +59,47 @@ class Supervisor:
         os.replace(temp, target)
 
     async def _terminate(self, name, proc):
+        """Gracefully stop only the child spawned by this supervisor.
+
+        Windows subprocess.terminate() uses TerminateProcess and cannot run finally
+        blocks. CTRL_BREAK_EVENT is attempted first for the dedicated process group.
+        """
         if proc.returncode is not None:
             return
         LOGGER.info("Stopping owned worker %s pid=%s", name, proc.pid)
+        graceful = False
+        if _is_windows():
+            try:
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+                graceful = True
+            except (OSError, ValueError, AttributeError, ProcessLookupError):
+                LOGGER.warning("CTRL_BREAK unavailable for %s; using terminate fallback", name)
+        if not graceful:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                return
         try:
-            proc.terminate()
-        except ProcessLookupError:
+            await asyncio.wait_for(proc.wait(), timeout=8 if graceful else 12)
             return
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=12)
         except asyncio.TimeoutError:
+            pass
+        if graceful and proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                return
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=4)
+                return
+            except asyncio.TimeoutError:
+                pass
+        if proc.returncode is None:
             LOGGER.error("Worker %s ignored shutdown; killing owned pid=%s", name, proc.pid)
-            proc.kill()
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                return
             await proc.wait()
 
     async def _wait_shutdown(self):
@@ -81,10 +118,8 @@ class Supervisor:
             started = time.monotonic()
             proc = None
             try:
-                kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
-                proc = await asyncio.create_subprocess_exec(
-                    self.python, "-m", "eth_tester.cli", name, **kwargs
-                )
+                kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if _is_windows() else {}
+                proc = await asyncio.create_subprocess_exec(*self._argv(name), **kwargs)
                 self.children[name] = proc
                 self._record(name, "running", pid=proc.pid)
                 while True:

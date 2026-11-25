@@ -45,19 +45,22 @@ def authorise(settings, update):
     chat = getattr(update, "effective_chat", None)
     owner = os.environ.get("ETH_TESTER_TG_USER_ID", "").strip()
     return bool(
-        user and not user.is_bot and chat and chat.type == "private"
-        and settings.tg_chat_id and owner
-        and str(chat.id) == str(settings.tg_chat_id).strip()
-        and str(user.id) == owner
+        user is not None and getattr(user, "is_bot", True) is False
+        and chat is not None and getattr(chat, "type", None) == "private"
+        and bool(getattr(settings, "tg_chat_id", None)) and owner.isdecimal()
+        and str(getattr(chat, "id", "")) == str(settings.tg_chat_id).strip()
+        and str(getattr(user, "id", "")) == owner
     )
 
 
 def _audit(settings, update, name, accepted, outcome):
     """Only IDs, command names and outcomes are stored; no text or token."""
+    chat = getattr(update, "effective_chat", None)
+    user = getattr(update, "effective_user", None)
     detail = {
         "command": name[:48], "accepted": accepted, "outcome": outcome[:48],
-        "chat_id": str(update.effective_chat.id) if update.effective_chat else None,
-        "user_id": str(update.effective_user.id) if update.effective_user else None,
+        "chat_id": str(getattr(chat, "id", "")) if chat is not None else None,
+        "user_id": str(getattr(user, "id", "")) if user is not None else None,
     }
     try:
         with connection(settings) as conn:

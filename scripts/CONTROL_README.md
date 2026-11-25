@@ -40,3 +40,32 @@ uninstall awaits Storage Guardian's ownership-scoped deletion and local confirma
 ## Acceptance still pending
 Real PostgreSQL and Windows Task Scheduler/ACL tests; authorized and unauthorized Telegram
 integration tests; Ctrl+C and forced worker crash; reboot and power-loss recovery; disk full.
+
+
+## G round 2 Windows acceptance (disposable machine only)
+Installer now refuses broad-write ACLs on its code root/Python executable and broad-read
+ACLs on .env. If a Telegram token is configured in .env, the LocalService account must
+inherit a numeric machine-level ETH_TESTER_TG_USER_ID. Installation executes only a
+read-only \`python -m eth_tester.cli --help\` import preflight before registering the
+AtStartup task. It does not bootstrap, migrate, drop or wipe PostgreSQL.
+
+Before native approval on a throwaway Windows VM:
+1. Install project and Python under an admin-controlled root; configure LocalService
+   read/execute and restrict .env to admins and LocalService. Put secrets outside Git.
+2. Validate the read-only CLI preflight and Task Scheduler action, principal, trigger,
+   ownership manifest and non-adoption of a pre-existing foreign task.
+3. Start the task with a disposable dedicated PostgreSQL database only; validate
+   Telegram owner rejection, paper-only start/pause/stop, worker exit/restart,
+   WS freshness and progress using independent observations.
+4. Stop via owned uninstall marker and verify no child process or registered task
+   survives; verify unrelated task, directory, database, backups and archives are
+   unchanged. Repeat after clean reboot and forced worker crash.
+5. Save task XML/ACLs, child PID evidence, DB OID, process logs and exact commit SHA.
+   Until that evidence exists, Windows native acceptance remains RUNTIME NO_GO.
+
+On Windows the Supervisor first attempts CTRL_BREAK_EVENT for its dedicated child
+process group; if console signals are unavailable, it falls back to terminate/kill.
+This is not a guarantee of graceful shutdown when a service has no console.
+Database migration/bootstrap remains B-owned; Supervisor currently calls init_database
+on startup and therefore requires a separately approved least-privilege DB contract.
+Remote Telegram /delete remains disabled despite Storage's manifest APIs.

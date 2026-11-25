@@ -43,6 +43,62 @@ foreach ($ace in $access) {
 }
 if (-not $canRead) { throw 'Grant LOCAL SERVICE (S-1-5-19) explicit read ACL to .env' }
 if ($broad) { throw 'Insecure broad read ACL on .env; restrict it before installing' }
+# A writable interpreter or package root would allow privilege escalation as LOCAL SERVICE.
+foreach ($target in @($Root, $Python)) {
+    foreach ($ace in (Get-Acl -LiteralPath $target).Access) {
+        if ($ace.AccessControlType -ne 'Allow' -or
+            (($ace.FileSystemRights -band [Security.AccessControl.FileSystemRights]'Write,Modify,FullControl') -eq 0)) {
+            continue
+        }
+        try { $sid = $ace.IdentityReference.Translate(
+            [System.Security.Principal.SecurityIdentifier]).Value
+        } catch { throw "Cannot verify ACL on $target" }
+        if (@('S-1-1-0','S-1-5-11','S-1-5-32-545') -contains $sid) {
+            throw "Writable installation component by broad principal: $target"
+        }
+    }
+}
+# The Telegram sender identity must be inherited by the LocalService task at boot.
+$hasBotToken = [bool](Select-String -LiteralPath (Join-Path $Root '.env') -Pattern '^\s*TG_BOT_TOKEN\s*=\s*\S+' -Quiet)
+$ownerId = [Environment]::GetEnvironmentVariable('ETH_TESTER_TG_USER_ID', 'Machine')
+if ($hasBotToken -and ($ownerId -notmatch '^[0-9]+
+# Supervisor state is written outside the source/.env tree to a narrowly scoped runtime directory.
+$runtime = Join-Path $env:ProgramData 'ETHTester\runtime'
+New-Item -ItemType Directory -Path $runtime -Force | Out-Null
+$runtimeAcl = Get-Acl -LiteralPath $runtime
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    'NT AUTHORITY\LOCAL SERVICE', 'Modify',
+    [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow
+)
+$runtimeAcl.AddAccessRule($rule)
+Set-Acl -LiteralPath $runtime -AclObject $runtimeAcl
+$action = New-ScheduledTaskAction -Execute $Python -Argument '-m eth_tester.cli run' -WorkingDirectory $Root
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$owner = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\LOCAL SERVICE' -LogonType ServiceAccount -RunLevel Limited
+$opts = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $owner -Settings $opts | Out-Null
+try {
+    [ordered]@{
+        product='ETHTester'; version=1; task=$taskName; root=$Root; python=$Python
+        arguments='-m eth_tester.cli run'; created_utc=(Get-Date).ToUniversalTime().ToString('o')
+    } | ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding UTF8 -ErrorAction Stop
+} catch {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    throw
+}
+Write-Host "Installed owned Windows startup task: $taskName"
+)) {
+    throw 'Set machine-level ETH_TESTER_TG_USER_ID to the numeric Telegram owner before installing'
+}
+Push-Location $Root
+try {
+    & $Python -m eth_tester.cli --help *> $null
+    if ($LASTEXITCODE -ne 0) { throw 'Python environment missing ETH Tester dependencies' }
+} finally {
+    Pop-Location
+}
 # Supervisor state is written outside the source/.env tree to a narrowly scoped runtime directory.
 $runtime = Join-Path $env:ProgramData 'ETHTester\runtime'
 New-Item -ItemType Directory -Path $runtime -Force | Out-Null
