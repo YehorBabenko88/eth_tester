@@ -268,7 +268,7 @@ def revalidate_completed_archive(settings, day):
 
 
 def plan_archive_days(start, end, cursor, retries, *, limit=24):
-    """Bounded UTC cycle, excluding today's unfinished archive."""
+    """Compatibility planner: bounded fresh days plus due failed-day retries."""
     if end < start or not 1 <= limit <= 64:
         raise ValueError("Invalid archive start or unbounded cycle")
     cursor = max(start, min(end, cursor or start))
@@ -283,40 +283,139 @@ def plan_archive_days(start, end, cursor, retries, *, limit=24):
     return days
 
 
+def plan_archive_work(start, end, fresh_cursor, retries, recheck_cursor,
+                      pending, *, fresh_limit=24, recheck_limit=8):
+    """One bounded cycle; old retries NEVER advance the fresh UTC cursor.
+
+    A second rotating cursor revisits earlier official-candle comparisons.
+    Pending comparisons are retried independently of both scan positions.
+    """
+    if end < start or not 1 <= fresh_limit <= 64 or not 1 <= recheck_limit <= 32:
+        raise ValueError("Invalid or unbounded archive cycle")
+    fresh_cursor = max(start, min(end, fresh_cursor or start))
+    tasks, seen = [], set()
+
+    def add(mode, day):
+        if start <= day < end and day not in seen:
+            tasks.append((mode, day))
+            seen.add(day)
+
+    for day in retries[:8]:
+        add("retry", day)
+    for offset in range(min(fresh_limit, (end-fresh_cursor).days)):
+        add("fresh", fresh_cursor + timedelta(days=offset))
+    for day in pending[:8]:
+        add("recheck", day)
+    if start < end:
+        span = (end - start).days
+        if not recheck_cursor or not start <= recheck_cursor < end:
+            recheck_cursor = start
+        for offset in range(min(recheck_limit, span)):
+            delta = ((recheck_cursor-start).days + offset) % span
+            add("recheck", start + timedelta(days=delta))
+    return tasks
+
+
+def archive_volume_reconciled(proof):
+    """B's 1440-minute *volume-only* result, NEVER full print completeness."""
+    return (isinstance(proof, dict)
+            and proof.get("status") == "volume_only_reconciled"
+            and proof.get("minutes_checked") == 1440
+            and proof.get("minutes_matched") == 1440
+            and proof.get("exchange_complete") is False)
+
+
 def archive_cycle_plan(settings):
-    """Load bounded retry eligibility and durable forward cursor."""
+    """Read independent fresh, failed-day and past-day recheck cursors."""
     start = settings.archive_start
     end = datetime.now(timezone.utc).date()
+    if end < start:
+        raise ValueError("ARCHIVE_START in future")
     with connection(settings) as conn:
-        cursor = conn.execute("""SELECT cursor_ts FROM ingestion_cursor
-            WHERE source='trades_archive_scan' AND symbol=%s
-              AND instrument=%s AND interval=''""",
-              (settings.symbol, settings.category)).fetchone()
-        due = conn.execute("""SELECT day FROM ingestion_job
+        stored = conn.execute("""SELECT source,cursor_ts FROM ingestion_cursor
+            WHERE symbol=%s AND instrument=%s AND interval=''
+              AND source IN ('trades_archive_scan','trades_archive_recheck_scan')""",
+            (settings.symbol, settings.category)).fetchall()
+        cursors = {row["source"]: (row["cursor_ts"].date()
+                    if row["cursor_ts"] else None) for row in stored}
+        retry = conn.execute("""SELECT day FROM ingestion_job
             WHERE source='trades_archive' AND symbol=%s
               AND day >= %s AND day < %s
-              AND ((state='failed' AND updated_at < now()-interval '6 hours')
-                 OR (state='unavailable' AND updated_at < now()-interval '24 hours'))
+              AND ((state IN ('failed','running','pending')
+                    AND updated_at < clock_timestamp()-interval '6 hours')
+                 OR (state='unavailable'
+                    AND updated_at < clock_timestamp()-interval '24 hours'))
             ORDER BY updated_at,day LIMIT 8""",
-            (settings.symbol,start,end)).fetchall()
-    next_date = cursor["cursor_ts"].date() if cursor and cursor["cursor_ts"] else start
-    return plan_archive_days(start,end,next_date,[r["day"] for r in due])
+            (settings.symbol, start, end)).fetchall()
+        pending = conn.execute("""SELECT interval FROM ingestion_cursor
+            WHERE source='trades_archive_day_recheck' AND symbol=%s
+              AND instrument=%s AND interval >= %s AND interval < %s
+              AND status='pending'
+              AND last_success < clock_timestamp()-interval '6 hours'
+            ORDER BY last_success,interval LIMIT 8""",
+            (settings.symbol, settings.category,
+             start.isoformat(), end.isoformat())).fetchall()
+    return plan_archive_work(
+        start, end, cursors.get("trades_archive_scan"),
+        [r["day"] for r in retry], cursors.get("trades_archive_recheck_scan"),
+        [datetime.fromisoformat(r["interval"]).date() for r in pending])
 
 
-def advance_archive_cursor(settings, day):
-    """After an actual day attempt, atomically remember crash-resumable progress."""
-    stamp = datetime.combine(day+timedelta(days=1),datetime.min.time(),timezone.utc)
+def advance_archive_cursor(settings, day, *, mode="fresh"):
+    """Only sequential fresh work advances ingestion; retry cannot skip days."""
+    if mode not in ("fresh", "recheck"):
+        raise ValueError("Invalid scan cursor mode")
+    source = ("trades_archive_scan" if mode == "fresh"
+              else "trades_archive_recheck_scan")
+    stamp = datetime.combine(day+timedelta(days=1), datetime.min.time(), timezone.utc)
     with connection(settings) as conn:
         conn.execute("""INSERT INTO ingestion_cursor
              (source,symbol,instrument,interval,cursor_ts,last_success,status,meta)
-             VALUES('trades_archive_scan',%s,%s,'',%s,clock_timestamp(),
-                    'partial',%s::jsonb)
+             VALUES(%s,%s,%s,'',%s,clock_timestamp(),'partial',%s::jsonb)
              ON CONFLICT(source,symbol,instrument,interval) DO UPDATE SET
-             cursor_ts=greatest(ingestion_cursor.cursor_ts,excluded.cursor_ts),
+             cursor_ts=CASE WHEN excluded.source='trades_archive_scan'
+                 THEN greatest(ingestion_cursor.cursor_ts,excluded.cursor_ts)
+                 ELSE excluded.cursor_ts END,
              last_success=clock_timestamp(),status='partial',meta=excluded.meta""",
-             (settings.symbol,settings.category,stamp,json.dumps({
-                 "contract":"bounded_archive_cycle_v1","ml_eligible":False,
-                 "exchange_complete":False})))
+             (source, settings.symbol, settings.category, stamp,
+              json.dumps({"contract":"bounded_archive_cycle_v2",
+                          "source_quality":"partial",
+                          "exchange_complete":False,"ml_eligible":False})))
+
+
+def record_archive_recheck(settings, day, comparison):
+    """Durable per-day status so future cycles cannot silently forget pending."""
+    if not isinstance(comparison, dict):
+        comparison = {"status":"invalid_comparison"}
+    ok = archive_volume_reconciled(comparison)
+    state = "volume_only_reconciled" if ok else "pending"
+    meta = {"contract":"archive_recheck_v1",
+            "comparison_status":str(comparison.get("status","unknown"))[:80],
+            "minutes_checked":comparison.get("minutes_checked"),
+            "minutes_matched":comparison.get("minutes_matched"),
+            "exchange_complete":False,"ml_eligible":False}
+    with connection(settings) as conn:
+        conn.execute("""INSERT INTO ingestion_cursor
+            (source,symbol,instrument,interval,last_success,status,meta)
+            VALUES('trades_archive_day_recheck',%s,%s,%s,
+                   clock_timestamp(),%s,%s::jsonb)
+            ON CONFLICT(source,symbol,instrument,interval) DO UPDATE SET
+            last_success=clock_timestamp(),status=excluded.status,
+            meta=excluded.meta""",
+            (settings.symbol, settings.category, day.isoformat(),
+             state, json.dumps(meta, sort_keys=True)))
+    return ok
+
+
+def recheck_archive_with_receipt(settings, day):
+    """Never let a failed comparison create a positive archive witness."""
+    try:
+        comparison = revalidate_completed_archive(settings, day)
+    except Exception as exc:
+        comparison = {"status":"recheck_error","error":str(exc)[:250]}
+        print(f"Archive SHA recheck pending for {day}: {exc}", flush=True)
+    # A failed DB write here aborts the cycle; no false green cursor.
+    return record_archive_recheck(settings, day, comparison)
 
 
 def quarantine_archive_day(settings, day, error, permanent):
@@ -348,13 +447,18 @@ def quarantine_archive_day(settings, day, error, permanent):
 
 
 async def backfill_archives(settings):
-    """Process a finite restartable batch; leave source quality fail-closed."""
-    days = archive_cycle_plan(settings)
+    """Bounded restartable cycle, with durable prior-day comparison backlog."""
+    tasks = archive_cycle_plan(settings)
     result = {"attempted":0,"failed":0,"unavailable":0,"completed":0,
               "recheck_pending":0,"exchange_complete":False,"ml_eligible":False}
     async with httpx.AsyncClient(follow_redirects=False) as client:
-        for day in days:
+        for mode, day in tasks:
             result["attempted"] += 1
+            if mode == "recheck":
+                if not recheck_archive_with_receipt(settings, day):
+                    result["recheck_pending"] += 1
+                advance_archive_cursor(settings, day, mode="recheck")
+                continue
             state = "failed"
             for attempt in range(5):
                 try:
@@ -369,41 +473,53 @@ async def backfill_archives(settings):
                     if isinstance(exc,httpx.HTTPStatusError):
                         permanent = exc.response.status_code in (400,401,403,410)
                     if permanent or attempt == 4:
-                        # Database failure writing this ledger aborts the entire
-                        # cycle instead of advancing a fake successful cursor.
+                        # Durable failure ledger is required before any progress.
                         quarantine_archive_day(settings,day,exc,permanent)
                         print(f"Archive quarantined {day}: {exc}",flush=True)
                         break
                     await asyncio.sleep(min(90,2**attempt*3))
             if state in ("cached","complete"):
                 result["completed"] += 1
-                try:
-                    check = revalidate_completed_archive(settings,day)
-                    if check.get("status") not in ("verified","volume_match"):
-                        result["recheck_pending"] += 1
-                except Exception as exc:
+                if not recheck_archive_with_receipt(settings, day):
                     result["recheck_pending"] += 1
-                    print(f"Archive recheck pending {day}: {exc}",flush=True)
             else:
                 result["unavailable" if state=="unavailable" else "failed"] += 1
-            # Advancing a cursor is allowed after the failure is DURABLY recorded.
-            advance_archive_cursor(settings,day)
+            if mode == "fresh":
+                advance_archive_cursor(settings, day, mode="fresh")
             if state != "cached":
                 await asyncio.sleep(1/max(0.05,settings.archive_downloads_per_second))
+    end = datetime.now(timezone.utc).date()
     with connection(settings) as conn:
         unresolved = conn.execute("""SELECT count(*) AS n FROM ingestion_job
             WHERE source='trades_archive' AND symbol=%s
-              AND state IN ('failed','unavailable')""",
-              (settings.symbol,)).fetchone()["n"]
+              AND day >= %s AND day < %s AND state <> 'complete'""",
+            (settings.symbol,settings.archive_start,end)).fetchone()["n"]
+        seen = conn.execute("""SELECT count(*) AS n FROM ingestion_job
+            WHERE source='trades_archive' AND symbol=%s
+              AND day >= %s AND day < %s""",
+            (settings.symbol,settings.archive_start,end)).fetchone()["n"]
+        unvalidated = conn.execute("""SELECT count(*) AS n FROM ingestion_job j
+            WHERE j.source='trades_archive' AND j.symbol=%s
+              AND j.state='complete' AND j.day >= %s AND j.day < %s
+              AND NOT EXISTS (
+                SELECT 1 FROM ingestion_cursor c
+                WHERE c.source='trades_archive_day_recheck'
+                  AND c.symbol=j.symbol AND c.instrument=%s
+                  AND c.interval=to_char(j.day,'YYYY-MM-DD')
+                  AND c.status='volume_only_reconciled')""",
+            (settings.symbol,settings.archive_start,end,settings.category)
+            ).fetchone()["n"]
         current = conn.execute("""SELECT cursor_ts FROM ingestion_cursor
             WHERE source='trades_archive_scan' AND symbol=%s
               AND instrument=%s AND interval=''""",
-              (settings.symbol,settings.category)).fetchone()
-    today = datetime.now(timezone.utc).date()
+            (settings.symbol,settings.category)).fetchone()
     caught_up = bool(current and current["cursor_ts"]
-                     and current["cursor_ts"].date() >= today)
-    result["unresolved_days"] = unresolved
+                     and current["cursor_ts"].date() >= end)
+    missing = max(0,(end-settings.archive_start).days-seen)
+    result.update({"unresolved_days":unresolved,"unvalidated_days":unvalidated,
+                   "unattempted_days":missing})
     result["status"] = ("cycle_completed" if caught_up and not unresolved
+                        and not missing and not unvalidated
                         and not result["recheck_pending"] else "partial")
     print("Archive bounded cycle:",result,flush=True)
     return result

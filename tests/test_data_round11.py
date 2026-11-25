@@ -64,35 +64,37 @@ def test_archive_cursor_is_bounded_and_future_excluded():
     with pytest.raises(ValueError):
         archives.plan_archive_days(start,start-timedelta(days=1),start,[])
 
-@pytest.mark.asyncio
-async def test_failed_archive_day_does_not_starve_later_day(monkeypatch):
-    start=date(2026,1,1); processed=[]; advances=[]
-    class Client:
-        async def __aenter__(self):return self
-        async def __aexit__(self,*args):pass
-    class DB:
-        def __enter__(self):return self
-        def __exit__(self,*args):pass
-        def execute(self,sql,args=None):
-            if "count(*)" in sql:return Row({"n":1})
-            return Row({"cursor_ts":None})
-    async def download(settings,day,client):
-        processed.append(day)
-        if day==start:raise DataIntegrityError("corrupt gzip")
-        return "complete"
-    async def nothing(_):return None
-    monkeypatch.setattr(archives,"archive_cycle_plan",lambda s:[start,start+timedelta(days=1)])
-    monkeypatch.setattr(archives.httpx,"AsyncClient",lambda **kwargs:Client())
-    monkeypatch.setattr(archives,"download_archive",download)
-    monkeypatch.setattr(archives,"quarantine_archive_day",lambda *x:processed.append("quarantine"))
-    monkeypatch.setattr(archives,"advance_archive_cursor",lambda s,d:advances.append(d))
-    monkeypatch.setattr(archives,"revalidate_completed_archive",lambda *x:{"status":"pending_official_1m"})
-    monkeypatch.setattr(archives,"connection",lambda *x:DB())
-    monkeypatch.setattr(archives.asyncio,"sleep",nothing)
-    result=await archives.backfill_archives(SimpleNamespace(
-        symbol="ETHUSDT",category="linear",archive_start=start,
-        archive_downloads_per_second=1))
-    assert processed[:3]==[start,"quarantine",start+timedelta(days=1)]
-    assert advances==[start,start+timedelta(days=1)]
-    assert result["status"]=="partial" and result["failed"]==1
-    assert result["ml_eligible"] is False
+def test_failed_archive_day_does_not_starve_later_day(monkeypatch):
+    import asyncio
+    async def scenario():
+        start=date(2026,1,1); processed=[]; advances=[]
+        class Client:
+            async def __aenter__(self):return self
+            async def __aexit__(self,*args):pass
+        class DB:
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def execute(self,sql,args=None):
+                if "count(*)" in sql:return Row({"n":1})
+                return Row({"cursor_ts":None})
+        async def download(settings,day,client):
+            processed.append(day)
+            if day==start:raise DataIntegrityError("corrupt gzip")
+            return "complete"
+        async def nothing(_):return None
+        monkeypatch.setattr(archives,"archive_cycle_plan",lambda s:[("fresh",start),("fresh",start+timedelta(days=1))])
+        monkeypatch.setattr(archives.httpx,"AsyncClient",lambda **kwargs:Client())
+        monkeypatch.setattr(archives,"download_archive",download)
+        monkeypatch.setattr(archives,"quarantine_archive_day",lambda *x:processed.append("quarantine"))
+        monkeypatch.setattr(archives,"advance_archive_cursor",lambda s,d,**kw:advances.append(d))
+        monkeypatch.setattr(archives,"revalidate_completed_archive",lambda *x:{"status":"pending_official_1m"})
+        monkeypatch.setattr(archives,"connection",lambda *x:DB())
+        monkeypatch.setattr(archives.asyncio,"sleep",nothing)
+        result=await archives.backfill_archives(SimpleNamespace(
+            symbol="ETHUSDT",category="linear",archive_start=start,
+            archive_downloads_per_second=1))
+        assert processed[:3]==[start,"quarantine",start+timedelta(days=1)]
+        assert advances==[start,start+timedelta(days=1)]
+        assert result["status"]=="partial" and result["failed"]==1
+        assert result["ml_eligible"] is False
+    asyncio.run(scenario())
