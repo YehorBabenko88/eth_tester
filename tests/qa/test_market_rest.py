@@ -23,6 +23,15 @@ async def mock_request(replies):
     async with bybit.MarketClient("https://offline.invalid", rps=100000) as client:
         await client.client.aclose()
         client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        class OfflineBudget:
+            async def reserve(self):
+                return 0
+
+            async def defer(self, _seconds):
+                return None
+
+        client._budget = OfflineBudget()
         result = await client.get("kline", symbol="ETHUSDT", category="linear")
     return result, seen
 
