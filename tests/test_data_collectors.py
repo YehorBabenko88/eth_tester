@@ -194,3 +194,29 @@ def test_archive_reconcile_requires_all_1440_minutes():
             return Rows()
     assert reconcile_archive_day(Conn(), "ETHUSDT", date(2026, 1, 1)
                                  )["status"] == "incomplete_candles"
+
+
+def test_archive_conflict_fails_once_and_records_gap(monkeypatch):
+    import eth_tester.archives as archives
+
+    conn = FakeConnection()
+    calls = []
+
+    @contextmanager
+    def connect(_settings):
+        yield conn
+
+    async def deterministic_conflict(*_args):
+        calls.append("attempt")
+        raise DataIntegrityError("Conflicting trade-id payload already exists")
+
+    monkeypatch.setattr(archives, "connection", connect)
+    monkeypatch.setattr(archives, "download_archive", deterministic_conflict)
+    settings = SimpleNamespace(
+        archive_start=datetime.now(UTC).date() - timedelta(days=1),
+        symbol="ETHUSDT", category="linear", archive_downloads_per_second=1.0)
+    with pytest.raises(DataIntegrityError, match="Conflicting"):
+        asyncio.run(archives.backfill_archives(settings))
+    assert calls == ["attempt"]
+    assert any("UPDATE ingestion_job" in q for q, _ in conn.queries)
+    assert any("INSERT INTO ingestion_coverage" in q for q, _ in conn.queries)
