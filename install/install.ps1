@@ -33,6 +33,22 @@ $canRead = @($access | Where-Object {
     (($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadData) -ne 0)
 }).Count -gt 0
 if (-not $canRead) { throw 'Grant LOCAL SERVICE explicit read ACL to .env before installing' }
+# Credential files must not be accessible to broad Windows principals, even through inheritance.
+$broad = @($access | Where-Object {
+    $_.IdentityReference.Value -match '(Everyone|Authenticated Users|BUILTIN\\Users)' -and
+    $_.AccessControlType -eq 'Allow' -and
+    (($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadData) -ne 0)
+}).Count -gt 0
+if ($broad) { throw 'Insecure broad read ACL on .env; restrict access to admins, owner and LOCAL SERVICE' }
+# Supervisor state is written outside the source/.env tree to a narrowly scoped runtime directory.
+$runtime = Join-Path $env:ProgramData 'ETHTester\runtime'
+New-Item -ItemType Directory -Path $runtime -Force | Out-Null
+$runtimeAcl = Get-Acl -LiteralPath $runtime
+$rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+    'NT AUTHORITY\LOCAL SERVICE', 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow'
+)
+$runtimeAcl.AddAccessRule($rule)
+Set-Acl -LiteralPath $runtime -AclObject $runtimeAcl
 $action = New-ScheduledTaskAction -Execute $Python -Argument '-m eth_tester.cli run' -WorkingDirectory $Root
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $owner = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\LOCAL SERVICE' -LogonType ServiceAccount -RunLevel Limited
