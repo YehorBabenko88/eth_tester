@@ -61,7 +61,7 @@ def test_open_or_naive_candle_exits_before_pivot(monkeypatch):
     assert strategy.price_signal(bars) is None
 
 def test_certified_expectancy_checks_issuer_time_and_version():
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timezone
     from eth_tester.strategy import Signal, certified_expectancy
 
     decision = datetime(2026, 1, 2, tzinfo=timezone.utc)
