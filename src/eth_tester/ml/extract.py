@@ -6,6 +6,7 @@ snapshot: recorded proof must be persisted with the original trade reason.
 from datetime import datetime, timezone
 import json
 import math
+from decimal import Decimal, InvalidOperation
 
 from . import CLASSES, Example, FEATURE_NAMES, validate
 from ..database import connection
@@ -100,6 +101,10 @@ def load_paper_examples(settings, as_of_ms, *, limit=100000):
 def _rejection_category(exc):
     """Finite, static source-quality diagnostics. Never expose source text/IDs."""
     message = str(exc)
+    if "provisional_paper_economics" in message:
+        return "provisional_paper_economics"
+    if "incomplete_paper_fee_evidence" in message:
+        return "incomplete_paper_fee_evidence"
     if "source certification" in message or "uncertified snapshot" in message:
         return "not_independently_certified_historical_snapshot"
     if "horizon" in message or "future" in message or "hindsight" in message:
@@ -109,6 +114,56 @@ def _rejection_category(exc):
     if "D/E snapshot identity" in message or "signal decision" in message:
         return "source_not_immutable"
     return "other"
+
+
+def _require_complete_paper_economics(record, reason, fee, nominal):
+    """Fail closed on unproved paper funding and execution costs.
+
+    A captured structural direction can still live in B's separate immutable
+    paper_ml_labels; it is NOT a monetary reward until independently costed.
+    E currently writes funding_verified=false and schedule_complete=false.
+    No absent field or paper-only fill can silently imply verified funding.
+    """
+    if record.get("funding_verified") is not True:
+        raise ValueError("provisional_paper_economics")
+    if (not isinstance(record.get("execution_quality"), str)
+            or record["execution_quality"].strip() in ("", "unknown", "unverified")):
+        raise ValueError("incomplete_paper_fee_evidence")
+    policy = reason.get("paper_cost_policy")
+    if not isinstance(policy, dict) or policy.get("version") != "paper_taker_cost_v1":
+        raise ValueError("incomplete_paper_fee_evidence")
+    try:
+        policy_nominal = Decimal(str(policy.get("notional_usd")))
+        if not policy_nominal.is_finite() or policy_nominal != Decimal(str(nominal)):
+            raise ValueError("incomplete_paper_fee_evidence")
+    except (InvalidOperation, ValueError, TypeError):
+        raise ValueError("incomplete_paper_fee_evidence") from None
+    events = record.get("execution_events")
+    if not isinstance(events, list) or len(events) != 2:
+        raise ValueError("incomplete_paper_fee_evidence")
+    if [e.get("action") for e in events if isinstance(e, dict)] != ["entry", "exit"]:
+        raise ValueError("incomplete_paper_fee_evidence")
+    try:
+        amounts = [Decimal(str(e["fee"])) for e in events]
+        if any(not amount.is_finite() or amount < 0 for amount in amounts):
+            raise ValueError("incomplete_paper_fee_evidence")
+        fee_diff = abs(sum(amounts) - Decimal(str(fee)))
+        tolerance = max(Decimal("0.0000001"), Decimal(str(nominal)) * Decimal("0.000000001"))
+        if fee_diff > tolerance:
+            raise ValueError("incomplete_paper_fee_evidence")
+    except (InvalidOperation, ValueError, TypeError, KeyError):
+        raise ValueError("incomplete_paper_fee_evidence") from None
+    for event in events:
+        if (event.get("source") != "paper_proxy" or not isinstance(event.get("quality"), str)
+                or event["quality"].strip() in ("", "unknown", "unverified")):
+            raise ValueError("incomplete_paper_fee_evidence")
+        if not isinstance(event.get("provenance"), dict):
+            raise ValueError("incomplete_paper_fee_evidence")
+    closing = events[1]["provenance"]
+    if (closing.get("fee_quality") != "entry_time_cost_policy_pinned"
+            or closing.get("funding_source_db_rechecked") is not True
+            or closing.get("funding_schedule_complete") is not True):
+        raise ValueError("provisional_paper_economics")
 
 
 def from_snapshot_records(records, as_of_ms):
@@ -144,6 +199,7 @@ def from_snapshot_records(records, as_of_ms):
                 raise ValueError("inconsistent paper cost/notional basis")
             if decision >= closed:
                 raise ValueError("position closed before ML decision")
+            _require_complete_paper_economics(record, reason, fee, nominal)
             accepted.append(Example(
                 f"paper:{trade_id}", decision, horizon, values, times, outcome,
                 gross / nominal, (fee + funding) / nominal))
@@ -187,6 +243,23 @@ def load_causal_feature_examples(settings, as_of_ms, *, tf="1", limit=100000):
                      p.signal_ts AS decision_at,p.opened_at,p.closed_at,
                      p.notional,p.gross_pnl,p.fee_paid AS fees,
                      p.funding_paid AS funding,p.net_pnl,
+                     p.funding_verified,p.execution_quality,
+                     (CASE WHEN p.funding_verified IS TRUE THEN
+                      (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                       'action',ev.action,'fee',ev.fee,'source',ev.source,
+                       'quality',ev.quality,
+                       'provenance',jsonb_build_object(
+                         'fee_quality',ev.provenance->>'fee_quality',
+                         'funding_source_db_rechecked',ev.provenance->'funding_source_db_rechecked',
+                         'funding_schedule_complete',ev.provenance->'funding_schedule_complete'))
+                       ORDER BY ev.event_ts,ev.event_key),'[]'::jsonb)
+                      FROM (SELECT action,fee,source,quality,provenance,
+                                   event_ts,event_key
+                            FROM paper_order_events
+                            WHERE paper_trade_id=p.id
+                            ORDER BY event_ts,event_key LIMIT 3) ev
+                      )
+                      ELSE '[]'::jsonb END) AS execution_events,
                      f.snapshot_key,f.bar_ts,f.available_at,f.observed_at,
                      f.computed_at,f.source_checksum,
                      f.quality AS snapshot_quality,f.is_causal,
