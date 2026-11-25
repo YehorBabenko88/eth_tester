@@ -1,82 +1,222 @@
-"""Live-only confirmation; missing evidence never becomes positive evidence."""
-from datetime import datetime,timedelta,timezone
-from decimal import Decimal as D
+"""Fail-closed live paper confirmation with explicit time and volume coverage.
+
+Never interpret a score as win probability, nor orderbook loss as a fill.
+All evidence must have existed at the observed decision instant.
+"""
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+
 from .strategies import Parameters
 from .strategy import economics
 
-def confirm_rejection(conn,settings,signal,bar):
-    start=bar["ts"]
-    end=start+timedelta(minutes=1)
-    now=datetime.now(timezone.utc)
-    symbol=settings.symbol
+VOLUME_REL_TOLERANCE = Decimal("0.0005")
+VOLUME_ABS_TOLERANCE = Decimal("0.001")
+
+
+def _decimal(value):
+    number = Decimal(str(value))
+    if not number.is_finite():
+        raise ValueError("non-finite market data")
+    return number
+
+
+def _matches_volume(actual, stated):
+    try:
+        actual, stated = _decimal(actual), _decimal(stated)
+        return (actual > 0 and stated > 0 and
+                abs(actual - stated) <= max(VOLUME_ABS_TOLERANCE,
+                                            stated * VOLUME_REL_TOLERANCE))
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
+def _valid_oi(rows, cutoff):
+    if len(rows) != 2:
+        return False
+    latest, previous = rows
+    if any(item["ts"].tzinfo is None for item in rows):
+        return False
+    if (latest["ts"] <= previous["ts"] or
+            latest["ts"] - previous["ts"] != timedelta(minutes=5) or
+            not timedelta(0) <= cutoff - latest["ts"] <= timedelta(minutes=10)):
+        return False
+    if any(int(item["ts"].timestamp()) % 300 != 0 for item in rows):
+        return False
+    try:
+        return all(_decimal(item["value"]) > 0 for item in rows)
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
+def _baseline(conn, symbol, start):
+    """Validate five consecutive one-minute trades against five closed candles."""
+    previous = start - timedelta(minutes=5)
+    ticks = conn.execute("""SELECT date_trunc('minute',ts) AS ts,count(*) AS n,
+      coalesce(sum(qty) FILTER(WHERE side='Buy'),0) AS buys,
+      coalesce(sum(qty) FILTER(WHERE side='Sell'),0) AS sells
+      FROM trades WHERE symbol=%s AND ts>=%s AND ts<%s GROUP BY 1 ORDER BY 1""",
+      (symbol, previous, start)).fetchall()
+    candles = conn.execute("""SELECT ts,volume FROM candles WHERE symbol=%s
+      AND kind='trade' AND tf='1' AND closed AND ts>=%s AND ts<%s ORDER BY ts""",
+      (symbol, previous, start)).fetchall()
+    if len(ticks) != 5 or len(candles) != 5:
+        return None
+    total_count, total_delta = 0, Decimal(0)
+    for index, (tick, candle) in enumerate(zip(ticks, candles)):
+        expected = previous + timedelta(minutes=index)
+        if (tick["ts"] != expected or candle["ts"] != expected
+                or tick["n"] < 2):
+            return None
+        try:
+            buys, sells = _decimal(tick["buys"]), _decimal(tick["sells"])
+            if min(buys, sells) < 0 or not _matches_volume(
+                    buys + sells, candle["volume"]):
+                return None
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+        total_count += tick["n"]
+        total_delta += buys - sells
+    return total_count, total_delta
+
+
+def _mtf(conn, symbol, end, sign):
+    trends = {}
+    for tf, minutes in (("5", 5), ("15", 15), ("60", 60)):
+        span = timedelta(minutes=minutes)
+        bars = conn.execute("""SELECT ts,close FROM candles WHERE symbol=%s
+          AND kind='trade' AND tf=%s AND closed AND ts<=%s
+          ORDER BY ts DESC LIMIT 3""", (symbol, tf, end - span)).fetchall()
+        if (len(bars) != 3 or end - bars[0]["ts"] > 2 * span
+                or any(a["ts"] - b["ts"] != span for a, b in zip(bars, bars[1:]))):
+            return None
+        if any(item["ts"].tzinfo is None for item in bars):
+            return None
+        try:
+            trends[tf] = sign * (_decimal(bars[0]["close"]) -
+                                _decimal(bars[-1]["close"])) > 0
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+    return trends
+
+
+def confirm_rejection(conn, settings, signal, bar, *, observed_at=None):
+    """Return (admissible, JSON-compatible evidence) at the observed instant."""
+    now = observed_at if observed_at is not None else datetime.now(timezone.utc)
+
     def reject(reason):
-        return False,{"reason":reason,"score":0}
-    if not timedelta(0)<=now-end<=timedelta(seconds=90):
+        return False, {"reason": reason, "score": 0, "admissible": False}
+
+    if signal is None or signal.direction not in ("long", "short"):
+        return reject("invalid_signal")
+    start = bar["ts"]
+    if start.tzinfo is None or now.tzinfo is None:
+        return reject("naive_timestamp")
+    end = start + timedelta(minutes=1)
+    if not timedelta(0) <= now - end <= timedelta(seconds=90):
         return reject("stale_or_open_bar")
-    rows=conn.execute("""SELECT price, sum(qty) FILTER(WHERE side='Buy') AS buys,
+    symbol = settings.symbol
+    rows = conn.execute("""SELECT price,sum(qty) FILTER(WHERE side='Buy') AS buys,
       sum(qty) FILTER(WHERE side='Sell') AS sells,count(*) AS n
       FROM trades WHERE symbol=%s AND ts>=%s AND ts<%s GROUP BY price""",
-      (symbol,start,end)).fetchall()
-    buys=sum((D(r["buys"] or 0) for r in rows),D(0))
-    sells=sum((D(r["sells"] or 0) for r in rows),D(0))
-    n=sum(r["n"] for r in rows)
-    volume=buys+sells
-    if n<20 or not volume or bar.get("volume") is None or abs(volume-D(bar["volume"]))>max(D("0.001"),D(bar["volume"])*D("0.0005")):
-        return reject("tick_volume_unverified")
-    earlier=conn.execute("""SELECT count(*) AS n,coalesce(sum(qty) FILTER(WHERE side='Buy'),0)-
-      coalesce(sum(qty) FILTER(WHERE side='Sell'),0) AS delta FROM trades
-      WHERE symbol=%s AND ts>=%s AND ts<%s""",(symbol,start-timedelta(minutes=5),start)).fetchone()
-    if not earlier["n"]:
-        return reject("missing_tape_baseline")
-    oi=conn.execute("""SELECT ts,value FROM open_interest WHERE symbol=%s AND interval='5min'
-      AND ts<=%s ORDER BY ts DESC LIMIT 2""",(symbol,end)).fetchall()
-    if len(oi)!=2 or oi[0]["ts"]-oi[1]["ts"]!=timedelta(minutes=5) or end-oi[0]["ts"]>timedelta(minutes=10) or min(r["value"] for r in oi)<=0:
-        return reject("stale_or_gapped_oi")
-    book=conn.execute("SELECT bids,asks,updated_at,valid FROM market_book_state WHERE symbol=%s",(symbol,)).fetchone()
-    if not book or not book["valid"] or not timedelta(0)<=now-book["updated_at"]<=timedelta(seconds=10):
-        return reject("stale_book")
-    bid=sum((D(x) for x in book["bids"].values()),D(0))
-    ask=sum((D(x) for x in book["asks"].values()),D(0))
-    if min(bid,ask)<=0:
-        return reject("empty_book")
-    sign=1 if signal.direction=="long" else -1
-    delta=(buys-sells)/volume
-    speed=D(n*5)/D(earlier["n"])
-    imbalance=(bid-ask)/(bid+ask)
-    change=D(oi[0]["value"])/D(oi[1]["value"])-1
-    trend=[]
-    for tf,minutes in (("5",5),("15",15),("60",60)):
-        span=timedelta(minutes=minutes)
-        bars=conn.execute("""SELECT ts,close FROM candles WHERE symbol=%s AND kind='trade'
-          AND tf=%s AND closed AND ts<=%s ORDER BY ts DESC LIMIT 3""",(symbol,tf,end-span)).fetchall()
-        if len(bars)!=3 or end-bars[0]["ts"]>2*span or any(a["ts"]-b["ts"]!=span for a,b in zip(bars,bars[1:])):
-            return reject("missing_multitimeframe_"+tf)
-        trend.append(sign*(D(bars[0]["close"])-D(bars[-1]["close"]))>0)
-    poc=max(rows,key=lambda r:(D(r["buys"] or 0)+D(r["sells"] or 0),-D(r["price"])))["price"]
-    near=[r for r in rows if abs(D(r["price"])-signal.level)<=D(bar["close"])*D("0.001")]
-    local=sum((D(r["buys"] or 0)-D(r["sells"] or 0) for r in near),D(0))
-    reversal=signal.reason.get("strategy") in ("rejection","false_breakout")
-    absorption=reversal and sign*delta<D("-0.15") and sign*local<0
-    cvd=D(earlier["delta"])+buys-sells
-    liq=conn.execute("""SELECT side,coalesce(sum(qty),0) AS qty FROM liquidation_events
-      WHERE symbol=%s AND ts>=%s AND ts<%s GROUP BY side""",(symbol,start,end)).fetchall()
-    liquidation={r["side"]:str(r["qty"]) for r in liq}
-    checks={"directional_flow_or_absorption":(absorption if reversal else sign*delta>D("0.1")),
-            "tape_acceleration":speed>=D("1.15"),"oi_building":change>D("0.001"),
-            "book_agrees":sign*imbalance>D("0.1"),"multitimeframe":sum(trend)>=2,
-            "cvd_agrees":sign*cvd>0,"footprint_near_level":bool(near)}
-    weights=(25,10,10,15,20,10,10)
-    score=sum(w for w,v in zip(weights,checks.values()) if v)
-    recent=conn.execute("""SELECT price,ts FROM trades WHERE symbol=%s AND source='websocket'
-      AND ts<=%s ORDER BY ts DESC,trade_id DESC LIMIT 1""",(symbol,now)).fetchone()
-    if not recent or now-recent["ts"]>timedelta(seconds=10):
-        return reject("stale_entry")
-    costs=economics(signal.direction,D(recent["price"]),signal.stop,signal.take,
-                    settings.taker_fee_rate,settings.slippage_bps)
-    accepted=score>=Parameters().min_score and checks["directional_flow_or_absorption"] and checks["multitimeframe"] and costs is not None
-    return accepted,{"score":score,"minimum":Parameters().min_score,"checks":checks,
-      "delta_fraction":str(delta),"cvd_6m":str(cvd),"tape_speed_ratio":str(speed),
-      "oi_change":str(change),"book_imbalance":str(imbalance),"poc":str(poc),
-      "local_delta":str(local),"absorption_proxy":absorption,"liquidations_observed":liquidation,
-      "economics_at_observed_entry":costs,"reason":"accepted" if accepted else "confirmation_or_cost_gate",
-      "warning":"Absorption is a proxy; liquidation coverage is not proven; score is not a probability."}
+      (symbol, start, end)).fetchall()
+    try:
+        if any(_decimal(row["price"]) <= 0 or row["n"] <= 0 for row in rows):
+            return reject("invalid_tick_price")
+        buys = sum((_decimal(row["buys"] or 0) for row in rows), Decimal(0))
+        sells = sum((_decimal(row["sells"] or 0) for row in rows), Decimal(0))
+        count = sum(row["n"] for row in rows)
+        volume = buys + sells
+        if min(buys, sells) < 0 or count < 20 or not _matches_volume(
+                volume, bar.get("volume")):
+            return reject("tick_volume_unverified")
+        baseline = _baseline(conn, symbol, start)
+        if baseline is None:
+            return reject("incomplete_five_minute_tick_baseline")
+        previous_count, previous_delta = baseline
+        oi = conn.execute("""SELECT ts,value FROM open_interest WHERE symbol=%s
+          AND interval='5min' AND ts<=%s ORDER BY ts DESC LIMIT 2""",
+          (symbol, end)).fetchall()
+        if not _valid_oi(oi, end):
+            return reject("stale_or_gapped_oi")
+        book = conn.execute("""SELECT bids,asks,updated_at,valid
+          FROM market_book_state WHERE symbol=%s""", (symbol,)).fetchone()
+        if (not book or not book["valid"] or book["updated_at"].tzinfo is None
+                or not timedelta(0) <= now - book["updated_at"] <= timedelta(seconds=10)):
+            return reject("stale_book")
+        bid = sum((_decimal(qty) for qty in book["bids"].values()), Decimal(0))
+        ask = sum((_decimal(qty) for qty in book["asks"].values()), Decimal(0))
+        if min(bid, ask) <= 0:
+            return reject("invalid_book_liquidity")
+        sign = 1 if signal.direction == "long" else -1
+        mtf = _mtf(conn, symbol, end, sign)
+        if mtf is None:
+            return reject("missing_multitimeframe")
+        recent = conn.execute("""SELECT price,ts FROM trades WHERE symbol=%s
+          AND source='websocket' AND ts<=%s ORDER BY ts DESC,trade_id DESC LIMIT 1""",
+          (symbol, now)).fetchone()
+        if (not recent or recent["ts"].tzinfo is None or
+                not timedelta(0) <= now - recent["ts"] <= timedelta(seconds=10)):
+            return reject("stale_entry")
+        delta = (buys - sells) / volume
+        speed = Decimal(count * 5) / Decimal(previous_count)
+        imbalance = (bid - ask) / (bid + ask)
+        oi_change = _decimal(oi[0]["value"]) / _decimal(oi[1]["value"]) - 1
+        rolling_cvd = previous_delta + buys - sells
+        poc = min(rows, key=lambda item: (-(_decimal(item["buys"] or 0) +
+                                               _decimal(item["sells"] or 0)),
+                                          _decimal(item["price"])))["price"]
+        near = [item for item in rows if abs(_decimal(item["price"]) -
+                 signal.level) <= _decimal(bar["close"]) * Decimal("0.001")]
+        local_buy = sum((_decimal(item["buys"] or 0) for item in near), Decimal(0))
+        local_sell = sum((_decimal(item["sells"] or 0) for item in near), Decimal(0))
+        local_volume = local_buy + local_sell
+        local_delta = local_buy - local_sell
+        footprint = local_volume / volume >= Decimal("0.05")
+        reversal = signal.reason.get("strategy") in (
+            "rejection", "false_breakout", "naked_poc_rejection",
+            "hvn_rejection")
+        absorption = (reversal and footprint and
+                      sign * delta < Decimal("-0.15") and
+                      sign * local_delta < -local_volume * Decimal("0.15"))
+        checks = {
+            "directional_flow_or_absorption": (absorption if reversal
+                                               else sign * delta > Decimal("0.10")),
+            "tape_acceleration": speed >= Decimal("1.15"),
+            "oi_building": oi_change > Decimal("0.001"),
+            "book_agrees": sign * imbalance > Decimal("0.1"),
+            "multitimeframe": sum(mtf.values()) >= 2,
+            "cvd_agrees": sign * rolling_cvd > 0,
+            "footprint_near_level": footprint,
+        }
+        weights = {"directional_flow_or_absorption": 25, "tape_acceleration": 10,
+                   "oi_building": 10, "book_agrees": 15, "multitimeframe": 20,
+                   "cvd_agrees": 10, "footprint_near_level": 10}
+        score = sum(weight for key, weight in weights.items() if checks[key])
+        costs = economics(signal.direction, _decimal(recent["price"]),
+                          signal.stop, signal.take, settings.taker_fee_rate,
+                          settings.slippage_bps)
+        accepted = (score >= Parameters().min_score and
+                    checks["directional_flow_or_absorption"] and
+                    checks["multitimeframe"] and costs is not None)
+        liquidation = conn.execute("""SELECT side,coalesce(sum(qty),0) AS qty
+          FROM liquidation_events WHERE symbol=%s AND ts>=%s AND ts<%s
+          GROUP BY side""", (symbol, start, end)).fetchall()
+        return accepted, {
+            "reason": "accepted" if accepted else "confirmation_or_cost_gate",
+            "admissible": accepted, "score": score, "minimum": Parameters().min_score,
+            "checks": checks, "weights": weights, "mtf": mtf,
+            "delta_fraction": str(delta), "rolling_cvd_6m_qty": str(rolling_cvd),
+            "tape_speed_ratio": str(speed), "oi_change": str(oi_change),
+            "book_imbalance": str(imbalance), "minute_poc": str(poc),
+            "level_local_delta": str(local_delta),
+            "level_volume_fraction": str(local_volume / volume),
+            "absorption_proxy": absorption,
+            "liquidations_observed_unverified": {
+                item["side"]: str(item["qty"]) for item in liquidation},
+            "economics_at_observed_entry": costs,
+            "baseline": "five_closed_1m_candles_volume_matched",
+            "warning": ("Score is not a probability; book changes and liquidation "
+                        "counts cannot prove absorption or fill attribution."),
+        }
+    except (InvalidOperation, TypeError, ValueError, KeyError, ZeroDivisionError):
+        return reject("invalid_market_observation")
