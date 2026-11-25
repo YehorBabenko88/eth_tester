@@ -37,6 +37,11 @@ def ingest_ws(conn,symbol,payload):
 async def live_feed(settings):
     topics=[f"publicTrade.{settings.symbol}",f"orderbook.50.{settings.symbol}"]
     attempt=0
+    with connection(settings) as conn:
+        last=conn.execute("SELECT ts FROM trades WHERE symbol=%s AND source='websocket' ORDER BY ts DESC LIMIT 1",(settings.symbol,)).fetchone()
+        pending=conn.execute("SELECT id FROM data_gaps WHERE symbol=%s AND source='publicTrade' AND end_ts IS NULL ORDER BY id DESC LIMIT 1",(settings.symbol,)).fetchone()
+    last_trade=last['ts'] if last else None
+    pending_id=pending['id'] if pending else None
     while True:
         try:
             async with websockets.connect(settings.bybit_ws,ping_interval=20,ping_timeout=15,
@@ -60,12 +65,23 @@ async def live_feed(settings):
                     if topic.startswith(("publicTrade.","orderbook.")):
                         with connection(settings) as conn:
                             ingest_ws(conn,settings.symbol,payload)
-        except (OSError,websockets.exceptions.WebSocketException,TimeoutError,
-                RuntimeError,ValueError,KeyError) as exc:
-            with connection(settings) as conn:
-                conn.execute("""INSERT INTO feed_health(symbol,topic,status,detail)
-                   VALUES(%s,'connection','disconnected',%s::jsonb)""",
-                   (settings.symbol,json.dumps({"reason":str(exc)[:400]})))
+                            if topic.startswith('publicTrade.') and payload.get('data'):
+                                stamp=max(stamp_ms(x['T']) for x in payload['data'])
+                                if pending_id:
+                                    conn.execute('UPDATE data_gaps SET end_ts=%s WHERE id=%s AND end_ts IS NULL',(stamp,pending_id))
+                                    pending_id=None
+                                last_trade=stamp
+        except Exception as exc:
+            try:
+                with connection(settings) as conn:
+                    conn.execute("INSERT INTO feed_health(symbol,topic,status,detail) VALUES(%s,'connection','disconnected',%s::jsonb)",
+                                 (settings.symbol,json.dumps({'reason':str(exc)[:400]})))
+                    if last_trade and pending_id is None:
+                        item=conn.execute("INSERT INTO data_gaps(source,symbol,start_ts,explanation) VALUES('publicTrade',%s,%s,'websocket interrupted') RETURNING id",
+                                          (settings.symbol,last_trade)).fetchone()
+                        pending_id=item['id']
+            except Exception as log_error:
+                print(f'Failed to persist outage: {log_error}',flush=True)
             attempt+=1
             await asyncio.sleep(min(120,2**min(7,attempt))+random.uniform(0,2))
 
