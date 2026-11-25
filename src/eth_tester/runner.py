@@ -8,10 +8,10 @@ from .paper import open_paper,close_paper
 from .strategy import price_signal
 from .orderflow import confirm_rejection
 
-def estimated_funding(conn,settings,opened,observed,qty,entry):
+def estimated_funding(conn,settings,opened,observed,qty,entry,direction):
     rows=conn.execute("""SELECT ts,rate FROM funding WHERE symbol=%s AND
       ts>%s AND ts<=%s""",(settings.symbol,opened,observed)).fetchall()
-    return sum((qty*entry*Decimal(x["rate"]) for x in rows),Decimal(0))
+    return (1 if direction=="long" else -1)*sum((qty*entry*Decimal(x["rate"]) for x in rows),Decimal(0))
 
 def engine_tick(settings):
     now=datetime.now(timezone.utc)
@@ -26,8 +26,14 @@ def engine_tick(settings):
             return "waiting_live_feed"
         trade=conn.execute("SELECT * FROM paper_trades WHERE state='open' LIMIT 1").fetchone()
         if trade:
-            price=Decimal(recent["price"])
             stop,take=Decimal(trade["stop"]),Decimal(trade["take"])
+            hit=conn.execute("""SELECT ts,price FROM trades WHERE symbol=%s AND ts>=%s AND ts<=%s
+              AND (price<=%s OR price>=%s) ORDER BY ts,trade_id LIMIT 1""",
+              (settings.symbol,trade["opened_at"],recent["ts"],min(stop,take),max(stop,take))).fetchone()
+            if not hit:
+                return "monitoring_position"
+            recent=hit
+            price=Decimal(hit["price"])
             if trade["direction"]=="long":
                 reason="stop" if price<=stop else "take" if price>=take else None
             else:
@@ -35,7 +41,7 @@ def engine_tick(settings):
             if not reason:
                 return "monitoring_position"
             funding=estimated_funding(conn,settings,trade["opened_at"],
-                                       recent["ts"],trade["qty"],trade["entry"])
+                                       recent["ts"],trade["qty"],trade["entry"],trade["direction"])
         else:
             enabled=conn.execute("SELECT enabled,paused FROM bot_control WHERE singleton=true").fetchone()
             if not enabled or not enabled["enabled"] or enabled["paused"]:
@@ -50,6 +56,8 @@ def engine_tick(settings):
             bars.reverse()
             if len(bars)<30 or now-bars[-1]["ts"]>timedelta(minutes=5):
                 return "stale_or_insufficient_candles"
+            if any(b["ts"]-a["ts"]!=timedelta(minutes=1) for a,b in zip(bars,bars[1:])):
+                return "blocked_candle_gap"
             last=bars[-1]["ts"]
             exists=conn.execute("""SELECT 1 FROM strategy_signals WHERE
               symbol=%s AND tf='1' AND bar_ts=%s AND version='pivot_rejection_v1'""",
