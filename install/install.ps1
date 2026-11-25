@@ -27,19 +27,22 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
 }
 # Explicit, narrowly scoped ACL must grant LocalService access. Never grant Everyone read.
 $access = (Get-Acl -LiteralPath (Join-Path $Root '.env')).Access
-$canRead = @($access | Where-Object {
-    $_.IdentityReference.Value -match '(LOCAL SERVICE|S-1-5-19)' -and
-    $_.AccessControlType -eq 'Allow' -and
-    (($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadData) -ne 0)
-}).Count -gt 0
-if (-not $canRead) { throw 'Grant LOCAL SERVICE explicit read ACL to .env before installing' }
-# Credential files must not be accessible to broad Windows principals, even through inheritance.
-$broad = @($access | Where-Object {
-    $_.IdentityReference.Value -match '(Everyone|Authenticated Users|BUILTIN\\Users)' -and
-    $_.AccessControlType -eq 'Allow' -and
-    (($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadData) -ne 0)
-}).Count -gt 0
-if ($broad) { throw 'Insecure broad read ACL on .env; restrict access to admins, owner and LOCAL SERVICE' }
+$canRead = $false
+$broad = $false
+foreach ($ace in $access) {
+    if ($ace.AccessControlType -ne 'Allow' -or
+        (($ace.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadData) -eq 0)) {
+        continue
+    }
+    # Well-known SIDs are independent of localized Windows account names.
+    try { $sid = $ace.IdentityReference.Translate(
+        [System.Security.Principal.SecurityIdentifier]).Value
+    } catch { continue }
+    if ($sid -eq 'S-1-5-19') { $canRead = $true }
+    if (@('S-1-1-0','S-1-5-11','S-1-5-32-545') -contains $sid) { $broad = $true }
+}
+if (-not $canRead) { throw 'Grant LOCAL SERVICE (S-1-5-19) explicit read ACL to .env' }
+if ($broad) { throw 'Insecure broad read ACL on .env; restrict it before installing' }
 # Supervisor state is written outside the source/.env tree to a narrowly scoped runtime directory.
 $runtime = Join-Path $env:ProgramData 'ETHTester\runtime'
 New-Item -ItemType Directory -Path $runtime -Force | Out-Null
