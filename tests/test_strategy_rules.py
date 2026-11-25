@@ -32,3 +32,11 @@ def test_calibrated_expectancy_requires_conservative_probability():
     qualified = calibrated_expectancy(*args, D("0.8"))
     assert qualified is not None
     assert D(qualified["expected_net_fraction_lower_bound"]) >= D("0.002")
+
+def test_economics_invalid_inputs_fail_closed():
+    args = (D(100), D(99), D(105), D("0.00055"), D(2))
+    assert economics("invalid", *args) is None
+    assert economics("long", *args[:3], D(-1), args[4]) is None
+    assert economics("long", *args[:3], args[3], D(-2)) is None
+    assert economics("long", D("NaN"), *args[1:]) is None
+    assert economics("long", D(100), D(100), D(105), args[3], args[4]) is None
