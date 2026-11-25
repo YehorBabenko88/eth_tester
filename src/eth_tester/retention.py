@@ -1,7 +1,6 @@
 """Safe retention and operational storage health: never prune raw market history."""
 from shutil import disk_usage
 
-from psycopg import sql
 
 from .database import connection
 
