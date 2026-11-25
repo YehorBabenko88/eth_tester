@@ -44,8 +44,11 @@ if ($broad) { throw 'Insecure broad read ACL on .env; restrict access to admins,
 $runtime = Join-Path $env:ProgramData 'ETHTester\runtime'
 New-Item -ItemType Directory -Path $runtime -Force | Out-Null
 $runtimeAcl = Get-Acl -LiteralPath $runtime
-$rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-    'NT AUTHORITY\LOCAL SERVICE', 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow'
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    'NT AUTHORITY\LOCAL SERVICE', 'Modify',
+    [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit',
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow
 )
 $runtimeAcl.AddAccessRule($rule)
 Set-Acl -LiteralPath $runtime -AclObject $runtimeAcl
