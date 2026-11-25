@@ -5,7 +5,7 @@ orderflow absorption, profitable expectancy, or permission to open any order.
 Only the existing B/D/E evidence and position gates authorize paper admission.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import (
     Decimal, InvalidOperation, DivisionByZero, Context, localcontext, ROUND_HALF_EVEN,
 )
@@ -370,3 +370,34 @@ def evaluate_shadow_ensemble(closed_candles, *, taker_fee_rate=Decimal("0.00055"
             closed_candles, taker_fee_rate=taker_fee_rate,
             slippage_bps=slippage_bps, decision_at=decision_at,
         )
+
+
+def evaluate_closed_bar_research(closed_candles, *, observed_at,
+                                 taker_fee_rate=Decimal("0.00055"),
+                                 slippage_bps=Decimal("2")):
+    """Independently evaluate every eligible observed 1m bar, including no-trade.
+
+    E must call this outside the incumbent v3 signal-selection gate.
+    B's actual append-only source/receipt identity is a separate requirement:
+    this diagnostic NEVER certifies observation time or historical ML validity.
+    """
+    with localcontext(Context(prec=42, rounding=ROUND_HALF_EVEN)):
+        if (not isinstance(observed_at, datetime)
+                or observed_at.tzinfo is None
+                or observed_at.utcoffset() != timedelta(0)):
+            return _canonical(_empty("actual_utc_decision_time_required"))
+        observed = observed_at.astimezone(timezone.utc)
+        result = _evaluate_shadow_ensemble_impl(
+            closed_candles, taker_fee_rate=taker_fee_rate,
+            slippage_bps=slippage_bps, decision_at=observed,
+        )
+        result["research_observed_at"] = observed.isoformat()
+        result["independent_of_incumbent"] = True
+        result["observation_receipt_authoritative"] = False
+        result["paper_entry_authorized"] = False
+        result["ml_eligible"] = False
+        result["approved"] = False
+        result["promoted"] = False
+        result["calibration"] = "not_independently_calibrated"
+        result["expected_net_lower_bound"] = None
+        return _canonical(result)

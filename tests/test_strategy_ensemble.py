@@ -330,3 +330,86 @@ def test_raw_volume_revision_changes_fingerprint():
     revised = evaluate_shadow_ensemble(altered)
     assert original["input_sha256"] != revised["input_sha256"]
     assert original["source_identity_authoritative"] is False
+
+
+def test_every_closed_bar_research_is_independent_and_non_executable():
+    from eth_tester.strategies.ensemble import evaluate_closed_bar_research
+    bars = candles()
+    received_at = bars[-1]["ts"] + timedelta(minutes=1)
+    observation = evaluate_closed_bar_research(bars, observed_at=received_at)
+    check_no_promotion(observation)
+    assert observation["independent_of_incumbent"] is True
+    assert observation["research_observed_at"] == received_at.isoformat()
+    assert observation["observation_receipt_authoritative"] is False
+    assert observation["source_identity_authoritative"] is False
+    assert observation["input_bar_count"] == len(bars)
+    assert len(observation["input_sha256"]) == 64
+
+
+def test_every_closed_bar_research_includes_no_trade_without_incumbent():
+    from eth_tester.strategies.ensemble import evaluate_closed_bar_research
+    bars = candles()
+    for bar in bars:
+        bar.update(open=D(100), high=D("100.25"), low=D("99.75"),
+                   close=D(100), volume=D(10))
+    observation = evaluate_closed_bar_research(
+        bars, observed_at=bars[-1]["ts"] + timedelta(minutes=1))
+    check_no_promotion(observation)
+    assert observation["status"] == "no_trade"
+    assert observation["selected"] is None
+    assert observation["reason"] in (
+        "no_causal_pattern", "all_candidates_unconfirmed_or_mtf_conflicted")
+    assert observation["independent_of_incumbent"] is True
+    assert len(observation["input_sha256"]) == 64
+
+
+@pytest.mark.parametrize("bad_time", [None, START.replace(tzinfo=None)])
+def test_every_closed_bar_research_rejects_missing_real_utc_clock(bad_time):
+    from eth_tester.strategies.ensemble import evaluate_closed_bar_research
+    result = evaluate_closed_bar_research(candles(), observed_at=bad_time)
+    check_no_promotion(result)
+    assert result["status"] == "no_trade"
+    assert result["reason"] == "actual_utc_decision_time_required"
+
+
+def test_every_closed_bar_research_rejects_future_and_unconfirmed_bars():
+    from eth_tester.strategies.ensemble import evaluate_closed_bar_research
+    bars = candles()
+    end = bars[-1]["ts"] + timedelta(minutes=1)
+    future = evaluate_closed_bar_research(
+        bars, observed_at=end - timedelta(seconds=1))
+    check_no_promotion(future)
+    assert future["reason"] == "future_candle_relative_to_observation"
+    unconfirmed = deepcopy(bars)
+    unconfirmed[0].pop("closed")
+    result = evaluate_closed_bar_research(unconfirmed, observed_at=end)
+    check_no_promotion(result)
+    assert result["reason"] == "open_candle_unavailable"
+
+
+def test_every_closed_bar_research_rejects_gaps_and_short_windows():
+    from eth_tester.strategies.ensemble import evaluate_closed_bar_research
+    bars = candles()
+    end = bars[-1]["ts"] + timedelta(minutes=1)
+    short = evaluate_closed_bar_research(bars[:59], observed_at=end)
+    check_no_promotion(short)
+    assert short["reason"] == "insufficient_or_unbounded_closed_history"
+    broken = deepcopy(bars)
+    broken[13]["ts"] += timedelta(minutes=1)
+    gap = evaluate_closed_bar_research(broken, observed_at=end)
+    check_no_promotion(gap)
+    assert gap["reason"] == "missing_or_out_of_order_bar"
+
+
+def test_every_closed_bar_research_input_revision_is_detected():
+    from eth_tester.strategies.ensemble import evaluate_closed_bar_research
+    bars = candles()
+    at = bars[-1]["ts"] + timedelta(minutes=1)
+    first = evaluate_closed_bar_research(bars, observed_at=at)
+    revised = deepcopy(bars)
+    revised[4]["volume"] += D("0.0001")
+    second = evaluate_closed_bar_research(revised, observed_at=at)
+    assert first["input_sha256"] != second["input_sha256"]
+    assert first["diagnostic_sha256"] != second["diagnostic_sha256"]
+    assert first["observation_receipt_authoritative"] is False
+    assert second["ml_eligible"] is False
