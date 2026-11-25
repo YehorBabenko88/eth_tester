@@ -34,8 +34,33 @@ def ingest_ws(conn,symbol,payload):
            row.get("u"),row.get("seq"),payload.get("type","unknown"),
            json.dumps(row.get("b",[])),json.dumps(row.get("a",[]))))
 
+    elif topic.startswith('tickers.'):
+        row=data if isinstance(data,dict) else {}
+        def numeric(name):
+            value=row.get(name)
+            return Decimal(str(value)) if value not in (None,'') else None
+        conn.execute('''INSERT INTO market_ticker_events(symbol,exchange_ts,event_type,
+          mark_price,index_price,last_price,open_interest,funding_rate,bid_price,ask_price,raw)
+          VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)''',
+          (symbol,stamp_ms(payload['ts']) if payload.get('ts') else None,
+           payload.get('type','delta'),numeric('markPrice'),numeric('indexPrice'),
+           numeric('lastPrice'),numeric('openInterest'),numeric('fundingRate'),
+           numeric('bid1Price'),numeric('ask1Price'),json.dumps(row)))
+    elif topic.startswith('allLiquidation.'):
+        rows=data if isinstance(data,list) else [data]
+        for row in rows:
+            conn.execute('''INSERT INTO liquidation_events(symbol,ts,side,price,qty,raw)
+              VALUES(%s,%s,%s,%s,%s,%s::jsonb)''',
+              (symbol,stamp_ms(row['T']),row['S'],Decimal(row['p']),
+               Decimal(row['v']),json.dumps(row)))
+
+
 async def live_feed(settings):
-    topics=[f"publicTrade.{settings.symbol}",f"orderbook.50.{settings.symbol}"]
+    if settings.book_depth not in (1,50,200,1000):
+        raise ValueError("Unsupported orderbook depth")
+    topics=[f"publicTrade.{settings.symbol}",
+            f"orderbook.{settings.book_depth}.{settings.symbol}",
+            f"tickers.{settings.symbol}",f"allLiquidation.{settings.symbol}"]
     attempt=0
     with connection(settings) as conn:
         last=conn.execute("SELECT ts FROM trades WHERE symbol=%s AND source='websocket' ORDER BY ts DESC LIMIT 1",(settings.symbol,)).fetchone()
@@ -62,7 +87,7 @@ async def live_feed(settings):
                             book_ready=True
                         elif not book_ready:
                             continue
-                    if topic.startswith(("publicTrade.","orderbook.")):
+                    if topic.startswith(("publicTrade.","orderbook.","tickers.","allLiquidation.")):
                         with connection(settings) as conn:
                             ingest_ws(conn,settings.symbol,payload)
                             if topic.startswith('publicTrade.') and payload.get('data'):
