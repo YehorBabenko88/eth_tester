@@ -200,6 +200,67 @@ def test_bounded_cleanup_preserves_market_data(postgres_lab):
         ).fetchone()["n"] == 2
 
 
+def test_paper_event_idempotency_and_monotonic_cursor(postgres_lab):
+    signal = datetime(2026, 11, 20, tzinfo=timezone.utc)
+    with connection(postgres_lab) as conn:
+        trade = conn.execute(
+            """INSERT INTO paper_trades(
+                symbol,state,direction,signal_ts,reason,strategy_version)
+               VALUES('ETHUSDT','closed','long',%s,'{}'::jsonb,'test')
+               RETURNING id""",
+            (signal,),
+        ).fetchone()["id"]
+        event_args = (
+            "test-event-001", "paper_test", "ETHUSDT", "event-001",
+            trade, "order-001", "entry", "Buy", Decimal("0.1"),
+            Decimal("3100"), False, Decimal("1"), Decimal("0"),
+            Decimal("0.5"), signal, signal + timedelta(minutes=1),
+        )
+        for _ in range(2):
+            conn.execute(
+                """INSERT INTO paper_order_events(
+                   event_key,source,symbol,event_id,paper_trade_id,
+                   order_id,action,side,qty,price,maker,fee,
+                   spread_cost,slippage_cost,event_ts,observed_ts)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT(event_key) DO NOTHING""",
+                event_args,
+            )
+        assert conn.execute(
+            "SELECT count(*) AS n FROM paper_order_events WHERE event_key='test-event-001'"
+        ).fetchone()["n"] == 1
+        conn.execute(
+            """INSERT INTO paper_funding_events(
+                paper_trade_id,funding_ts,rate,mark_price,position_qty,amount)
+                VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING""",
+            (trade, signal, Decimal("0.0001"), Decimal("3000"),
+             Decimal("0.1"), Decimal("-0.03")),
+        )
+        conn.execute(
+            """UPDATE paper_position_state
+               SET paper_trade_id=%s, version=version+1,
+                   processed_cursor=%s WHERE singleton=true""",
+            (trade, signal),
+        )
+        with pytest.raises(psycopg.Error, match="version must increase"):
+            with conn.transaction():
+                conn.execute(
+                    "UPDATE paper_position_state SET pending_exit=false WHERE singleton=true"
+                )
+        with pytest.raises(psycopg.Error, match="cannot move backwards"):
+            with conn.transaction():
+                conn.execute(
+                    """UPDATE paper_position_state SET version=version+1,
+                       processed_cursor=%s WHERE singleton=true""",
+                    (signal - timedelta(minutes=1),),
+                )
+        conn.execute(
+            """UPDATE paper_position_state SET version=version+1,
+               processed_cursor=%s WHERE singleton=true""",
+            (signal + timedelta(minutes=1),),
+        )
+
+
 def test_verified_backup_restore_and_scoped_delete(postgres_lab, tmp_path):
     if not shutil.which("pg_dump") or not shutil.which("pg_restore"):
         pytest.skip("pg_dump and pg_restore are mandatory for backup integration")
