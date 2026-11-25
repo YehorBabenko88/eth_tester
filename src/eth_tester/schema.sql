@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS trades (
   symbol text NOT NULL, ts timestamptz NOT NULL, trade_id text NOT NULL,
   price numeric NOT NULL, qty numeric NOT NULL, side text NOT NULL CHECK(side IN ('Buy','Sell')),
   notional numeric NOT NULL, source text NOT NULL, raw jsonb NOT NULL DEFAULT '{}'::jsonb,
-  PRIMARY KEY (symbol,ts,trade_id)
+  PRIMARY KEY (symbol,trade_id)
 );
 CREATE INDEX IF NOT EXISTS trades_time ON trades(symbol,ts DESC);
 CREATE TABLE IF NOT EXISTS funding (
