@@ -88,14 +88,8 @@ def replay_orderbook(settings,batch=2000):
                     if not valid:
                         last=item["id"]
                         continue
-                    if last_u is not None and u is not None and u>last_u+1:
-                        valid=False
-                        conn.execute("""INSERT INTO data_gaps(source,symbol,start_ts,end_ts,
-                         explanation) VALUES('orderbook',%s,%s,%s,'L2 update_id gap')""",
-                         (settings.symbol,item["recv_ts"],item["recv_ts"]))
-                        last=item["id"]
-                        last_u=u
-                        continue
+                    # Bybit u is an update ID, not a documented gapless
+                    # message counter for all orderbook depths.
                     if last_u is not None and u is not None and u<last_u:
                         valid=False
                         last=item["id"]
