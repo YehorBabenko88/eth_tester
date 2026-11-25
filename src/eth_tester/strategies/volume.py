@@ -256,8 +256,11 @@ def volume_signal(closed_candles, profile, fee_rate=Decimal("0.00055"),
                       "value_area": [str(profile.value_area_low), str(profile.value_area_high)],
                       "economics": cost, "requires_live_confirmation": True,
                       "source": "verified_tick_volume"}
-            candidates.append((abs(price - level), name,
+            priority = {"naked_poc_rejection": 0, "hvn_rejection": 1,
+                        "hvn_zone_rejection": 2, "lvn_breakout": 3,
+                        "lvn_zone_breakout": 4}
+            candidates.append((abs(price - level), priority.get(name, 9), name,
                                Signal(side, level, stop, take, reason)))
-        return min(candidates, key=lambda item: (item[0], item[1]))[2] if candidates else None
+        return min(candidates, key=lambda item: (item[0], item[1], item[2]))[3] if candidates else None
     except (InvalidOperation, TypeError, ValueError, KeyError):
         return None
