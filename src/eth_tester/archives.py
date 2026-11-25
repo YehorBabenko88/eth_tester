@@ -80,6 +80,12 @@ async def download_archive(settings,day,client):
         size=0
         async with client.stream("GET",url,timeout=httpx.Timeout(120,read=120)) as resp:
             if resp.status_code==404:
+                if replay_complete:
+                    # An already acquired source SHA must outlive host
+                    # unavailability. Rehydration fails, original receipt stays.
+                    raise DataIntegrityError(
+                        "Previously completed archive unavailable during "
+                        "same-SHA membership rehydration (HTTP 404)")
                 with connection(settings) as conn:
                     conn.execute("""UPDATE ingestion_job SET state='unavailable',error='HTTP 404',
                     updated_at=now() WHERE source='trades_archive' AND symbol=%s AND day=%s""",
@@ -135,10 +141,14 @@ async def download_archive(settings,day,client):
             # Rehydrating an old successfully downloaded day must not rewrite
             # any original minute volume receipt if later candles differ.
             # B's separately versioned comparison ledger will re-evaluate it.
-            conn.execute("""UPDATE ingestion_job SET state='complete',bytes_downloaded=%s,
-              row_count=%s,sha256=%s,error=NULL,updated_at=now()
-              WHERE source='trades_archive' AND symbol=%s AND day=%s""",
-              (size,count,checksum.hexdigest(),symbol,day))
+            if not replay_complete:
+                conn.execute("""UPDATE ingestion_job SET state='complete',bytes_downloaded=%s,
+                  row_count=%s,sha256=%s,error=NULL,updated_at=now()
+                  WHERE source='trades_archive' AND symbol=%s AND day=%s""",
+                  (size,count,checksum.hexdigest(),symbol,day))
+            # Original completed source metadata is deliberately immutable
+            # during same-SHA membership recovery. Only B's new append-only
+            # SHA bins and comparison receipts may be written.
     return "complete"
 
 
@@ -211,6 +221,52 @@ def resolve_archived_gaps(settings):
     """
     return 0
 
+def revalidate_completed_archive(settings, day):
+    """Append-only volume recheck when later original Bybit 1m bars arrive.
+
+    Operates exclusively on previously downloaded exact-SHA archive bins;
+    never modifies original acquisition state, resolves WS gaps, or issues
+    full-trade-ID / ML certificates. A missing official grid remains partial.
+    """
+    from .storage.archive_receipts import revalidate_archive_bins
+    start = datetime.combine(day, datetime.min.time(), timezone.utc)
+    end = start + timedelta(days=1)
+    with connection(settings) as conn:
+        original = conn.execute(
+            """SELECT state,sha256 FROM ingestion_job WHERE
+               source='trades_archive' AND symbol=%s AND day=%s""",
+            (settings.symbol, day)).fetchone()
+        if (original is None or original["state"] != "complete"
+                or not original["sha256"]):
+            return {"status": "pending_acquisition"}
+        stage = conn.execute(
+            """SELECT 1 FROM archive_stage_receipts WHERE
+               symbol=%s AND instrument=%s AND archive_day=%s
+               AND archive_sha256=%s""",
+            (settings.symbol, settings.category, day,
+             original["sha256"])).fetchone()
+        if not stage:
+            return {"status": "missing_sha_stage"}
+        candles = conn.execute(
+            """SELECT count(*) AS total,
+                      count(*) FILTER (WHERE source='bybit_v5') AS official
+               FROM candles WHERE symbol=%s AND kind='trade' AND tf='1'
+                 AND closed=true AND ts >= %s AND ts < %s""",
+            (settings.symbol, start, end)).fetchone()
+        if candles["total"] == 0:
+            return {"status": "pending_official_1m"}
+        if candles["total"] != candles["official"]:
+            # A synthetic QA candle must NEVER become a new positive source
+            # witness merely by being included in B's comparison query.
+            return {"status": "non_official_1m_source"}
+        proof = revalidate_archive_bins(
+            conn, settings.symbol, day, original["sha256"],
+            instrument=settings.category)
+        if proof.get("exchange_complete") is not False:
+            raise DataIntegrityError("Archive volume recheck claimed all trade IDs")
+        return proof
+
+
 async def backfill_archives(settings):
     start=settings.archive_start
     end=datetime.now(timezone.utc).date()
@@ -234,21 +290,55 @@ async def backfill_archives(settings):
                         # their UTC day as a successfully imported archive.
                         day_start = datetime.combine(day, datetime.min.time(), timezone.utc)
                         with connection(settings) as conn:
-                            conn.execute("""UPDATE ingestion_job SET state='failed',error=%s,
-                              updated_at=now() WHERE source='trades_archive' AND symbol=%s AND day=%s""",
-                              (str(exc)[:2000], settings.symbol, day))
-                            write_coverage(
-                                conn, source="trades_archive", symbol=settings.symbol,
-                                interval="", start_ms=int(day_start.timestamp()*1000),
-                                end_exclusive_ms=int(
-                                    (day_start+timedelta(days=1)).timestamp()*1000),
-                                status="gap", observed_rows=0, quality="archive_import_failed",
-                                evidence={"error": str(exc)[:1500],
-                                          "permanent": bool(permanent),
-                                          "attempts": attempt + 1},
-                                instrument=settings.category)
+                            prior = conn.execute(
+                                """SELECT state,sha256 FROM ingestion_job
+                                   WHERE source='trades_archive'
+                                     AND symbol=%s AND day=%s FOR UPDATE""",
+                                (settings.symbol, day)).fetchone()
+                            if prior and prior["state"] == "complete":
+                                # An old immutable gzip acquisition survived;
+                                # only an independent rehydration attempt failed.
+                                # Preserve its original state, SHA and coverage.
+                                conn.execute(
+                                    """INSERT INTO bot_events(severity,event,data)
+                                       VALUES('error','archive_rehydration_failed',
+                                              %s::jsonb)""",
+                                    (json.dumps({
+                                        "day": day.isoformat(),
+                                        "original_sha256": prior["sha256"],
+                                        "error": str(exc)[:300],
+                                        "verified_new_bins": False}),))
+                            else:
+                                conn.execute("""UPDATE ingestion_job SET state='failed',error=%s,
+                                  updated_at=now() WHERE source='trades_archive' AND symbol=%s AND day=%s""",
+                                  (str(exc)[:2000], settings.symbol, day))
+                                write_coverage(
+                                    conn, source="trades_archive", symbol=settings.symbol,
+                                    interval="", start_ms=int(day_start.timestamp()*1000),
+                                    end_exclusive_ms=int(
+                                        (day_start+timedelta(days=1)).timestamp()*1000),
+                                    status="gap", observed_rows=0, quality="archive_import_failed",
+                                    evidence={"error": str(exc)[:1500],
+                                              "permanent": bool(permanent),
+                                              "attempts": attempt + 1},
+                                    instrument=settings.category)
                         raise
                     await asyncio.sleep(min(90, 2**attempt*3))
+            # Revalidation is a separate append-only transaction. Network
+            # acquisition is NOT undone if official closed bars arrive late.
+            if state in ("cached", "complete"):
+                try:
+                    comparison = revalidate_completed_archive(settings, day)
+                    if comparison.get("status") not in (
+                            "pending_official_1m", "missing_sha_stage"):
+                        print(f"archive recheck {day}: "
+                              f"{comparison['status']}", flush=True)
+                except Exception as recheck_error:
+                    # Preserve source SHA and retry on the next scheduled pass.
+                    # A broken comparison is neither a verified archive nor a
+                    # reason to erase its original downloaded source receipt.
+                    print(f"Archive SHA recheck pending for {day}: "
+                          f"{recheck_error}", flush=True)
             print(f"{day} {state} {i+1}/{total} ({100*(i+1)/max(total,1):.1f}%)",flush=True)
             if state != "cached":
                 await asyncio.sleep(1/max(0.05,settings.archive_downloads_per_second))

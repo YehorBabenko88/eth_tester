@@ -1,5 +1,7 @@
 """Strict historic Bybit candle ingestion; no claim of completeness for absent windows."""
 from datetime import datetime, timezone
+from hashlib import sha256
+import json
 
 from .data_quality import (
     DataIntegrityError, FIXED_MS, next_open, open_time, validate_candle_page,
@@ -82,7 +84,11 @@ async def collect_klines(settings, client, kind, tf):
         previous = cursor_ts(conn, source, settings.symbol, tf)
     if previous:
         lookback = ms(previous)
-        for _ in range(2):
+        # F's three FULL FUTURE UTC 1m candles require a SINGLE
+        # independently re-fetched historical page beginning before the
+        # original signal, not three separately inferred candle rows.
+        # Eight extra closed bars also tolerate bounded collector lag.
+        for _ in range(8 if kind == "trade" and tf == "1" else 2):
             lookback = open_time(tf, lookback - 1)
         pos = max(start, lookback)
     else:
@@ -119,6 +125,27 @@ async def collect_klines(settings, client, kind, tf):
             raise
         try:
             with connection(settings) as conn:
+                source_received_at = conn.execute(
+                    "SELECT clock_timestamp() AS ts").fetchone()["ts"]
+                if source_received_at.tzinfo is None:
+                    raise DataIntegrityError(
+                        "Independent REST receipt requires database clock")
+                receipt_ms = ms(source_received_at)
+                source_end_ms = next_open(tf, end)
+                closed_grid_from_http = (
+                    kind == "trade" and tf == "1" and
+                    status == "verified" and
+                    len(values) == expected and
+                    expected > 0 and
+                    source_end_ms <= receipt_ms and
+                    len(raw) >= expected)
+                # The reference binds EXACT returned REST payload SHA,
+                # requested UTC window and *actual post-HTTP DB receipt*.
+                # Never infer source proof from existing stored candles.
+                source_reference = sha256(json.dumps(
+                    [settings.symbol, settings.category, kind, tf,
+                     pos, end, checksum, receipt_ms],
+                    separators=(",", ":")).encode()).hexdigest()
                 if status == "verified":
                     for stamp, row in values.items():
                         store_candle(conn, settings.symbol, kind, tf, stamp, row)
@@ -139,7 +166,22 @@ async def collect_klines(settings, client, kind, tf):
                     quality="exchange_closed_grid_checked" if values else "not_observed",
                     evidence={"kind": kind, "tf": tf, "endpoint": KINDS[kind],
                               "requested_start_ms": pos, "requested_end_ms": end,
-                              "row_count": len(values)},
+                              "row_count": len(values),
+                              "source_event_start_ms": pos,
+                              "source_event_end_exclusive_ms": source_end_ms,
+                              "source_receipt_ms": receipt_ms,
+                              "source_receipt_kind": "postgres_clock_timestamp_after_http",
+                              "evidence_ref": source_reference,
+                              "rest_payload_sha256": checksum,
+                              # These source-witness flags refer ONLY to a
+                              # genuinely fetched, fully closed REST grid.
+                              # No archive trade-ID or nine-feature ML claim.
+                              "closed_grid_complete": closed_grid_from_http,
+                              "receipt_is_independently_recorded":
+                                  closed_grid_from_http,
+                              "source_verified_as_of_receipt": closed_grid_from_http,
+                              "proves_all_trade_ids": False,
+                              "exchange_trades_complete": False},
                     instrument=settings.category)
                 missing = conn.execute(
                     """SELECT count(*) AS total FROM data_gaps

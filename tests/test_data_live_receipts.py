@@ -256,3 +256,168 @@ def test_fast_live_lane_observes_closed_minute_and_oi_without_day_archive(monkey
                             symbol="ETHUSDT")))
     assert calls == ["closed_1m", "observed_5m_oi"]
     assert len(conn.inserted("feed_health")) == 2
+
+
+def test_identical_duplicate_trade_ids_are_one_immutable_receipt(monkeypatch):
+    """Duplicate wire records cannot double-count source identities."""
+    seen = []
+    monkeypatch.setattr(
+        live, "_record_ws_trade_receipts",
+        lambda *args: seen.append(args))
+    at = datetime(2026, 11, 25, 19, 3, tzinfo=UTC)
+    conn = FakeConnection(at)
+    wire = {"topic": "publicTrade.ETHUSDT", "data": [
+        {"i": "repeated", "T": int(at.timestamp()*1000),
+         "p": "100.00", "v": "0.500", "S": "Buy"},
+        {"i": "repeated", "T": int(at.timestamp()*1000),
+         "p": "100", "v": "0.5", "S": "Buy"}]}
+    live.ingest_ws(conn, "ETHUSDT", wire, session_id="true-session")
+    assert len(conn.inserted("trades")) == 1
+    assert len(seen) == 1
+    assert seen[0][1:] == ("ETHUSDT", "true-session", ["repeated"])
+    record = json.loads(conn.inserted("feed_health")[0][1][1])
+    assert record["observed_rows"] == 2
+    assert record["distinct_trade_ids"] == 1
+    assert record["identical_replayed_ids"] == 1
+    assert record["proves_all_trade_ids"] is False
+    assert record["ml_eligible"] is False
+
+
+@pytest.mark.parametrize("changed", [
+    {"v": "0.6"}, {"p": "101"}, {"S": "Sell"},
+    {"T": int(datetime(2026, 11, 25, 19, 3, 1, tzinfo=UTC).timestamp()*1000)},
+])
+def test_conflicting_duplicate_trade_id_rejected_before_any_sql(changed):
+    at = datetime(2026, 11, 25, 19, 3, tzinfo=UTC)
+    first = {"i": "collision", "T": int(at.timestamp()*1000),
+             "p": "100", "v": "0.5", "S": "Buy"}
+    other = dict(first, **changed)
+    conn = FakeConnection(at)
+    with pytest.raises(DataIntegrityError, match="Conflicting duplicate"):
+        live.ingest_ws(
+            conn, "ETHUSDT",
+            {"topic": "publicTrade.ETHUSDT", "data": [first, other]},
+            session_id="true-session")
+    assert conn.calls == []
+
+
+def test_large_ws_frame_receipts_chunked_without_losing_trade_ids(monkeypatch):
+    at = datetime(2026, 11, 25, 19, 3, tzinfo=UTC)
+    conn = FakeConnection(at)
+    chunks = []
+    monkeypatch.setattr(
+        live, "_record_ws_trade_receipts",
+        lambda _conn, _symbol, _session, ids: chunks.append(list(ids)))
+    rows = [{"i": str(i), "T": int(at.timestamp()*1000),
+             "p": "100", "v": "0.001", "S": "Buy"}
+            for i in range(2051)]
+    live.ingest_ws(conn, "ETHUSDT",
+                   {"topic": "publicTrade.ETHUSDT", "data": rows},
+                   session_id="live-session")
+    assert len(conn.inserted("trades")) == 2051
+    assert list(map(len, chunks)) == [2048, 3]
+    assert len(set(chunks[0] + chunks[1])) == 2051
+    assert json.loads(conn.inserted("feed_health")[0][1][1])[
+        "ml_eligible"] is False
+
+
+def test_real_rest_closed_grid_has_source_receipt_after_http(monkeypatch):
+    """Contract-only fixed clock: original HTTP response, not stored candles."""
+    from datetime import date
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 25, 0, 15, 20, tzinfo=UTC)
+
+    clock = datetime(2026, 11, 25, 0, 16, 3, tzinfo=UTC)
+    conn = FakeConnection(clock)
+    original = datetime(2026, 11, 25, 0, 7, tzinfo=UTC)
+    requested = [int((original + timedelta(minutes=i)).timestamp()*1000)
+                 for i in range(8)]
+    client = FakeClient([[str(t), "100", "101", "99", "100", "1.5", "150"]
+                         for t in requested])
+    monkeypatch.setattr(history_integrity, "datetime", FixedDateTime)
+    monkeypatch.setattr(history_integrity, "connection", lambda _: conn)
+    monkeypatch.setattr(history_integrity, "cursor_ts",
+                        lambda *_: datetime(2026, 11, 25, 0, 15, tzinfo=UTC))
+    monkeypatch.setattr(history_integrity, "save_cursor", lambda *a, **kw: None)
+
+    original_execute = conn.execute
+    def coverage_execute(statement, params=None):
+        if "SELECT count(*) AS total FROM data_gaps" in str(statement):
+            conn.calls.append((str(statement), params))
+            return Rows({"total": 0})
+        return original_execute(statement, params)
+    conn.execute = coverage_execute
+    settings = SimpleNamespace(
+        symbol="ETHUSDT", category="linear", archive_start=date(2026, 11, 25))
+    asyncio.run(history_integrity.collect_klines(
+        settings, client, "trade", "1"))
+    assert client.calls[0][1]["start"] == requested[0]
+    assert client.calls[0][1]["end"] == requested[-1]
+    proof = conn.inserted("ingestion_coverage")[0][1]
+    witness = json.loads(proof[11])
+    assert proof[6] == "verified"
+    assert proof[10] == "exchange_closed_grid_checked"
+    assert witness["kind"] == "trade" and witness["tf"] == "1"
+    assert witness["closed_grid_complete"] is True
+    assert witness["receipt_is_independently_recorded"] is True
+    assert witness["source_receipt_ms"] == int(clock.timestamp()*1000)
+    assert witness["source_event_end_exclusive_ms"] < witness["source_receipt_ms"]
+    assert len(witness["evidence_ref"]) == 64
+    assert witness["proves_all_trade_ids"] is False
+    assert witness["exchange_trades_complete"] is False
+
+
+def test_missing_rest_grid_cannot_issue_verified_receipt(monkeypatch):
+    from datetime import date
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 25, 0, 15, 20, tzinfo=UTC)
+
+    conn = FakeConnection(datetime(2026, 11, 25, 0, 16, 3, tzinfo=UTC))
+    starts = [int(datetime(2026, 11, 25, 0, i, tzinfo=UTC).timestamp()*1000)
+              for i in range(7, 15) if i != 10]
+    client = FakeClient([[str(t), "100", "101", "99", "100", "1", "100"]
+                         for t in starts])
+    monkeypatch.setattr(history_integrity, "datetime", FixedDateTime)
+    monkeypatch.setattr(history_integrity, "connection", lambda _: conn)
+    monkeypatch.setattr(history_integrity, "cursor_ts",
+                        lambda *_: datetime(2026, 11, 25, 0, 15, tzinfo=UTC))
+    with pytest.raises(DataIntegrityError, match="Missing candle"):
+        asyncio.run(history_integrity.collect_klines(
+            SimpleNamespace(symbol="ETHUSDT", category="linear",
+                            archive_start=date(2026, 11, 25)),
+            client, "trade", "1"))
+    assert not any(json.loads(args[11]).get(
+        "receipt_is_independently_recorded") is True
+                   for _, args in conn.inserted("ingestion_coverage"))
+
+
+def test_archive_recheck_requires_original_official_candle_source(monkeypatch):
+    from datetime import date
+    from eth_tester import archives
+    conn = FakeConnection(datetime(2026, 11, 25, tzinfo=UTC))
+    executed = []
+    def db(statement, params=None):
+        query = str(statement)
+        conn.calls.append((query, params))
+        if "FROM ingestion_job WHERE" in query:
+            return Rows({"state": "complete", "sha256": "a"*64})
+        if "FROM archive_stage_receipts WHERE" in query:
+            return Rows({"exists": 1})
+        if "count(*) FILTER" in query:
+            return Rows({"total": 1, "official": 0})
+        return Rows()
+    conn.execute = db
+    monkeypatch.setattr(archives, "connection", lambda _: conn)
+    from eth_tester.storage import archive_receipts
+    monkeypatch.setattr(
+        archive_receipts, "revalidate_archive_bins",
+        lambda *args, **kw: executed.append((args, kw)))
+    result = archives.revalidate_completed_archive(
+        SimpleNamespace(symbol="ETHUSDT", category="linear"),
+        date(2026, 11, 24))
+    assert result["status"] == "non_official_1m_source"
+    assert not executed

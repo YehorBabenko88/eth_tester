@@ -574,3 +574,123 @@ def test_old_complete_archive_changed_remote_bytes_cannot_mutate_job(data_settin
         assert original["attempts"] == 3
         assert conn.execute("""SELECT count(*) AS n FROM trades
             WHERE symbol='ETHUSDT'""").fetchone()["n"] == 0
+
+
+def test_identical_ws_replay_inside_one_frame_db_source_identity(data_settings):
+    """Identical on-wire repeats merge to one trade + one B receipt, never x2."""
+    at = datetime.now(UTC) - timedelta(seconds=2)
+    stamp = int(at.timestamp()*1000)
+    at = datetime.fromtimestamp(stamp/1000,UTC)
+    row = {"i": "one-wire-replay", "T": stamp, "p": "100",
+           "v": "0.5", "S": "Buy"}
+    wire = {"topic": "publicTrade.ETHUSDT", "data": [
+        row, dict(row, p="100.000", v="0.5000")]}
+    with connection(data_settings) as conn:
+        ingest_ws(conn, "ETHUSDT", wire, session_id="real-pg-duplicate")
+    with connection(data_settings) as conn:
+        assert conn.execute("""SELECT count(*) AS n FROM trades
+            WHERE symbol='ETHUSDT' AND trade_id='one-wire-replay'"""
+        ).fetchone()["n"] == 1
+        receipt = conn.execute("""SELECT session_id,qty,exchange_complete
+            FROM live_trade_receipts WHERE symbol='ETHUSDT'
+              AND trade_id='one-wire-replay'""").fetchone()
+        assert receipt["session_id"] == "real-pg-duplicate"
+        assert receipt["qty"] == Decimal("0.5")
+        assert receipt["exchange_complete"] is False
+        detail = conn.execute("""SELECT detail FROM feed_health
+            WHERE symbol='ETHUSDT' AND topic='publicTrade'
+            ORDER BY ts DESC LIMIT 1""").fetchone()["detail"]
+        assert detail["observed_rows"] == 2
+        assert detail["distinct_trade_ids"] == 1
+
+
+def test_archive_recheck_late_official_candles_appends_never_rewrites(data_settings):
+    """Actual B 0007 versioned receipts: missing -> full original 1440 grid."""
+    from eth_tester.archives import revalidate_completed_archive
+    from eth_tester.storage.archive_receipts import persist_archive_stage_bins
+
+    day = date(2026, 1, 12)
+    start = datetime.combine(day, datetime.min.time(), UTC)
+    digest = "a" * 64
+    with connection(data_settings) as conn:
+        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        conn.execute("""INSERT INTO eth_stage(
+            symbol,ts,trade_id,price,qty,side,notional,source)
+            VALUES('ETHUSDT',%s,'source-tape-id',100,2,
+                   'Buy',200,'archive')""", (start,))
+        merge_staged_trades(conn, "eth_stage")
+        persist_archive_stage_bins(
+            conn, "ETHUSDT", day, digest, 1, instrument="linear")
+        conn.execute("""INSERT INTO ingestion_job(
+            source,symbol,day,state,attempts,sha256,row_count)
+            VALUES('trades_archive','ETHUSDT',%s,'complete',1,%s,1)""",
+            (day, digest))
+        conn.execute("""INSERT INTO candles(
+            symbol,kind,tf,ts,open,high,low,close,volume,turnover,source)
+            VALUES('ETHUSDT','trade','1',%s,100,100,100,100,
+                   2,200,'bybit_v5')""", (start,))
+    first = revalidate_completed_archive(data_settings, day)
+    assert first["status"] == "incomplete"
+    assert first["exchange_complete"] is False
+    with connection(data_settings) as conn:
+        with conn.cursor() as cursor:
+            cursor.executemany("""INSERT INTO candles(
+                symbol,kind,tf,ts,open,high,low,close,volume,turnover,source)
+                VALUES('ETHUSDT','trade','1',%s,100,100,100,100,
+                       0,0,'bybit_v5')""",
+                [(start+timedelta(minutes=i),) for i in range(1,1440)])
+    final = revalidate_completed_archive(data_settings, day)
+    assert final["status"] == "volume_only_reconciled"
+    assert final["minutes_checked"] == final["minutes_matched"] == 1440
+    assert final["validation_key"] != first["validation_key"]
+    again = revalidate_completed_archive(data_settings, day)
+    assert again["validation_key"] == final["validation_key"]
+    with connection(data_settings) as conn:
+        rows = conn.execute("""SELECT validation_key,status,minutes_checked
+            FROM archive_validation_receipts WHERE symbol='ETHUSDT'
+              AND archive_day=%s ORDER BY checked_at""",
+            (day,)).fetchall()
+        assert len(rows) == 2
+        assert {row["status"] for row in rows} == {
+            "incomplete", "volume_only_reconciled"}
+        saved = conn.execute("""SELECT state,sha256 FROM ingestion_job
+            WHERE source='trades_archive' AND symbol='ETHUSDT' AND day=%s""",
+            (day,)).fetchone()
+        assert saved["state"] == "complete" and saved["sha256"] == digest
+        assert conn.execute("""SELECT count(*) AS n FROM feature_snapshots
+            WHERE quality='complete'""").fetchone()["n"] == 0
+
+
+def test_old_complete_archive_404_cannot_erase_source_sha(data_settings):
+    """Post-acquisition HTTP 404 is failure of recovery, not prior data."""
+    import asyncio
+    import httpx
+    from eth_tester.archives import download_archive
+
+    day = date(2026, 1, 13)
+    digest = "b" * 64
+    with connection(data_settings) as conn:
+        conn.execute("""INSERT INTO ingestion_job(
+            source,symbol,day,state,attempts,sha256,row_count)
+            VALUES('trades_archive','ETHUSDT',%s,'complete',4,%s,1)""",
+            (day,digest))
+    def failure(request):
+        return httpx.Response(404,request=request)
+    async def run():
+        async with httpx.AsyncClient(
+                transport=httpx.MockTransport(failure)) as client:
+            await download_archive(
+                data_settings.model_copy(update={"minimum_free_gb":0}),
+                day, client)
+    with pytest.raises(DataIntegrityError, match="Previously completed archive"):
+        asyncio.run(run())
+    with connection(data_settings) as conn:
+        job = conn.execute("""SELECT state,sha256,attempts FROM ingestion_job
+            WHERE source='trades_archive' AND symbol='ETHUSDT' AND day=%s""",
+            (day,)).fetchone()
+        assert job["state"] == "complete"
+        assert job["sha256"] == digest
+        assert job["attempts"] == 4
+        assert conn.execute("""SELECT count(*) AS n FROM
+            archive_source_price_bins WHERE archive_day=%s""",
+            (day,)).fetchone()["n"] == 0

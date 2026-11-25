@@ -52,6 +52,44 @@ def _record_ws_book_lineage(conn, symbol, session_id, snapshot_event_id,
         conn, symbol, session_id, snapshot_event_id, event_id)
 
 
+def canonical_ws_trade_rows(data, symbol):
+    """Deduplicate only truly identical normalized prints inside ONE WS frame.
+
+    The first raw event remains the source of record. A conflicting reuse of a
+    Bybit trade ID fails the whole frame before ANY database insert. Duplicate
+    raw rows never create extra observed identity or inflate minute volume.
+    """
+    if not isinstance(data, list):
+        raise DataIntegrityError("Bybit publicTrade data must be a list")
+    original = {}
+    unique = []
+    for row in data:
+        if not isinstance(row, dict):
+            raise DataIntegrityError("Malformed Bybit publicTrade record")
+        identifier = row["i"]
+        if not isinstance(identifier, str) or not identifier.strip():
+            raise DataIntegrityError("Empty or non-string Bybit trade ID")
+        side = row["S"]
+        if side not in ("Buy", "Sell"):
+            raise DataIntegrityError("Unknown trade side")
+        if row.get("s", symbol) != symbol:
+            raise DataIntegrityError("WebSocket trade row has wrong symbol")
+        event = stamp_ms(row["T"])
+        price, qty = Decimal(str(row["p"])), Decimal(str(row["v"]))
+        if (not price.is_finite() or not qty.is_finite()
+                or price <= 0 or qty <= 0):
+            raise DataIntegrityError("Invalid WebSocket trade price/quantity")
+        fields = (event, price, qty, side)
+        if identifier in original:
+            if original[identifier] != fields:
+                raise DataIntegrityError(
+                    f"Conflicting duplicate WS trade ID: {identifier}")
+            continue
+        original[identifier] = fields
+        unique.append((identifier, row, event, price, qty, side))
+    return unique
+
+
 def ingest_ws(conn,symbol,payload,*,session_id=None):
     """Persist actual WS event payloads, optionally attaching a live session receipt.
 
@@ -65,18 +103,8 @@ def ingest_ws(conn,symbol,payload,*,session_id=None):
     if not topic.endswith("." + symbol):
         raise DataIntegrityError(f"WebSocket topic symbol mismatch: {topic}")
     if topic.startswith("publicTrade."):
-        if not isinstance(data, list):
-            raise DataIntegrityError("Bybit publicTrade data must be a list")
-        for row in data:
-            side=row["S"]
-            if side not in ("Buy","Sell"):
-                raise ValueError("Unknown trade side")
-            if row.get("s", symbol) != symbol:
-                raise DataIntegrityError("WebSocket trade row has wrong symbol")
-            price,qty=Decimal(row["p"]),Decimal(row["v"])
-            if (not price.is_finite() or not qty.is_finite()
-                    or price <= 0 or qty <= 0):
-                raise DataIntegrityError("Invalid WebSocket trade price/quantity")
+        unique = canonical_ws_trade_rows(data, symbol)
+        for identifier, row, event, price, qty, side in unique:
             saved = conn.execute("""INSERT INTO trades(symbol,ts,trade_id,price,qty,side,notional,source,raw)
              VALUES(%s,%s,%s,%s,%s,%s,%s,'websocket',%s::jsonb)
              ON CONFLICT(symbol,trade_id) DO UPDATE
@@ -85,14 +113,17 @@ def ingest_ws(conn,symbol,payload,*,session_id=None):
              AND trades.qty=EXCLUDED.qty AND trades.side=EXCLUDED.side
              AND trades.notional=EXCLUDED.notional
              RETURNING trade_id""",
-             (symbol,stamp_ms(row["T"]),row["i"],price,qty,side,price*qty,json.dumps(row))).fetchone()
+             (symbol,event,identifier,price,qty,side,price*qty,json.dumps(row))).fetchone()
             if saved is None:
-                raise DataIntegrityError(f"Conflicting WS trade ID: {row['i']}")
-        if session_id is not None and data:
-            trade_ids = [str(row["i"]) for row in data]
-            # The B-owned receipt is recorded in the SAME database transaction
-            # as all trades; any conflict rolls back both writes.
-            _record_ws_trade_receipts(conn, symbol, session_id, trade_ids)
+                raise DataIntegrityError(f"Conflicting WS trade ID: {identifier}")
+        if session_id is not None and unique:
+            trade_ids = [item[0] for item in unique]
+            # B accepts at most 2048 distinct IDs per call. A single WS frame
+            # may have more; keep all bounded chunks in the SAME transaction.
+            # Failure of any chunk rolls back the entire ingest/receipt batch.
+            for offset in range(0, len(trade_ids), 2048):
+                _record_ws_trade_receipts(
+                    conn, symbol, session_id, trade_ids[offset:offset+2048])
             stamps = [int(row["T"]) for row in data]
             raw_sha = sha256(json.dumps(
                 payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -107,7 +138,7 @@ def ingest_ws(conn,symbol,payload,*,session_id=None):
                 "source_event_start_ms": min(stamps),
                 "source_event_end_ms": max(stamps),
                 "observed_rows": len(data), "distinct_trade_ids":
-                    len({str(row["i"]) for row in data}),
+                    len(unique), "identical_replayed_ids": len(data)-len(unique),
                 "proves_all_trade_ids": False,
                 "source_quality": "observed_partial",
                 "ml_eligible": False,
