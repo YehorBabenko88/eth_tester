@@ -59,3 +59,38 @@ def test_open_or_naive_candle_exits_before_pivot(monkeypatch):
     bars[3]["closed"] = True
     bars[3]["ts"] = bars[3]["ts"].replace(tzinfo=None)
     assert strategy.price_signal(bars) is None
+
+def test_certified_expectancy_checks_issuer_time_and_version():
+    from datetime import datetime, timezone, timedelta
+    from eth_tester.strategy import Signal, certified_expectancy
+
+    decision = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    deadline = int(decision.timestamp() * 1000)
+    signal = Signal("long", D(100), D(99), D(105),
+                    {"strategy_version": "eth_rules_v2"})
+    certificate = {
+        "strategy_version": "eth_rules_v2", "model_version": "frozen-model-a",
+        "method": "one_sided_wilson_95_iid_assumption",
+        "selection": "frozen_model_nonuncertain_positive_predicted_net",
+        "probability_lower": 0.9, "observations": 100, "net_wins": 95,
+        "holdout_start_ms": deadline - 10_000_000,
+        "holdout_end_ms": deadline - 100_000,
+        "issued_at_ms": deadline - 10_000,
+        "selected_evidence_sha256": "a" * 64,
+        "paper_only": True, "independent_trades_assumed": True,
+    }
+    def evaluate_cert(data):
+        return certified_expectancy(signal, data, decision_at=decision,
+                                    entry_price=D(100),
+                                    fee=D("0.00055"), slip=D(2))
+
+    accepted = evaluate_cert(certificate)
+    assert accepted is not None
+    assert accepted["certificate_model_version"] == "frozen-model-a"
+    assert accepted["iid_assumption_not_verified"]
+    assert evaluate_cert({k: v for k, v in certificate.items()
+                          if k != "issued_at_ms"}) is None
+    assert evaluate_cert({**certificate, "issued_at_ms": deadline + 1}) is None
+    assert evaluate_cert({**certificate, "strategy_version": "other"}) is None
+    assert evaluate_cert({**certificate, "probability_lower": 0.1}) is None
+    assert evaluate_cert({**certificate, "observations": 2}) is None
