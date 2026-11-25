@@ -134,3 +134,16 @@ def test_zero_volume_internal_zone_is_identified_without_made_up_trades():
         (D(101), D(103), D(2))]
     assert [(z.low, z.high) for z in profile.high_volume_zones] == [
         (D(100), D(100)), (D(104), D(104))]
+
+def test_sparse_profile_value_area_finishes_inside_observed_bounds():
+    trades = [{"ts": START, "price": "100", "qty": "5"},
+              {"ts": START, "price": "105", "qty": "5"}]
+    profile = build_profile(trades, START, END, D(1),
+                            coverage_verified=True, expected_trade_count=2)
+    assert profile is not None
+    assert profile.poc == D(100)
+    assert profile.value_area_low == D(100)
+    assert profile.value_area_high == D(105)
+    very_wide = [dict(trades[0]), dict(trades[1], price="30000")]
+    assert build_profile(very_wide, START, END, D(1),
+                         coverage_verified=True, expected_trade_count=2) is None
