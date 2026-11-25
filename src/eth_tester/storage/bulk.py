@@ -33,6 +33,7 @@ def copy_trades(conn, rows):
                 copy.write_row(tuple(values))
                 count += 1
         if not count:
+            cur.execute("DROP TABLE eth_trade_stage")
             return {"input_rows": 0, "inserted_rows": 0, "deduplicated_rows": 0}
 
         # Detect contradictory duplicates even *within* an archive page.
