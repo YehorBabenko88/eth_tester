@@ -111,4 +111,22 @@ def run_backtest(settings, tf='5'):
                result['funding'], result['net_pnl'], result['outcome'],
                json.dumps({'signal': result['reason'], 'quality': result['quality'],
                            'mae': str(result['mae']), 'mfe': str(result['mfe'])}, default=str)))
+    # Chart rendering is evidence-only: persistence of trades must not depend on PNG.
+    try:
+        from .charts import render_backtest_evidence
+        output = render_backtest_evidence(
+            bars, deals, output_dir=f"runtime/charts/backtest_{run['id']}",
+            run_id=str(run['id']),
+        ) if deals else []
+        if output:
+            with connection(settings) as conn:
+                for index, paths in enumerate(output, 1):
+                    conn.execute("""UPDATE backtest_trades
+                      SET reason=reason || %s::jsonb WHERE run_id=%s AND seq=%s""",
+                                 (json.dumps({'charts': paths}), run['id'], index))
+    except Exception as exc:
+        with connection(settings) as conn:
+            conn.execute("""INSERT INTO bot_events(severity,event,data)
+              VALUES('warning','backtest_chart_failed',%s::jsonb)""",
+                         (json.dumps({'run': run['id'], 'error': str(exc)[:400]}),))
     return run['id'], len(deals), total, coverage
