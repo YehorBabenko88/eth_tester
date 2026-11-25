@@ -9,7 +9,7 @@ def main():
     parser.add_argument("--trade-id",type=int)
     commands=parser.add_subparsers(dest="command",required=True)
     for cmd in ("init","backfill","archives","live","levels","footprint",
-                "telegram","status","chart","backtest","engine","learn","cleanup","analyse","run","book-replay"):
+                "telegram","status","chart","backtest","engine","learn","cleanup","analyse","run","book-replay","aggregate"):
         commands.add_parser(cmd)
     args=parser.parse_args()
     settings=Settings()
@@ -45,6 +45,9 @@ def main():
     elif args.command=="engine":
         from .runner import run_engine
         asyncio.run(run_engine(settings))
+    elif args.command=="aggregate":
+        from .rollups import aggregate_history
+        print("Historical aggregated intervals:",aggregate_history(settings))
     elif args.command=="book-replay":
         from .book_analysis import replay_orderbook
         print("Book events:",replay_orderbook(settings))
