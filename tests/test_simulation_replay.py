@@ -63,3 +63,30 @@ def test_wfo_and_holdout_have_no_time_overlap():
 def test_wfo_rejects_unsorted():
     with pytest.raises(ValueError):
         walk_forward_splits([{'ts': BASE}, {'ts': BASE}], 1, 1)
+
+
+def test_overlapping_out_of_sample_windows_rejected():
+    rows = [{'ts': BASE + timedelta(minutes=i), 'value': i} for i in range(40)]
+    with pytest.raises(ValueError, match='overlapping OOS'):
+        walk_forward_splits(rows, train_size=12, test_size=6, step=3)
+
+
+def test_fit_cannot_mutate_future_original_records():
+    records = [{'ts': BASE + timedelta(minutes=i), 'value': i} for i in range(35)]
+    def fit(rows):
+        rows[0]['value'] = -999
+        return {'threshold': rows[-1]['value']}
+    def evaluate(rows, model):
+        rows[0]['value'] = -888
+        model['threshold'] = -777
+        return True
+    reports = walk_forward_evaluate(records, train_size=10, test_size=5,
+                                    fit=fit, evaluate=evaluate)
+    assert reports and [row['value'] for row in records] == list(range(35))
+
+
+def test_prequote_funding_is_explicitly_rejected_not_fabricated():
+    event = FundingEvent(BASE, D('.001'), D(100), 'early')
+    report = replay_ticks([q(0), q(1)], funding_events=[event])
+    assert report['funding_rejected'] == [(BASE, 'no_prior_market_quote')]
+    assert report['engine'].equity == D(10000)
