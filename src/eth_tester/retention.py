@@ -11,8 +11,8 @@ from .storage import check_ownership
 def storage_report(settings, *, exact_counts=False, local_disk_path=None):
     """Report DB bytes and WAL usage without full scans on every heartbeat.
 
-    pg_stat_wal.wal_bytes is cumulative bytes *generated* since stats_reset.
-    pg_ls_waldir is a privileged physical WAL-on-disk estimate; may be None.
+    pg_stat_wal.wal_bytes is cluster-wide cumulative bytes since stats_reset.
+    pg_ls_waldir is cluster-wide, privileged WAL-on-disk size; may be None.
     The optional disk path is explicitly local to this Python process, and
     cannot be assumed to match a remote PostgreSQL server's volume.
     """
@@ -44,11 +44,11 @@ def storage_report(settings, *, exact_counts=False, local_disk_path=None):
             result.update({r["relname"]: r["n"] for r in estimated})
         result["row_counts_estimated"] = not exact_counts
         wal = conn.execute(
-            "SELECT wal_bytes::numeric AS wal_bytes_generated, stats_reset AS wal_stats_reset "
+            "SELECT wal_bytes::numeric AS cluster_wal_bytes_generated, stats_reset AS cluster_wal_stats_reset "
             "FROM pg_stat_wal"
         ).fetchone()
         result.update(wal)
-        result["wal_on_disk_bytes"] = None
+        result["cluster_wal_on_disk_bytes"] = None
         try:
             with conn.transaction():
                 item = conn.execute(
