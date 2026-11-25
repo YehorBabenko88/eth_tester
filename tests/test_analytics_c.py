@@ -50,7 +50,7 @@ def test_footprint_delta_and_diagonal_stack():
         {"price": str(p), "qty": "10", "side": "Buy"}
         for p in (100, 101, 102, 103)
     ] + [{"price": "100", "qty": "1", "side": "Sell"}]
-    result = footprint(trades, min_stack=3)
+    result = footprint(trades, min_stack=3, tick_size=1, coverage_verified=True)
     assert result["buy"] == 40
     assert result["sell"] == 1
     assert result["delta"] == 39
