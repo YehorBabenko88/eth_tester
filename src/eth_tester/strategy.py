@@ -35,8 +35,8 @@ def price_signal(closed_candles,fee_rate=D("0.00055"),slip_bps=D("2"),max_lookba
         if step.total_seconds()<=0 or any(b["ts"]-a["ts"]!=step for a,b in zip(candles,candles[1:])):
             return None
         for b in candles:
-            o,h,l,c=(D(b[k]) for k in ("open","high","low","close"))
-            if not all(x.is_finite() for x in (o,h,l,c)) or not 0<l<=min(o,c)<=max(o,c)<=h:
+            o,h,low,c=(D(b[k]) for k in ("open","high","low","close"))
+            if not all(x.is_finite() for x in (o,h,low,c)) or not 0<low<=min(o,c)<=max(o,c)<=h:
                 return None
         last=candles[-1]
         price=D(last["close"])
