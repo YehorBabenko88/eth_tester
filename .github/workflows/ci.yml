@@ -29,7 +29,8 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         env:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
-        run: python -c "import os,subprocess,re; expected=os.environ['EXPECTED_SHA'].lower(); actual=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip().lower(); assert re.fullmatch('[0-9a-f]{40}',expected) and actual==expected, f'Checkpoint SHA mismatch or invalid: expected={expected}, actual={actual}'"
+        run: |
+          python -c "import os,subprocess,re; expected=os.environ['EXPECTED_SHA'].lower(); actual=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip().lower(); assert re.fullmatch('[0-9a-f]{40}',expected) and actual==expected, f'Checkpoint SHA mismatch or invalid: expected={expected}, actual={actual}'"
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -87,7 +88,8 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         env:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
-        run: python -c "import os,subprocess,re; expected=os.environ['EXPECTED_SHA'].lower(); actual=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip().lower(); assert re.fullmatch('[0-9a-f]{40}',expected) and actual==expected, f'Checkpoint SHA mismatch or invalid: expected={expected}, actual={actual}'"
+        run: |
+          python -c "import os,subprocess,re; expected=os.environ['EXPECTED_SHA'].lower(); actual=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip().lower(); assert re.fullmatch('[0-9a-f]{40}',expected) and actual==expected, f'Checkpoint SHA mismatch or invalid: expected={expected}, actual={actual}'"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
