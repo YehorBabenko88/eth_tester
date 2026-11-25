@@ -29,9 +29,11 @@ def render_trade(settings,trade_id,output_dir="runtime/charts"):
     ax.legend()
     directory=Path(output_dir)
     directory.mkdir(parents=True,exist_ok=True)
-    path=directory/f"paper_trade_{trade_id}.png"
+    stage="exit" if trade["closed_at"] else "entry"
+    path=directory/f"paper_trade_{trade_id}_{stage}.png"
     fig.savefig(path,dpi=140)
     plt.close(fig)
     with connection(settings) as conn:
-        conn.execute("UPDATE paper_trades SET exit_chart=%s WHERE id=%s",(str(path),trade_id))
+        field="exit_chart" if trade["closed_at"] else "entry_chart"
+        conn.execute(f"UPDATE paper_trades SET {field}=%s WHERE id=%s",(str(path),trade_id))
     return path
