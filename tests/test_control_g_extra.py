@@ -113,3 +113,10 @@ def test_delete_command_refused_even_for_owner(monkeypatch):
     asyncio.run(control.dispatch(SimpleNamespace(), u, SimpleNamespace(args=[]), "delete"))
     assert len(replies) == 1
     assert "заблокировано" in replies[0]
+
+def test_cooperative_supervisor_shutdown_request(tmp_path):
+    from eth_tester.supervisor import Supervisor
+    marker = tmp_path / "shutdown.request"
+    marker.write_text("owned uninstall", encoding="utf-8")
+    asyncio.run(Supervisor(path=tmp_path)._wait_shutdown())
+    assert not marker.exists()
