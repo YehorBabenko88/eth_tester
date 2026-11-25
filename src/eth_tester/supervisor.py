@@ -1,6 +1,6 @@
-"""Paper-only worker supervisor with bounded restart and graceful child shutdown.
+"""Paper-only worker supervisor: graceful shutdown, status and bounded restarts.
 
-The supervisor has no authority to change bot_control: an operator stop stays stopped.
+No worker restart changes bot_control, so operator-stopped paper entries stay stopped.
 """
 
 import asyncio
@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -21,7 +22,12 @@ PERIODIC = {"backfill": 86400, "archives": 86400, "aggregate": 21600}
 
 
 def runtime_path():
-    return Path(os.environ.get("ETH_TESTER_RUNTIME_DIR", "runtime")).resolve()
+    custom = os.environ.get("ETH_TESTER_RUNTIME_DIR")
+    if custom:
+        return Path(custom).resolve()
+    if os.name == "nt":
+        return Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ETHTester" / "runtime"
+    return Path.cwd() / "runtime"
 
 
 class Supervisor:
@@ -59,6 +65,16 @@ class Supervisor:
             proc.kill()
             await proc.wait()
 
+    async def _wait_shutdown(self):
+        """Local owned-task stop request, used before Windows task unregistration."""
+        marker = self.path / "shutdown.request"
+        while True:
+            if marker.exists():
+                marker.unlink()
+                LOGGER.info("Owned supervisor shutdown requested")
+                return
+            await self.sleep(1)
+
     async def child(self, name, recurring_seconds=None):
         delay = 3.0
         while True:
@@ -71,7 +87,12 @@ class Supervisor:
                 )
                 self.children[name] = proc
                 self._record(name, "running", pid=proc.pid)
-                code = await proc.wait()
+                while True:
+                    try:
+                        code = await asyncio.wait_for(proc.wait(), timeout=30)
+                        break
+                    except asyncio.TimeoutError:
+                        self._record(name, "running", pid=proc.pid)
                 self._record(name, "exited", exit_code=code)
                 if recurring_seconds is not None and code == 0:
                     delay = 3.0
@@ -102,14 +123,33 @@ class Supervisor:
         specs.extend(PERIODIC.items())
         if settings.tg_bot_token and settings.tg_chat_id:
             specs.append(("telegram", None))
-        tasks = [asyncio.create_task(self.child(name, interval), name=name)
-                 for name, interval in specs]
+        tasks = [
+            asyncio.create_task(self.child(name, interval), name=name)
+            for name, interval in specs
+        ]
+        watcher = asyncio.create_task(self._wait_shutdown(), name="supervisor_shutdown")
+        loop = asyncio.get_running_loop()
+        registered = []
+        stop = asyncio.Event()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+                registered.append(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+        signal_watcher = asyncio.create_task(stop.wait())
         try:
-            await asyncio.gather(*tasks)
+            done, _ = await asyncio.wait(
+                [*tasks, watcher, signal_watcher], return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                task.result()
         finally:
-            for task in tasks:
+            for task in (*tasks, watcher, signal_watcher):
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, watcher, signal_watcher, return_exceptions=True)
+            for sig in registered:
+                loop.remove_signal_handler(sig)
 
 
 async def supervise(settings):
