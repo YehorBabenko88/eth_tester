@@ -52,7 +52,7 @@ def test_funding_never_uses_unverified_entry_price(monkeypatch):
 
 
 def test_crossing_time_is_stop_first_under_ambiguous_trade_ids(monkeypatch):
-    runner = load_runner(monkeypatch)
+    load_runner(monkeypatch)
     from eth_tester.simulation.crossing import resolve_first_crossing
     first = {'ts': BASE, 'low_cross': D(97), 'high_cross': D(107)}
     choice = resolve_first_crossing(first, 'long', D(98), D(104))
