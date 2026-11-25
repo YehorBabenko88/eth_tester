@@ -9,6 +9,7 @@ import json
 
 from .data_quality import DataIntegrityError, PERIOD_MS, validate_period_page
 from .database import connection, cursor_ts, save_cursor
+from .data_coverage import digest_rows, write_coverage
 from .history_integrity import as_utc, ms, record_gap
 
 UTC = timezone.utc
@@ -109,12 +110,22 @@ async def collect_funding(settings, client):
                 {"category": settings.category, "symbol": settings.symbol},
                 pos, end, 200, 60000)
             values = _funding_rows(rows, pos, final_end)
+            checksum = digest_rows(rows)
             with connection(settings) as conn:
                 for ts, rate in values.items():
                     _save_funding(conn, settings.symbol, ts, rate)
                 if not values:
                     record_gap(conn, settings.symbol, "funding:history",
                                pos, final_end, "Funding API returned no history")
+                write_coverage(
+                    conn, source="funding", symbol=settings.symbol, interval="",
+                    start_ms=pos, end_exclusive_ms=final_end + 1,
+                    status="partial" if values else "unavailable",
+                    observed_rows=len(values), expected_rows=None,
+                    checksum=checksum if values else None,
+                    quality="funding_schedule_unproven" if values else "not_observed",
+                    evidence={"endpoint": "funding/history", "window_end_ms": final_end},
+                    instrument=settings.category)
                 _status(conn, source, settings.symbol, "", pos, final_end,
                         "observed_partial" if values else "unavailable",
                         min(values) if values else None)
@@ -122,6 +133,12 @@ async def collect_funding(settings, client):
             with connection(settings) as conn:
                 record_gap(conn, settings.symbol, "funding:history",
                            pos, end, f"Integrity failure: {exc}")
+                write_coverage(
+                    conn, source="funding", symbol=settings.symbol, interval="",
+                    start_ms=pos, end_exclusive_ms=end + 1,
+                    status="gap", observed_rows=0, quality="rejected",
+                    evidence={"error": str(exc)},
+                    instrument=settings.category)
             raise
         pos = final_end + 1
 
@@ -147,6 +164,8 @@ async def _collect_period(settings, client, endpoint, source, interval,
                 client, endpoint, params, pos, end, limit, step)
             values, quality = validate_period_page(
                 rows, interval, pos, final_end, values=value_names)
+            checksum = digest_rows(rows)
+            expected = max(0, final_end // step - (pos + step - 1) // step + 1)
             with connection(settings) as conn:
                 for stamp, record in values.items():
                     if db_table == "open_interest":
@@ -177,6 +196,17 @@ async def _collect_period(settings, client, endpoint, source, interval,
                 if not values:
                     record_gap(conn, settings.symbol, f"{source}:{interval}",
                                pos, final_end, "No samples returned by Bybit")
+                write_coverage(
+                    conn, source=source, symbol=settings.symbol, interval=interval,
+                    start_ms=pos, end_exclusive_ms=final_end + 1,
+                    status="partial" if values else "unavailable",
+                    observed_rows=len(values), expected_rows=expected,
+                    checksum=checksum if values else None,
+                    quality=quality,
+                    evidence={"endpoint": endpoint, "cursor_checked": True,
+                              "window_end_ms": final_end,
+                              "expected_grid_samples": expected},
+                    instrument=settings.category)
                 _status(conn, source, settings.symbol, interval,
                         pos, final_end, quality,
                         min(values) if values else None)
@@ -184,6 +214,14 @@ async def _collect_period(settings, client, endpoint, source, interval,
             with connection(settings) as conn:
                 record_gap(conn, settings.symbol, f"{source}:{interval}",
                            pos, end, f"Integrity failure: {exc}")
+                write_coverage(
+                    conn, source=source, symbol=settings.symbol, interval=interval,
+                    start_ms=pos, end_exclusive_ms=end + 1,
+                    status="gap", observed_rows=0,
+                    expected_rows=max(0, end // step - (pos + step - 1) // step + 1),
+                    quality="rejected",
+                    evidence={"endpoint": endpoint, "error": str(exc)},
+                    instrument=settings.category)
             raise
         pos = final_end + 1
 
