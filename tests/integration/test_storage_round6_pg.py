@@ -32,64 +32,174 @@ pytestmark = pytest.mark.postgres
 UTC = timezone.utc
 
 
-@pytest.fixture(scope="module")
-def source_lab():
+def _owned_pg_lab(prefix):
+    """Create one test-owned DB; never adopt or drop a replaced database."""
+    assert prefix in ("eth_tester_storage_r6_", "eth_tester_storage_r8_")
     administrative = os.getenv("ETH_TEST_PG_DSN")
     if not administrative:
         pytest.skip("ETH_TEST_PG_DSN required for disposable real PostgreSQL")
-    db_name = "eth_tester_storage_r6_" + uuid4().hex[:12]
-    dsn = make_conninfo(administrative, dbname=db_name)
+    db_name = prefix + uuid4().hex[:12]
     settings = SimpleNamespace(
-        database_url=dsn, initial_equity_usd=Decimal("10000"),
-        symbol="ETHUSDT", category="linear",
+        database_url=make_conninfo(administrative, dbname=db_name),
+        initial_equity_usd=Decimal("10000"), symbol="ETHUSDT",
+        category="linear",
     )
-    try:
-        init_database(settings)
-        yield settings
-    finally:
-        # Never touch a preexisting database; only this generated unique name.
-        with psycopg.connect(make_conninfo(administrative, dbname="postgres"),
-                             autocommit=True) as admin:
-            exists = admin.execute(
-                "SELECT 1 FROM pg_database WHERE datname=%s", (db_name,)
+    admin_dsn = make_conninfo(administrative, dbname="postgres")
+    created = False
+    owned_oid = None
+    owned_role = None
+    with psycopg.connect(admin_dsn, autocommit=True) as admin:
+        # Cooperative lifecycle lock; distinct from production init lock.
+        lock_name = "eth_tester:fixture_owner:" + db_name
+        admin.execute("SELECT pg_advisory_lock(hashtext(%s))", (lock_name,))
+        try:
+            # One atomic PostgreSQL CREATE: collision fails, never adopt.
+            admin.execute(sql.SQL("CREATE DATABASE {}").format(
+                sql.Identifier(db_name)
+            ))
+            created = True
+            identity = admin.execute(
+                "SELECT oid,datdba FROM pg_database WHERE datname=%s",
+                (db_name,),
             ).fetchone()
-            if exists:
-                admin.execute(sql.SQL("DROP DATABASE {}").format(
-                    sql.Identifier(db_name)
-                ))
+            if identity is None:
+                raise RuntimeError("Created test database absent from catalog")
+            owned_oid, owned_role = identity
+            init_database(settings)
+            initialized = admin.execute(
+                "SELECT oid,datdba FROM pg_database WHERE datname=%s",
+                (db_name,),
+            ).fetchone()
+            if (initialized is None or initialized[0] != owned_oid
+                    or initialized[1] != owned_role):
+                raise RuntimeError("Test database identity changed on bootstrap")
+            with connection(settings) as conn:
+                marker = conn.execute(
+                    "SELECT owner_tag FROM eth_storage_identity "
+                    "WHERE singleton=true"
+                ).fetchone()
+                if not marker or marker["owner_tag"] != "eth_tester":
+                    raise RuntimeError("Test database schema owner marker mismatch")
+            yield settings
+        finally:
+            try:
+                if created:
+                    present = admin.execute(
+                        "SELECT oid,datdba FROM pg_database WHERE datname=%s",
+                        (db_name,),
+                    ).fetchone()
+                    if (present is None or present[0] != owned_oid
+                            or present[1] != owned_role):
+                        raise RuntimeError(
+                            "Refusing to DROP replaced or unowned QA database"
+                        )
+                    admin.execute(sql.SQL("DROP DATABASE {}").format(
+                        sql.Identifier(db_name)
+                    ))
+            finally:
+                admin.execute(
+                    "SELECT pg_advisory_unlock(hashtext(%s))", (lock_name,)
+                )
 
+
+@pytest.fixture(scope="module")
+def source_lab():
+    yield from _owned_pg_lab("eth_tester_storage_r6_")
 
 
 @pytest.fixture
 def r8_source_lab():
-    """Own isolated PostgreSQL database for R8's immutable live receipts."""
-    administrative = os.getenv("ETH_TEST_PG_DSN")
-    if not administrative:
-        pytest.skip("ETH_TEST_PG_DSN required for disposable real PostgreSQL")
-    db_name = "eth_tester_storage_r8_" + uuid4().hex[:12]
-    dsn = make_conninfo(administrative, dbname=db_name)
-    settings = SimpleNamespace(
-        database_url=dsn, initial_equity_usd=Decimal("10000"),
-        symbol="ETHUSDT", category="linear",
-    )
-    admin_dsn = make_conninfo(administrative, dbname="postgres")
-    with psycopg.connect(admin_dsn, autocommit=True) as admin:
-        if admin.execute(
-            "SELECT 1 FROM pg_database WHERE datname=%s", (db_name,)
-        ).fetchone():
-            raise RuntimeError("Refusing to reuse an existing R8 QA database")
-    try:
-        init_database(settings)
-        yield settings
-    finally:
-        # Only drop the distinct, freshly generated R8-owned test database.
-        with psycopg.connect(admin_dsn, autocommit=True) as admin:
-            if admin.execute(
-                "SELECT 1 FROM pg_database WHERE datname=%s", (db_name,)
-            ).fetchone():
-                admin.execute(sql.SQL("DROP DATABASE {}").format(
-                    sql.Identifier(db_name)
-                ))
+    yield from _owned_pg_lab("eth_tester_storage_r8_")
+
+
+def test_round34_owned_pg_fixture_collision_and_cleanup(monkeypatch):
+    """Mock catalog: collision never drops; failed init drops only owned OID."""
+    class Result:
+        def __init__(self, value=None):
+            self.value = value
+
+        def fetchone(self):
+            return self.value
+
+    class Admin:
+        def __init__(self, mode):
+            self.mode = mode
+            self.created = 0
+            self.dropped = 0
+            self.reads = 0
+            self.unlocked = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def execute(self, query, params=None):
+            command = str(query)
+            if "pg_advisory_unlock" in command:
+                self.unlocked += 1
+                return Result()
+            if "pg_advisory_lock" in command:
+                return Result()
+            if "CREATE DATABASE" in command:
+                self.created += 1
+                if self.mode == "collision":
+                    raise psycopg.errors.DuplicateDatabase("existing name")
+                return Result()
+            if "SELECT oid,datdba" in command:
+                self.reads += 1
+                replacement = self.mode == "replaced" and self.reads == 3
+                return Result((43 if replacement else 42, 10))
+            if "DROP DATABASE" in command:
+                self.dropped += 1
+                return Result()
+            raise AssertionError("Unexpected SQL in ownership mock")
+
+    class MarkerConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def execute(self, statement):
+            assert "eth_storage_identity" in statement
+            return Result({"owner_tag": "eth_tester"})
+
+    monkeypatch.setenv("ETH_TEST_PG_DSN", "dbname=postgres")
+    for mode in ("collision", "bootstrap_failure", "replaced"):
+        admin = Admin(mode)
+        monkeypatch.setattr(psycopg, "connect", lambda *_a, **_k: admin)
+        calls = []
+        def bootstrap(_settings):
+            calls.append("init")
+            if mode == "bootstrap_failure":
+                raise RuntimeError("injected bootstrap error")
+
+        monkeypatch.setitem(globals(), "init_database", bootstrap)
+        monkeypatch.setitem(
+            globals(), "connection", lambda _settings: MarkerConnection()
+        )
+        owned = _owned_pg_lab("eth_tester_storage_r8_")
+        if mode == "collision":
+            with pytest.raises(psycopg.errors.DuplicateDatabase):
+                next(owned)
+            assert calls == []
+            assert admin.dropped == 0
+        elif mode == "bootstrap_failure":
+            with pytest.raises(RuntimeError, match="injected bootstrap"):
+                next(owned)
+            assert calls == ["init"]
+            assert admin.dropped == 1
+        else:
+            next(owned)
+            with pytest.raises(RuntimeError, match="replaced or unowned"):
+                next(owned)
+            assert calls == ["init"]
+            assert admin.dropped == 0
+        assert admin.created == 1
+        assert admin.unlocked == 1
 
 
 def _r8_previous_closed_bar(anchor):
