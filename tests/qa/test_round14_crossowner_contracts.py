@@ -132,7 +132,7 @@ def test_equal_volume_not_promoted_to_exchange_complete(monkeypatch, stage_sha_p
                 assert ("WHERE symbol=%s AND tf=%s AND ts >= %s AND ts < %s "
                         "ORDER BY ts LIMIT %s") in query
                 assert args == (
-                    "ETHUSDT", "1", stamp, stamp + timedelta(minutes=1), 1537
+                    "ETHUSDT", "1", stamp - timedelta(minutes=59), stamp + timedelta(minutes=1), 1537
                 )
                 return Rows(many=[{"ts": stamp, "delta": Decimal(0),
                                    "volume": Decimal("0.001"),
