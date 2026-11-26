@@ -7,7 +7,8 @@ from eth_tester.data_quality import DataIntegrityError
 from eth_tester.database import connection
 from eth_tester.history_integrity import collect_klines, as_utc
 from eth_tester.history_series import collect_oi
-from test_postgres import pg_settings as _pg_settings  # noqa: F401 — pytest fixture registration
+# Pytest must expose this imported fixture under its exact requested name.
+from test_postgres import pg_settings  # noqa: F401
 
 pytestmark = pytest.mark.postgres
 UTC = timezone.utc
@@ -31,7 +32,7 @@ class MissingCandleClient:
         return {"list": []}
 
 
-def test_data_candle_coverage_verified_and_missing(pg_settings):
+def test_data_candle_coverage_verified_and_missing(pg_settings):  # noqa: F811 - pytest fixture injection
     from eth_tester.config import Settings
     history_date = (datetime.now(UTC) - timedelta(days=2)).date()
     options = Settings(
@@ -59,7 +60,7 @@ def test_data_candle_coverage_verified_and_missing(pg_settings):
         assert cursor is None  # never mark unavailable historic data as loaded
 
 
-def test_data_oi_period_conflict_is_not_overwritten(pg_settings):
+def test_data_oi_period_conflict_is_not_overwritten(pg_settings):  # noqa: F811 - pytest fixture injection
     from eth_tester.config import Settings
     now = datetime.now(UTC).replace(second=0, microsecond=0)
     start = now - timedelta(days=2)
