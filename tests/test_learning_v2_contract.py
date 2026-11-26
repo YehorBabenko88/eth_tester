@@ -169,3 +169,183 @@ def test_synthetic_cost_control_rejects_provisional_and_inconsistent(mutate):
     mutate(row)
     accepted, rejected = from_snapshot_records([row], cutoff)
     assert accepted == [] and sum(rejected.values()) == 1
+
+# ETH TESTER F ROUND 37 — NEW V3 replacement; NOT original R22 or V1/V2.
+# Append-only to tests/test_learning_v2_contract.py; LOCAL HOLD, NOT PUBLISHED.
+# All fixture positives are synthetic QA, NEVER financial certifications.
+
+
+def _r37_positive_synthetic_control():
+    row, cutoff = sample()
+    accepted, rejected = from_snapshot_records([row], cutoff)
+    assert rejected == {}
+    assert len(accepted) == 1
+    assert accepted[0].event_id == "paper:17"
+    assert accepted[0].net_return == pytest.approx(0.009)
+    return cutoff
+
+
+@pytest.mark.parametrize("funding_value", [
+    None, False, 0, 1, "true", "false", [], {},
+], ids=[
+    "null-and-absent", "false", "integer-zero", "integer-one",
+    "string-true", "string-false", "empty-list", "empty-map",
+])
+def test_r37_funding_original_row_cannot_be_spoofed(funding_value):
+    _r37_positive_synthetic_control()
+    for absent in ((False, True) if funding_value is None else (False,)):
+        row, cutoff = sample()
+        if absent:
+            row.pop("funding_verified")
+        else:
+            row["funding_verified"] = funding_value
+        row["reason"].update({
+            "funding_verified": True,
+            "funding_schedule_complete": True,
+            "net_pnl_certified": True,
+        })
+        accepted, rejected = from_snapshot_records([row], cutoff)
+        assert accepted == []
+        assert rejected == {"provisional_paper_economics": 1}
+
+
+@pytest.mark.parametrize("mutation,expected", [
+    (lambda r: r["execution_events"][1]["provenance"].update(
+        funding_source_db_rechecked=1), "provisional_paper_economics"),
+    (lambda r: r["execution_events"][1]["provenance"].update(
+        funding_schedule_complete="true"), "provisional_paper_economics"),
+    (lambda r: r["execution_events"][1]["provenance"].update(
+        funding_schedule_complete=None), "provisional_paper_economics"),
+    (lambda r: r["execution_events"][0].update(
+        fee="Infinity"), "incomplete_paper_fee_evidence"),
+    (lambda r: r["execution_events"][0].update(
+        fee="-1"), "incomplete_paper_fee_evidence"),
+], ids=[
+    "integer-funding-recheck", "string-schedule-complete",
+    "null-and-absent-schedule", "nonfinite-entry-fee", "negative-entry-fee",
+])
+def test_r37_funding_receipt_and_fee_exact_rejection(mutation, expected):
+    _r37_positive_synthetic_control()
+    row, cutoff = sample()
+    mutation(row)
+    accepted, rejected = from_snapshot_records([row], cutoff)
+    assert accepted == []
+    assert rejected == {expected: 1}
+    if (row["execution_events"][1]["provenance"].get(
+            "funding_schedule_complete") is None):
+        row, cutoff = sample()
+        row["execution_events"][1]["provenance"].pop(
+            "funding_schedule_complete")
+        accepted, rejected = from_snapshot_records([row], cutoff)
+        assert accepted == []
+        assert rejected == {"provisional_paper_economics": 1}
+
+
+@pytest.mark.parametrize("mutation,category,stage,message", [
+    (lambda r: r["provenance"]["feature_available_ms"].update(
+        oi=r["reason"]["ml_signal_decision_ms"] + 1),
+     "late_or_backdated_horizon_source", "snapshot", "feature hindsight: oi"),
+    (lambda r: r["provenance"]["feature_sources"]["cvd"].update(
+        source_receipt_ms=r["reason"]["ml_signal_decision_ms"] + 1),
+     "late_or_backdated_horizon_source", "snapshot", "feature hindsight: cvd"),
+    (lambda r: r.update(is_causal=1),
+     "not_independently_certified_historical_snapshot", "snapshot",
+     "uncertified snapshot"),
+    (lambda r: r["provenance"].update(source_coverage_verified=1),
+     "not_independently_certified_historical_snapshot", "snapshot",
+     "noncanonical source certification"),
+    (lambda r: r["label_ledger"].update(
+        source_receipt_at="2030-01-01T00:00:00+00:00"),
+     "late_or_backdated_horizon_source", "label",
+     "future, backdated or incomplete horizon"),
+    (lambda r: r["label_ledger"].update(
+        coverage_checked_at="2030-01-01T00:00:00+00:00"),
+     "late_or_backdated_horizon_source", "label",
+     "future, backdated or incomplete horizon"),
+    (lambda r: r["label_ledger"]["source_evidence"].update(
+        complete_closed_bar_grid=1),
+     "other", "label", "missing complete independent closed-bar grid"),
+], ids=[
+    "feature-after-decision", "source-receipt-after-decision",
+    "integer-causal-proof", "integer-coverage-proof",
+    "label-receipt-after-cutoff", "label-check-after-cutoff",
+    "integer-complete-closed-bar-grid",
+])
+def test_r37_causality_rejection_exact_branch(mutation, category,
+                                              stage, message):
+    _r37_positive_synthetic_control()
+    row, cutoff = sample()
+    mutation(row)
+    accepted, rejected = from_snapshot_records([row], cutoff)
+    assert accepted == []
+    assert rejected == {category: 1}
+    if stage == "snapshot":
+        with pytest.raises(ValueError, match=message):
+            validate_snapshot(row, row["reason"])
+    else:
+        # Positive upstream validator ensures the intended label guard runs.
+        values, times, decision = validate_snapshot(row, row["reason"])
+        assert len(values) == len(times) == 9
+        assert decision == row["reason"]["ml_signal_decision_ms"]
+        with pytest.raises(ValueError, match=message):
+            validate_label(row, row["reason"], cutoff,
+                           int(row["closed_at"].timestamp() * 1000),
+                           row["paper_trade_id"])
+
+
+def test_r37_manual_and_bounded_paper_missing_attestation_exact():
+    _r37_positive_synthetic_control()
+    for marker in (
+        {"qa_only": True},
+        {"paper_only": True, "ml_eligible": False,
+         "paper_live_evidence_key": "f" * 64},
+    ):
+        # Marker alone is NOT a rejection gate in this specific decoder.
+        # Synthetic complete proof must still pass: no masked baseline failure.
+        row, cutoff = sample()
+        row["reason"].update(marker)
+        accepted, rejected = from_snapshot_records([row], cutoff)
+        assert len(accepted) == 1 and rejected == {}
+        for missing, category in (
+            ("snapshot", "source_not_immutable"),
+            ("label", "late_or_backdated_horizon_source"),
+            ("both", "source_not_immutable"),
+        ):
+            row, cutoff = sample()
+            row["reason"].update(marker)
+            if missing in ("snapshot", "both"):
+                row["reason"].pop("ml_snapshot_key")
+                row["reason"].pop("ml_source_checksum")
+            if missing in ("label", "both"):
+                row["label_ledger"] = None
+            accepted, rejected = from_snapshot_records([row], cutoff)
+            assert accepted == []
+            assert rejected == {category: 1}
+            if missing == "label":
+                values, times, decision = validate_snapshot(row, row["reason"])
+                assert len(values) == len(times) == 9
+                assert decision == row["reason"]["ml_signal_decision_ms"]
+                with pytest.raises(ValueError, match="missing post-horizon ledger"):
+                    validate_label(row, row["reason"], cutoff,
+                                   int(row["closed_at"].timestamp() * 1000),
+                                   row["paper_trade_id"])
+            else:
+                with pytest.raises(ValueError,
+                                   match="D/E snapshot identity mismatch"):
+                    validate_snapshot(row, row["reason"])
+
+
+def test_r37_synthetic_candidate_cannot_be_promoted():
+    from eth_tester.ml.lifecycle import admit_paper_candidate
+
+    _r37_positive_synthetic_control()
+    row, cutoff = sample()
+    accepted, rejected = from_snapshot_records([row], cutoff)
+    assert len(accepted) == 1 and rejected == {}
+    for gates in ({}, {"all_pass": True, "oos_certified": True}):
+        approved, reason = admit_paper_candidate(
+            None, "qa-synthetic-only", object(), [accepted[0]],
+            [accepted[0]], [accepted[0]], champion=None, gates=gates)
+        assert approved is False
+        assert reason == (
+            "independent certified OOS promotion contract not approved")
