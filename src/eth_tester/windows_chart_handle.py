@@ -130,7 +130,9 @@ def open_chart_windows_native(root, leaf):
             # SINGLE component relative to pinned HANDLE; never reparse its parents.
             buffer = ctypes.create_unicode_buffer(name)
             encoded = name.encode('utf-16-le')
-            us = UnicodeString(len(encoded), ctypes.sizeof(buffer), buffer)
+            # Keep the UTF-16 buffer alive for the duration of NtCreateFile.
+            us = UnicodeString(len(encoded), ctypes.sizeof(buffer),
+                               ctypes.cast(buffer, wintypes.LPWSTR))
             attributes = ObjectAttributes(ctypes.sizeof(ObjectAttributes), parent,
                         ctypes.pointer(us), OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
                         None, None)

@@ -49,7 +49,16 @@ def test_native_windows_never_reopens_png_via_full_path():
     assert 'FILE_OPEN_REPARSE_POINT' in source
     assert 'FILE_ATTRIBUTE_REPARSE_POINT' in source
     assert 'dir_fd' not in source or 'NtCreateFile' in source
-    assert 'CreateFileW(drive,' in source  # ONLY volume root absolute, not filename
+    # Accept the explicit HANDLE wrapper, but prove native CreateFileW
+    # still opens only the drive root and never a mutable PNG path.
+    import ast
+    native_opens = [node for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == 'CreateFileW']
+    assert len(native_opens) == 1
+    assert isinstance(native_opens[0].args[0], ast.Name)
+    assert native_opens[0].args[0].id == 'drive'
     assert 'CreateFileW(str(root)' not in source
     assert 'NtCreateFile(ctypes.byref(out)' in source
     assert 'GetSecurityInfo(handle' in source
