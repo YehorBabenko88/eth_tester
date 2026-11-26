@@ -1,6 +1,5 @@
 """Reproducible offline fault and hypothesis research tests; NO market/PG claims."""
 from dataclasses import replace
-from math import isnan
 import pytest
 from eth_tester.ml import Example, fit, FEATURE_NAMES, CLASSES
 from eth_tester.ml.research import (
@@ -102,19 +101,23 @@ def test_no_duplicate_ledger_ids(cohorts):
 def test_reject_future_feature(cohorts):
     tr,val,sh,_=cohorts
     bad=[replace(val[0],available_ms=tuple([val[0].decision_ms+1]*len(FEATURE_NAMES)))]+val[1:]
-    with pytest.raises(ValueError):verify_history_partition(tr,bad,sh)
+    with pytest.raises(ValueError):
+        verify_history_partition(tr,bad,sh)
 
 
 def test_reject_future_label_or_overlap(cohorts):
     tr,val,sh,_=cohorts
     bad=[replace(val[-1],exit_ms=sh[0].decision_ms) if i==len(val)-1 else v for i,v in enumerate(val)]
-    with pytest.raises(ValueError):verify_history_partition(tr,bad,sh)
+    with pytest.raises(ValueError):
+        verify_history_partition(tr,bad,sh)
 
 
 def test_reject_unordered_and_corrupt_event_id(cohorts):
     tr,val,sh,_=cohorts
-    with pytest.raises(ValueError): verify_history_partition(tr,list(reversed(val)),sh)
-    with pytest.raises(ValueError): verify_history_partition(tr,[replace(val[0],event_id="paper:fake")]+val[1:],sh)
+    with pytest.raises(ValueError):
+        verify_history_partition(tr,list(reversed(val)),sh)
+    with pytest.raises(ValueError):
+        verify_history_partition(tr,[replace(val[0],event_id="paper:fake")]+val[1:],sh)
 
 
 def test_reject_nan_and_infinite(cohorts):

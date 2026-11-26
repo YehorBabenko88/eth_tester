@@ -1,5 +1,4 @@
 """F14 prospective every-closed-minute audit; fake unsigned receipts only."""
-from copy import deepcopy
 from datetime import datetime, timezone
 from hashlib import sha256
 import json

@@ -36,6 +36,8 @@ def sample():
         "orderflow": {"immutable_feature_snapshot": {
             "snapshot_key": "a"*64, "source_checksum": "b"*64}},
     }
+    # Synthetic positive control only; never independently attested market evidence.
+    reason["paper_cost_policy"] = {"version": "paper_taker_cost_v1", "notional_usd": "1000"}
     label = {
         "paper_trade_id": 17, "snapshot_key": "a"*64, "source_checksum": "b"*64,
         "method": "fixed_horizon_barrier_v1", "outcome": "bounce",
@@ -60,6 +62,18 @@ def sample():
         "provenance": provenance,
         "label_ledger": label, "notional": 1000,
         "gross_pnl": 12, "fees": 2, "funding": 1, "net_pnl": 9,
+        "funding_verified": True,
+        "execution_quality": "trade_print_proxy_no_liquidity",
+        "execution_events": [
+            {"action": "entry", "fee": "1", "source": "paper_proxy",
+             "quality": "trade_print_proxy_no_liquidity",
+             "provenance": {"paper_only": True}},
+            {"action": "exit", "fee": "1", "source": "paper_proxy",
+             "quality": "trade_print_proxy_no_liquidity",
+             "provenance": {"fee_quality": "entry_time_cost_policy_pinned",
+                            "funding_source_db_rechecked": True,
+                            "funding_schedule_complete": True}},
+        ],
     }
     return row, ms(22)
 
@@ -141,3 +155,17 @@ def test_historic_exchange_timestamp_cannot_stand_in_for_decision():
     row["reason"]["ml_signal_decision_ms"] = int(row["decision_at"].timestamp()*1000)
     accepted, errors = from_snapshot_records([row], cutoff)
     assert accepted == [] and sum(errors.values()) == 1
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda row: row.update(funding_verified=False),
+    lambda row: row["execution_events"][1]["provenance"].update(
+        funding_schedule_complete=False),
+    lambda row: row["execution_events"][0].update(fee="NaN"),
+    lambda row: row["reason"]["paper_cost_policy"].update(notional_usd="999"),
+])
+def test_synthetic_cost_control_rejects_provisional_and_inconsistent(mutate):
+    row, cutoff = sample()
+    mutate(row)
+    accepted, rejected = from_snapshot_records([row], cutoff)
+    assert accepted == [] and sum(rejected.values()) == 1

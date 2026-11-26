@@ -16,7 +16,7 @@ import math
 import random
 import re
 
-from . import CLASSES, FEATURE_NAMES, Model, brier, fit, validate
+from . import CLASSES, FEATURE_NAMES, Model, fit, validate
 
 CONTRACT = "eth_feature_snapshot_v2"
 RESEARCH_VERSION = "historical_shadow_research_v1"

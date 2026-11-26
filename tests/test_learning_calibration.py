@@ -19,7 +19,9 @@ def sample(i):
 
 
 def test_wilson_lower_is_conservative():
-    assert wilson_lower(0, 30) == 0
+    assert wilson_lower(0, 1) == 0.0
+    assert wilson_lower(0, 30) == 0.0
+    assert wilson_lower(0, 300) == 0.0
     assert 0.9 < wilson_lower(100, 100) < 1.0
     assert 0 < wilson_lower(50, 100) < .5
     assert wilson_lower(0, 0) is None

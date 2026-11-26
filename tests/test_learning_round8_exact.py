@@ -44,7 +44,8 @@ def test_previously_misrounded_float_boundaries_preserve_raw_level():
 
 @pytest.mark.parametrize("value", ["NaN", "Infinity", "-1", "0", True, "invalid"])
 def test_invalid_structural_barrier_rejected(value):
-    with pytest.raises(ValueError): classify("resistance", value, "500", "100")
+    with pytest.raises(ValueError):
+        classify("resistance", value, "500", "100")
 
 
 def test_exclusive_coverage_end_equal_to_horizon_is_admissible_with_receipt():
@@ -125,7 +126,8 @@ def test_known_sql_trigger_denial_does_not_abort_batch(monkeypatch):
     @contextmanager
     def provide(_): yield db
     def label_one(conn,row,**kwargs):
-        if row["paper_trade_id"]==2: raise RaisedByPg()
+        if row["paper_trade_id"]==2:
+            raise RaisedByPg()
         return "breakout"
     monkeypatch.setattr(module,"connection",provide)
     monkeypatch.setattr(module,"_label_one",label_one)

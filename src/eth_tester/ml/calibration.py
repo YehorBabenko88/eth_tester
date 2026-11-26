@@ -19,6 +19,9 @@ def wilson_lower(wins, trials, z=1.6448536269514722):
         raise ValueError("invalid one-sided critical value")
     if trials == 0:
         return None
+    # The exact zero-win boundary must not have a positive rounding residue.
+    if wins == 0:
+        return 0.0
     p = wins / trials
     denom = 1 + z*z/trials
     center = p + z*z/(2*trials)
