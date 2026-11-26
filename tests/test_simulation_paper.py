@@ -36,13 +36,30 @@ def test_open_uses_actual_event_timestamp_and_version(monkeypatch):
     p = paper_stub(monkeypatch)
     calls = []
     class Result:
-        def __init__(self, row): self.row = row
-        def fetchone(self): return self.row
+        def __init__(self, row, *, many=None):
+            self.row = row
+            self.many = many
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            if self.many is None:
+                raise AssertionError("Unexpected fetchall for non-history query")
+            return self.many
     class Conn:
         def __enter__(self): return self
         def __exit__(self, *_): return None
         def execute(self, sql, params=None):
             calls.append((sql, params))
+            # Only the exact closed-ledger SELECT can return multiple rows.
+            normalized = " ".join(str(sql).split())
+            if normalized == (
+                "SELECT notional,net_pnl,funding_verified FROM paper_trades "
+                "WHERE state='closed' ORDER BY id"
+            ):
+                assert params is None
+                return Result(None, many=[])
             if 'FROM paper_position_state' in sql:
                 return Result({'paper_trade_id': None, 'version': 0,
                                'pending_exit': False, 'processed_cursor': None})
@@ -69,6 +86,30 @@ def test_open_uses_actual_event_timestamp_and_version(monkeypatch):
     insert = [params for sql, params in calls if 'INSERT INTO paper_trades' in sql][0]
     assert insert[2] == BASE and insert[3] == BASE
     assert insert[-1] == strategy_identity()
+    history_calls = [
+        (index, sql, params)
+        for index, (sql, params) in enumerate(calls)
+        if "FROM paper_trades WHERE state='closed' ORDER BY id"
+        in " ".join(str(sql).split())
+    ]
+    assert len(history_calls) == 1
+    history_index, history_sql, history_params = history_calls[0]
+    assert " ".join(str(history_sql).split()) == (
+        "SELECT notional,net_pnl,funding_verified FROM paper_trades "
+        "WHERE state='closed' ORDER BY id"
+    )
+    assert history_params is None
+    assert history_index < next(
+        i for i, (sql, _) in enumerate(calls) if 'INSERT INTO paper_trades' in sql
+    )
+    import json
+    budget = json.loads(insert[10])["paper_risk_budget"]
+    assert budget["risk_capital_usd"] == "10000"
+    assert budget["quarantined_usd"] == "0"
+    assert budget["closed_quarantined_count"] == 0
+    assert budget["costs_certified"] is False
+    assert budget["funding_unknown_is_zero"] is False
+    assert budget["paper_only"] is True
     assert any('INSERT INTO paper_order_events' in sql for sql, _ in calls)
     assert any('UPDATE paper_position_state' in sql for sql, _ in calls)
 
