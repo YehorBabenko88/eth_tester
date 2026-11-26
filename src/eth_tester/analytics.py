@@ -8,6 +8,8 @@ TF_SECONDS={"1":60,"3":180,"5":300,"15":900,"30":1800,
 # A single live recomputation must never materialize an unbounded number of
 # distinct bucket/price/side groups in the Python worker.
 MAX_LIVE_FOOTPRINT_GROUPS = 8192
+# Fail before mutating any feature if the bounded live window is over budget.
+MAX_ENRICH_FEATURE_ROWS = 1536
 
 def floor_time(ts,seconds):
     return datetime.fromtimestamp(int(ts.timestamp())//seconds*seconds,timezone.utc)
@@ -155,13 +157,26 @@ def enrich_features(settings, tf="1", hours=24):
     """
     if tf not in TF_SECONDS:
         raise ValueError("Unsupported live interval")
+    if type(hours) is not int or not 1 <= hours <= 24:
+        raise ValueError("Live enrichment hours must be an integer in 1..24")
     from .book_analysis import snapshot_metrics
 
     with connection(settings) as conn:
+        # PostgreSQL 17+ transaction_timeout bounds the entire multi-statement
+        # transaction. Statement and lock timeouts alone do not bound it.
+        # Timeout, over-budget rows or a failed UPDATE abort ALL feature writes.
+        conn.execute("SET LOCAL transaction_timeout = '30000ms'")
+        conn.execute("SET LOCAL statement_timeout = '10000ms'")
+        conn.execute("SET LOCAL lock_timeout = '2000ms'")
+        # Fix the interval at a database clock instant and EXCLUDE future rows.
+        db_now = conn.execute("SELECT clock_timestamp() AS ts").fetchone()["ts"]
         rows = conn.execute("""SELECT ts,delta,volume,quality FROM features
-            WHERE symbol=%s AND tf=%s
-              AND ts>=now()-(%s || ' hours')::interval ORDER BY ts""",
-            (settings.symbol, tf, hours)).fetchall()
+            WHERE symbol=%s AND tf=%s AND ts >= %s AND ts < %s
+            ORDER BY ts LIMIT %s""",
+            (settings.symbol, tf, db_now - timedelta(hours=hours), db_now,
+             MAX_ENRICH_FEATURE_ROWS + 1)).fetchall()
+        if len(rows) > MAX_ENRICH_FEATURE_ROWS:
+            raise RuntimeError("live_enrichment_row_budget_exceeded")
         if not rows:
             return 0
         seed = conn.execute("""SELECT ts,cvd FROM features WHERE symbol=%s AND tf=%s
