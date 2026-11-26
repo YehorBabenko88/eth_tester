@@ -92,14 +92,20 @@ def test_no_signal_records_full_rules_identity(monkeypatch):
                 saved.append(params)
                 import json
                 return Result({'decision':params[3],'reason':json.loads(params[4])})
-            if 'feed_health' in sql: return Result({'status':'connected'})
+            if 'feed_health' in sql:
+                return Result({'status':'connected'})
             if 'ORDER BY ts DESC,trade_id DESC LIMIT 1' in sql:
                 return Result({'ts':now-timedelta(seconds=1),'price':D(100)})
-            if "paper_trades WHERE state='open'" in sql: return Result(None)
-            if 'FROM bot_control' in sql: return Result({'enabled':True,'paused':False})
-            if 'FROM data_gaps' in sql: return Result(None)
-            if 'FROM candles' in sql: return Result(list(reversed(bars)))
-            if 'FROM strategy_signals' in sql: return Result(None)
+            if "paper_trades WHERE state='open'" in sql:
+                return Result(None)
+            if 'FROM bot_control' in sql:
+                return Result({'enabled':True,'paused':False})
+            if 'FROM data_gaps' in sql:
+                return Result(None)
+            if 'FROM candles' in sql:
+                return Result(list(reversed(bars)))
+            if 'FROM strategy_signals' in sql:
+                return Result(None)
             if "pg_try_advisory_xact_lock(20991991)" in sql:
                 return Result({"acquired": True})
             return Result(None)

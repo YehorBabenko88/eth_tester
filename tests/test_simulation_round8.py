@@ -132,20 +132,27 @@ def test_nonretryable_D_rejection_is_terminal(monkeypatch):
             if "INSERT INTO strategy_signals" in sql:
                 self.saved={"decision":params[3],"reason":json.loads(params[4])}
                 return Result(self.saved)
-            if "feed_health" in sql:return Result({"status":"connected"})
+            if "feed_health" in sql:
+                return Result({"status":"connected"})
             if "ORDER BY ts DESC,trade_id DESC LIMIT 1" in sql:
                 return Result({"ts":datetime.now(timezone.utc)
                                -timedelta(milliseconds=100),"price":Decimal(100)})
-            if "paper_trades WHERE state='open'" in sql:return Result(None)
-            if "bot_control" in sql:return Result({"enabled":True,"paused":False})
-            if "data_gaps" in sql:return Result(None)
-            if "FROM candles" in sql:return Result(list(reversed(candles)))
+            if "paper_trades WHERE state='open'" in sql:
+                return Result(None)
+            if "bot_control" in sql:
+                return Result({"enabled":True,"paused":False})
+            if "data_gaps" in sql:
+                return Result(None)
+            if "FROM candles" in sql:
+                return Result(list(reversed(candles)))
             if "pg_try_advisory_xact_lock(20991991)" in sql:
                 return Result({"acquired": True})
             if sql.startswith("SET LOCAL"):
                 return Result(None)
-            if "pg_advisory_xact_lock" in sql:return Result(None)
-            if "FROM strategy_signals" in sql:return Result(self.saved)
+            if "pg_advisory_xact_lock" in sql:
+                return Result(None)
+            if "FROM strategy_signals" in sql:
+                return Result(self.saved)
             raise AssertionError(sql)
     db=DB()
     monkeypatch.setattr(runner,"connection",lambda *a:db)

@@ -103,7 +103,9 @@ def test_snapshot_must_be_canonical_and_pinned_in_same_transaction():
          "computed_at":BASE+timedelta(minutes=1,seconds=20),
          "provenance":provenance}
     class FakeDB:
-        def __init__(self): self.row=dict(row);self.queries=[]
+        def __init__(self):
+            self.row = dict(row)
+            self.queries = []
         def execute(self,query,params=None):
             self.queries.append((query,params))
             return self

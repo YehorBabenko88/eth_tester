@@ -31,7 +31,9 @@ class ResearchFakePg:
         self.present,self.closed=present,closed
         self.count,self.lease=count,lease
         self.duplicate,self.slow=duplicate,slow
-        self.history=[]; self.stored=[]; self.clocks=0
+        self.history = []
+        self.stored = []
+        self.clocks = 0
         self.candles=[{"ts":TARGET-timedelta(minutes=i),
                        "open":Decimal(100),"high":Decimal(101),
                        "low":Decimal(99),"close":Decimal(100),
@@ -44,7 +46,8 @@ class ResearchFakePg:
     def execute(self,sql,params=None):
         q=" ".join(sql.split())
         self.history.append((q,params))
-        if q.startswith("SET LOCAL"): return One(None)
+        if q.startswith("SET LOCAL"):
+            return One(None)
         if "SELECT clock_timestamp() AS ts" in q:
             self.clocks+=1
             return One({"ts":NOW+timedelta(seconds=91) if self.slow and self.clocks>1 else NOW})
@@ -52,10 +55,12 @@ class ResearchFakePg:
             return One({"acquired":self.lease})
         if "FROM strategy_signals" in q:
             return One({"one":1} if self.duplicate else None)
-        if "FROM candles" in q: return One(list(reversed(self.candles)))
+        if "FROM candles" in q:
+            return One(list(reversed(self.candles)))
         if "FROM feed_health" in q:
             return One({"status":"connected" if self.connected else "disconnected"})
-        if "FROM data_gaps" in q: return One({"one":1} if self.gap else None)
+        if "FROM data_gaps" in q:
+            return One({"one":1} if self.gap else None)
         if "INSERT INTO strategy_signals" in q:
             self.stored.append((params[3],params[4]))
             return One({"decision":params[3]})

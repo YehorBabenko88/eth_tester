@@ -22,10 +22,10 @@ def paper_stub(monkeypatch):
 
 def test_estimate_trade_both_sides_and_invalid(monkeypatch):
     p = paper_stub(monkeypatch)
-    l = p.estimate_trade('long', 100, 105, 1000, D('.00055'), D(2))
+    long_trade = p.estimate_trade('long', 100, 105, 1000, D('.00055'), D(2))
     s = p.estimate_trade('short', 100, 95, 1000, D('.00055'), D(2))
-    assert l['net'] > 0 and s['net'] > 0
-    assert l['fees'] > 0 and s['fees'] > 0
+    assert long_trade['net'] > 0 and s['net'] > 0
+    assert long_trade['fees'] > 0 and s['fees'] > 0
     with pytest.raises(ValueError):
         p.estimate_trade('long', 'NaN', 110, 1000, D('.00055'), D(2))
     with pytest.raises(ValueError):
@@ -46,12 +46,16 @@ def test_open_uses_actual_event_timestamp_and_version(monkeypatch):
             if 'FROM paper_position_state' in sql:
                 return Result({'paper_trade_id': None, 'version': 0,
                                'pending_exit': False, 'processed_cursor': None})
-            if 'SELECT enabled' in sql: return Result({'enabled': True, 'paused': False})
-            if 'SELECT 1 FROM paper_trades' in sql: return Result(None)
+            if 'SELECT enabled' in sql:
+                return Result({'enabled': True, 'paused': False})
+            if 'SELECT 1 FROM paper_trades' in sql:
+                return Result(None)
             if 'SELECT equity' in sql:
                 return Result({'equity': D(10000), 'initial_equity': D(10000)})
-            if 'coalesce(sum' in sql: return Result({'pnl': D(0)})
-            if 'INSERT INTO paper_trades' in sql: return Result({'id': 11})
+            if 'coalesce(sum' in sql:
+                return Result({'pnl': D(0)})
+            if 'INSERT INTO paper_trades' in sql:
+                return Result({'id': 11})
             return Result(None)
     monkeypatch.setattr(p, 'connection', lambda settings: Conn())
     settings = types.SimpleNamespace(symbol='ETHUSDT', initial_notional_usd=D(1000),

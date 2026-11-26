@@ -183,7 +183,6 @@ def test_missing_live_proof_can_retry_until_opened_but_not_replay(monkeypatch):
              "open": Decimal(100), "high": Decimal(101), "low": Decimal(99),
              "close": Decimal(100), "volume": Decimal(20)}
             for i in range(35)]
-    captured = []
     class DB:
         record = None
         def __enter__(self):
@@ -278,14 +277,20 @@ def test_old_bar_is_terminal_no_late_archive_reentry(monkeypatch):
         def __enter__(self): return self
         def __exit__(self,*args): return None
         def execute(self,sql,params=None):
-            if "feed_health" in sql: return Result({"status":"connected"})
+            if "feed_health" in sql:
+                return Result({"status":"connected"})
             if "ORDER BY ts DESC,trade_id DESC LIMIT 1" in sql:
                 return Result({"ts":now-timedelta(seconds=1),"price":Decimal(100)})
-            if "paper_trades WHERE state='open'" in sql: return Result(None)
-            if "bot_control" in sql: return Result({"enabled":True,"paused":False})
-            if "data_gaps" in sql: return Result(None)
-            if "FROM candles" in sql: return Result(list(reversed(bars)))
-            if "FROM strategy_signals" in sql: return Result(None)
+            if "paper_trades WHERE state='open'" in sql:
+                return Result(None)
+            if "bot_control" in sql:
+                return Result({"enabled":True,"paused":False})
+            if "data_gaps" in sql:
+                return Result(None)
+            if "FROM candles" in sql:
+                return Result(list(reversed(bars)))
+            if "FROM strategy_signals" in sql:
+                return Result(None)
             if "INSERT INTO strategy_signals" in sql:
                 assert params[3] == "expired_missing_proof"
                 return Result({"decision":params[3],

@@ -11,9 +11,10 @@ from .orderflow import confirm_rejection
 from .simulation.crossing import resolve_first_crossing
 from .simulation.review import review_one_closed_trade
 
-LOGGER=logging.getLogger(__name__)
 from .simulation.identity import (bind_snapshot_reference, require_new_strategy_identity,
                                   rule_identity)
+
+LOGGER=logging.getLogger(__name__)
 
 def estimated_funding(conn,settings,opened,observed,qty,entry,direction,*,with_events=False):
     """Never synthesize funding from entry price: require event-time mark evidence.
