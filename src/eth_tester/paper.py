@@ -154,26 +154,20 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
             WHERE id=1 FOR UPDATE""").fetchone()
         if not account:
             raise RuntimeError("Missing paper account")
-        if live_candidate:
-            past=conn.execute("""SELECT notional,net_pnl,funding_verified
-                FROM paper_trades WHERE state='closed' ORDER BY id""").fetchall()
-            budget=provisional_budget(account["initial_equity"],
-                                      account["equity"],past,
-                                      settings.initial_notional_usd)
-            risk_capital=budget["risk_capital_usd"]
-            # This is a VIRTUAL non-releasable allocation, not verified
-            # economic capital, actual funding, or permission for ML.
-            context["paper_risk_budget"]={
-                k:str(v) if isinstance(v,Decimal) else v
-                for k,v in budget.items()
-            }
-        else:
-            # QA/manual fixtures are visibly unverified and can never
-            # increase risk via a positive provisional balance.
-            risk_capital=min(number(account["equity"]),
-                             number(account["initial_equity"]))
-            if risk_capital<=0:
-                raise RuntimeError("Paper equity exhausted")
+        # Every entry path must consume the SAME finite virtual budget.
+        # Direct/manual QA is not B-certified, but is not a capital bypass.
+        # Recompute from committed closes under global + account locks.
+        past=conn.execute("""SELECT notional,net_pnl,funding_verified
+            FROM paper_trades WHERE state='closed' ORDER BY id""").fetchall()
+        budget=provisional_budget(account["initial_equity"],
+                                  account["equity"],past,
+                                  settings.initial_notional_usd)
+        risk_capital=budget["risk_capital_usd"]
+        # Not an economic loss bound, verified funding or permission for ML.
+        context["paper_risk_budget"]={
+            k:str(v) if isinstance(v,Decimal) else v
+            for k,v in budget.items()
+        }
         daily=conn.execute("""SELECT coalesce(sum(net_pnl),0) AS pnl FROM paper_trades
           WHERE state='closed' AND closed_at>=%s""",(event_at.replace(hour=0,minute=0,second=0,microsecond=0),)).fetchone()["pnl"]
         if daily<0 and -daily>=risk_capital*settings.max_daily_drawdown:

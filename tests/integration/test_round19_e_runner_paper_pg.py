@@ -4,7 +4,7 @@ Synthetic D signal and B admission proof are explicitly test-local: this
 proves runner -> actual open_paper -> actual PostgreSQL atomic insertion, NOT
 authentic WS/OI/L2 evidence or exchange trading/economic certification.
 """
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from uuid import uuid4
@@ -176,3 +176,89 @@ def test_real_runner_and_paper_insert_atomic_paper_ledger(disposable_e19_pg,
         assert conn.execute(
             "SELECT count(*) AS n FROM paper_order_events WHERE action='entry'"
         ).fetchone()["n"] == 1
+
+
+def test_manual_qa_cannot_reset_closed_nominal_quarantine(disposable_e19_pg):
+    """Actual disposable PG ledger: manual QA cannot evade virtual reserve.
+
+    QA entries are deliberately unverified, NOT autonomous D/B admissions,
+    actual exchange fills, verified funding, or ML-certified performance.
+    """
+    settings = disposable_e19_pg
+    reason = {
+        "strategy_version": Parameters().engine_identity(),
+        "rules_version": Parameters().version,
+        **Parameters().identity(),
+        "qa_only": True,
+    }
+    ids = []
+    for index in range(10):
+        trade_id = paper.open_paper(
+            settings, "long", Decimal("100"), Decimal("99.5"),
+            Decimal("105"), dict(reason),
+            observed_at=datetime.now(timezone.utc),
+        )
+        ids.append(trade_id)
+        with connection(settings) as conn:
+            trade = conn.execute(
+                "SELECT notional,state,reason,funding_verified "
+                "FROM paper_trades WHERE id=%s", (trade_id,)
+            ).fetchone()
+            assert trade["notional"] == Decimal("1000")
+            assert trade["state"] == "open"
+            assert trade["funding_verified"] is False
+            budget = trade["reason"]["paper_risk_budget"]
+            assert budget["quarantined_usd"] == str(index * 1000)
+            assert budget["closed_quarantined_count"] == index
+            assert budget["costs_certified"] is False
+            assert budget["funding_unknown_is_zero"] is False
+            assert trade["reason"].get("paper_live_snapshot_key") is None
+            assert trade["reason"].get("ml_eligible") is not True
+            assert conn.execute(
+                "SELECT count(*) AS n FROM paper_trades WHERE state='open'"
+            ).fetchone()["n"] == 1
+        assert paper.close_paper(
+            settings, Decimal("105"), "manual_qa_unverified",
+            observed_at=datetime.now(timezone.utc), expected_id=trade_id,
+        ) == trade_id
+
+    assert len(set(ids)) == 10
+    with connection(settings) as conn:
+        before = conn.execute(
+            "SELECT count(*) AS n FROM paper_trades"
+        ).fetchone()["n"]
+        assert before == 10
+        assert conn.execute(
+            "SELECT count(*) AS n FROM paper_order_events"
+        ).fetchone()["n"] == 20
+        state = conn.execute(
+            "SELECT paper_trade_id,version FROM paper_position_state "
+            "WHERE singleton=true"
+        ).fetchone()
+        assert state["paper_trade_id"] is None
+        assert state["version"] == 20
+
+    # Fresh connection recomputes full spent nominal. Profitable provisional
+    # closes cannot unlock an eleventh trade, even via direct/manual QA.
+    with pytest.raises(RuntimeError, match="budget exhausted or uncertified"):
+        paper.open_paper(
+            settings, "long", Decimal("100"), Decimal("99.5"),
+            Decimal("105"), dict(reason),
+            observed_at=datetime.now(timezone.utc),
+        )
+    with connection(settings) as conn:
+        assert conn.execute(
+            "SELECT count(*) AS n FROM paper_trades"
+        ).fetchone()["n"] == before
+        assert conn.execute(
+            "SELECT count(*) AS n FROM paper_order_events"
+        ).fetchone()["n"] == 20
+        assert conn.execute(
+            "SELECT count(*) AS n FROM paper_trades WHERE state='open'"
+        ).fetchone()["n"] == 0
+        state = conn.execute(
+            "SELECT paper_trade_id,version FROM paper_position_state "
+            "WHERE singleton=true"
+        ).fetchone()
+        assert state["paper_trade_id"] is None
+        assert state["version"] == 20
