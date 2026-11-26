@@ -140,6 +140,10 @@ def test_nonretryable_D_rejection_is_terminal(monkeypatch):
             if "bot_control" in sql:return Result({"enabled":True,"paused":False})
             if "data_gaps" in sql:return Result(None)
             if "FROM candles" in sql:return Result(list(reversed(candles)))
+            if "pg_try_advisory_xact_lock(20991991)" in sql:
+                return Result({"acquired": True})
+            if sql.startswith("SET LOCAL"):
+                return Result(None)
             if "pg_advisory_xact_lock" in sql:return Result(None)
             if "FROM strategy_signals" in sql:return Result(self.saved)
             raise AssertionError(sql)

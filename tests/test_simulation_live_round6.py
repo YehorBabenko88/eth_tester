@@ -53,7 +53,8 @@ def test_live_paper_binding_never_becomes_training_snapshot():
     assert accepted["paper_live_source_checksum"] == HASH
     assert accepted["paper_live_decision_ms"] == int(DECISION.timestamp() * 1000)
     assert accepted["ml_eligible"] is False and accepted["paper_only"] is True
-    assert not any(name.startswith("ml_") for name in accepted)
+    assert not any(name.startswith("ml_") and name != "ml_eligible"
+                   for name in accepted)
     assert not any(name.startswith("ml_") for name in original)
 
 
@@ -214,6 +215,10 @@ def test_missing_live_proof_can_retry_until_opened_but_not_replay(monkeypatch):
                 return Result(self.record)
             if "clock_timestamp()" in sql:
                 return Result({"ts": datetime.now(timezone.utc)})
+            if "pg_try_advisory_xact_lock(20991991)" in sql:
+                return Result({"acquired": True})
+            if sql.startswith("SET LOCAL"):
+                return Result(None)
             if "pg_advisory_xact_lock(hashtext" in sql:
                 return Result(None)
             raise AssertionError(sql)
@@ -285,6 +290,10 @@ def test_old_bar_is_terminal_no_late_archive_reentry(monkeypatch):
                 assert params[3] == "expired_missing_proof"
                 return Result({"decision":params[3],
                                "reason":json.loads(params[4])})
+            if "pg_try_advisory_xact_lock(20991991)" in sql:
+                return Result({"acquired": True})
+            if sql.startswith("SET LOCAL"):
+                return Result(None)
             if "pg_advisory_xact_lock(hashtext" in sql:
                 return Result(None)
             raise AssertionError(sql)

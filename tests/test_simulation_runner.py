@@ -100,6 +100,8 @@ def test_no_signal_records_full_rules_identity(monkeypatch):
             if 'FROM data_gaps' in sql: return Result(None)
             if 'FROM candles' in sql: return Result(list(reversed(bars)))
             if 'FROM strategy_signals' in sql: return Result(None)
+            if "pg_try_advisory_xact_lock(20991991)" in sql:
+                return Result({"acquired": True})
             return Result(None)
     monkeypatch.setattr(runner,'connection',lambda *a:Conn())
     assert runner.engine_tick(types.SimpleNamespace(symbol='ETHUSDT',

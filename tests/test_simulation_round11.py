@@ -101,7 +101,8 @@ def test_canonical_funding_selects_mark_within_1s_and_original_db_rows():
             assert "FROM funding f" in sql and "market_ticker_events m" in sql
             assert "m.exchange_ts>=f.ts-interval '1 second'" in sql
             assert "ORDER BY m.exchange_ts DESC,m.id DESC" in sql
-            assert params==("ETHUSDT",TRADE["opened_at"],BAR)
+            assert "m.received_ts<=%s" in sql
+            assert params==(BAR,"ETHUSDT",TRADE["opened_at"],BAR)
             return Result([{"ts":BAR,"rate":D(".0001"),"mark_price":D(100)}])
     rows=_canonical_funding_rows(FundingDB(),"ETHUSDT",TRADE["opened_at"],BAR)
     assert rows[0]["rate"]==D(".0001")

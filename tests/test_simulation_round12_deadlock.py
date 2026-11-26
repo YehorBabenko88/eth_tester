@@ -58,7 +58,8 @@ class FakePg:
             bars=[{"ts":LAST-timedelta(minutes=i),"open":100,"high":101,
                    "low":99,"close":100,"volume":Decimal(100)}
                   for i in range(30,-1,-1)]
-            return One(bars)
+            # SQL requests DESC; engine reverses rows to causal ASC order.
+            return One(list(reversed(bars)))
         if "FROM data_gaps" in q:
             return One(None)
         if "pg_advisory_xact_lock(hashtext" in q:

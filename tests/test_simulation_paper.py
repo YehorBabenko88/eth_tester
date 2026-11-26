@@ -48,7 +48,8 @@ def test_open_uses_actual_event_timestamp_and_version(monkeypatch):
                                'pending_exit': False, 'processed_cursor': None})
             if 'SELECT enabled' in sql: return Result({'enabled': True, 'paused': False})
             if 'SELECT 1 FROM paper_trades' in sql: return Result(None)
-            if 'SELECT equity' in sql: return Result({'equity': D(10000)})
+            if 'SELECT equity' in sql:
+                return Result({'equity': D(10000), 'initial_equity': D(10000)})
             if 'coalesce(sum' in sql: return Result({'pnl': D(0)})
             if 'INSERT INTO paper_trades' in sql: return Result({'id': 11})
             return Result(None)

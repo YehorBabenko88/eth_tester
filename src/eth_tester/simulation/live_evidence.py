@@ -86,7 +86,8 @@ def verify_live_paper_row(conn, *, symbol, reason, decision_at):
             or reason.get("paper_only") is not True
             or reason.get("ml_eligible") is not False
             or reason.get("paper_live_decision_ms") != _ms(decision)
-            or any(k.startswith("ml_") for k in reason)):
+            or any(k.startswith("ml_") and k != "ml_eligible"
+                   for k in reason)):
         raise ValueError("Unverified original live paper decision")
     # Shared prospective-source lock; A's disconnect/reconnect writer must
     # acquire the SAME transaction lock before publishing feed/gap changes.
