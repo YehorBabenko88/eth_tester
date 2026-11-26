@@ -234,6 +234,8 @@ def test_daily_archive_requires_every_minute_and_matching_checksum():
         "qty": "1", "trade_id": "4",
     }]
     valid = verified_provenance()
+    # Archive verification must occur after BOTH sampled minutes close.
+    valid["archive"]["checked_at"] = END + timedelta(minutes=1, seconds=6)
     valid["minute_checks"].append({
         **valid["minute_checks"][0], "minute_ts": END,
         "trade_count": 1, "trade_base_qty": "1",

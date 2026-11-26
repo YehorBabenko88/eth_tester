@@ -201,6 +201,8 @@ def test_invalid_row_identity_quality_and_clocks_are_denied(field, value):
     ("contract", "eth_feature_snapshot_v2"),
     ("quality", "complete"), ("paper_only", False),
     ("ml_eligible", True), ("proves_all_trade_ids", True),
+    ("complete_trade_ids_proven", True),
+    ("is_historical_certified", True),
     ("source_receipt_ms", _ms(END + timedelta(seconds=9))),
     ("source_checked_at_ms", _ms(NOW + timedelta(seconds=10))),
 ])

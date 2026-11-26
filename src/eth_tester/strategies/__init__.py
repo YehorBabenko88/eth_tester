@@ -32,6 +32,8 @@ def strategy_identity(parameters=None):
 
 def pattern(side, level, prior, bar, broken):
     """Return direction and pattern using only already closed bars."""
+    if side not in ("resistance", "support"):
+        return None
     p, c, o, h, low = map(D, (prior["close"], bar["close"], bar["open"], bar["high"], bar["low"]))
     if side == "resistance":
         if not broken and p <= level < c:

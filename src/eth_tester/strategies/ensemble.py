@@ -89,12 +89,12 @@ def _validated_bars(closed_candles, *, decision_at=None):
             raise ValueError("open_candle_unavailable")
         if decision_at is not None and stamp + timedelta(minutes=1) > decision_at:
             raise ValueError("future_candle_relative_to_observation")
-        o, h, l, c, volume = (_decimal(raw[k]) for k in
+        o, h, low, c, volume = (_decimal(raw[k]) for k in
                             ("open", "high", "low", "close", "volume"))
-        if not (0 < l <= min(o, c) <= max(o, c) <= h and volume >= 0):
+        if not (0 < low <= min(o, c) <= max(o, c) <= h and volume >= 0):
             raise ValueError("invalid_ohlcv_candle")
         result.append({"ts": stamp, "open": o, "high": h,
-                       "low": l, "close": c, "volume": volume})
+                       "low": low, "close": c, "volume": volume})
         previous = stamp
     return result
 
@@ -237,7 +237,7 @@ def _evaluate_shadow_ensemble_impl(closed_candles, *, taker_fee_rate=Decimal("0.
         fee, slip = _decimal(taker_fee_rate), _decimal(slippage_bps)
         if fee < 0 or fee >= Decimal("0.05") or slip < 0 or slip >= Decimal(100):
             raise ValueError("fee_or_slippage_outside_research_limits")
-        last, previous = bars[-1], bars[-2]
+        last = bars[-1]
         as_of = last["ts"] + timedelta(minutes=1)
         atr = _atr(bars)
         if atr <= 0:

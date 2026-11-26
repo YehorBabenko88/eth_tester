@@ -202,7 +202,7 @@ def evaluate(conn, bar_volume=D(50), now=NOW):
 
 def test_positive_path_checks_all_required_gates():
     accepted, evidence = evaluate(FakeConn())
-    assert accepted
+    assert accepted, evidence
     assert evidence["score"] == 100
     assert evidence["mtf"]["5"] and evidence["mtf"]["15"] and evidence["mtf"]["60"]
     assert evidence["baseline"] == "five_closed_1m_candles_volume_matched"

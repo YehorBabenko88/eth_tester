@@ -134,7 +134,7 @@ def test_price_signal_includes_engine_hash_and_causal_confirmation():
             low = D("99.6")
         if index == 14:
             opening, high, low, close = (
-                D("99.7"), D("100.6"), D("99.5"), D("99.8"))
+                D("99.7"), D("100.6"), D("99.0"), D("99.8"))
         bars.append({"ts": start + timedelta(minutes=index), "open": opening,
                      "high": high, "low": low, "close": close, "closed": True})
     signal = price_signal(bars)

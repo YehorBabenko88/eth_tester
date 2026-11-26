@@ -74,6 +74,12 @@ def read_live_evidence(conn, symbol, start, end, decision_at):
         evidence = row["evidence"]
         if (not isinstance(evidence, dict)
                 or evidence.get("contract") != CONTRACT
+                or evidence.get("quality") != QUALITY
+                or evidence.get("paper_only") is not True
+                or evidence.get("ml_eligible") is not False
+                or evidence.get("complete_trade_ids_proven") is True
+                or evidence.get("proves_all_trade_ids") is True
+                or evidence.get("is_historical_certified") is True
                 or evidence.get("exchange_complete") is True
                 or evidence.get("is_ml_certified") is True):
             return None
