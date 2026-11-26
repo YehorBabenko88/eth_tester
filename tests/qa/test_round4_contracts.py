@@ -62,6 +62,7 @@ def test_b_c_d_f_share_exact_v2_provenance_contract():
     from eth_tester.storage.snapshots import write_feature_snapshot
     from eth_tester.orderflow import _certified_snapshot
     from eth_tester.ml.extract import from_snapshot_records
+    from eth_tester.ml.contract import validate_snapshot, CONTRACT
 
     writer = inspect.getsource(write_feature_snapshot)
     d_reader = inspect.getsource(_certified_snapshot)
@@ -75,10 +76,14 @@ def test_b_c_d_f_share_exact_v2_provenance_contract():
         "source_coverage_verified",
     ):
         assert key in writer, f"B writer missing {key}"
-    for reader in (d_reader, f_reader):
-        assert "eth_feature_snapshot_v2" in reader
+    assert CONTRACT == "eth_feature_snapshot_v2"
+    assert "validate_snapshot(record, reason)" in f_reader
+    validator = inspect.getsource(validate_snapshot)
+    assert "noncanonical source certification" in validator
+    for reader in (d_reader, validator):
         assert "feature_sources" in reader
         assert "source_receipt_ms" in reader
+    assert "eth_feature_snapshot_v2" in d_reader
 
 
 def test_e_persists_exact_snapshot_identity_and_decision_time():

@@ -175,6 +175,14 @@ def test_supervisor_schedules_only_causal_ml_not_legacy_pnl_training():
     entry = inspect.getsource(cli.main)
     schedule = inspect.getsource(supervisor)
     assert "train_shadow(settings)" not in entry
-    assert "train_causal_shadow" in entry
+    from eth_tester import control_jobs
+
+    facade = inspect.getsource(control_jobs.run_control_job)
+    assert '"train-causal-shadow"' in entry
+    assert '"label-horizons"' in entry
+    assert "run_control_job(settings, job)" in entry
+    assert '"learn"' in entry and '"train-causal-shadow" if args.command == "learn"' in entry
+    assert "train_shadow(settings)" not in facade
+    assert 'JOBS = frozenset(("label-horizons", "train-causal-shadow"))' in inspect.getsource(control_jobs)
     assert "label-horizons" in schedule
-    assert "learn" in schedule
+    assert "train-causal-shadow" in schedule

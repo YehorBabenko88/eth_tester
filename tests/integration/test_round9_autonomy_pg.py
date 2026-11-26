@@ -85,11 +85,11 @@ def test_bounded_diagnostic_clean_two_cycles_preserve_market_history(h9_pg):
     """Cleanup is resumable/idempotent and cannot delete immutable market tape."""
     older = datetime.now(UTC) - timedelta(days=100)
     with connection(h9_pg) as conn:
-        for _ in range(3):
+        for i in range(3):
             conn.execute(
                 """INSERT INTO feed_health(symbol,topic,ts,status,detail)
                    VALUES('ETHUSDT','qa_retention',%s,'partial','{}'::jsonb)""",
-                (older,),
+                (older + timedelta(microseconds=i),),
             )
             conn.execute(
                 """INSERT INTO bot_events(ts,severity,event,data)

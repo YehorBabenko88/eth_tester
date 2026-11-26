@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 
-psycopg = pytest.importorskip("psycopg")
+import psycopg
 from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 

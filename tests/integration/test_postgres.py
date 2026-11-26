@@ -1,6 +1,8 @@
 """Real, isolated PostgreSQL 17/18 integration; never touches user databases."""
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal as D
+from hashlib import sha256
+import json
 import os
 from uuid import uuid4
 
@@ -102,14 +104,42 @@ def test_real_rollup_poc_delta_and_repeat_load(pg_settings):
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     fixtures = [("a", D(100), D(2), "Buy"), ("b", D(100), D(1), "Sell"),
                 ("c", D(101), D(2), "Sell")]
+    from eth_tester.storage.bulk import merge_staged_trades
+    from eth_tester.storage.archive_receipts import persist_archive_stage_bins
+
+    # Genuine disposable PG SHA membership, not an unverified global tape.
+    # Three synthetic prints are NOT a completeness or ML certificate.
+    digest = sha256(b"QA H17 synthetic archive 2026-01-01 v1").hexdigest()
     with connection(pg_settings) as conn:
-        for ident, price, qty, side in fixtures:
-            conn.execute("""INSERT INTO trades
-                (symbol,ts,trade_id,price,qty,side,notional,source)
-                VALUES('ETHUSDT',%s,%s,%s,%s,%s,%s,'archive')""",
-                (start, ident, price, qty, side, price * qty))
-    assert rollup_day(pg_settings, day, "1", "sha-test-1") == 2
-    assert rollup_day(pg_settings, day, "1", "sha-test-1") == 0
+        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        with conn.cursor() as cursor:
+            with cursor.copy("""COPY eth_stage (
+                symbol,ts,trade_id,price,qty,side,notional,source,raw)
+                FROM STDIN""") as copy:
+                for ident, price, qty, side in fixtures:
+                    copy.write_row((
+                        pg_settings.symbol, start, ident, price, qty,
+                        side, price * qty, "archive",
+                        json.dumps({"qa_only": True, "trade_id": ident}),
+                    ))
+        merged = merge_staged_trades(conn, "eth_stage")
+        assert merged["input_rows"] == len(fixtures)
+        witness = persist_archive_stage_bins(
+            conn, pg_settings.symbol, day, digest, len(fixtures),
+            instrument=pg_settings.category,
+        )
+        assert witness["distinct_trade_ids"] == len(fixtures)
+        assert witness["exchange_complete"] is False
+        conn.execute("""INSERT INTO ingestion_job
+            (source,symbol,day,state,row_count,sha256)
+            VALUES('trades_archive',%s,%s,'complete',%s,%s)""",
+            (pg_settings.symbol, day, len(fixtures), digest))
+    with pytest.raises(ValueError, match="archive_job_sha_missing_or_changed"):
+        rollup_day(pg_settings, day, "1", "0" * 64)
+    with pytest.raises(ValueError, match="archive_job_sha_missing_or_changed"):
+        rollup_day(pg_settings, day, "1", sha256(b"other").hexdigest())
+    assert rollup_day(pg_settings, day, "1", digest) == 2
+    assert rollup_day(pg_settings, day, "1", digest) == 0
     with connection(pg_settings) as conn:
         rows = conn.execute("""SELECT price,buy_qty,sell_qty FROM footprint
             WHERE symbol='ETHUSDT' AND tf='1' ORDER BY price""").fetchall()

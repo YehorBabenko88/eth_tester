@@ -112,7 +112,7 @@ def test_crash_before_insert_keeps_db_unchanged_and_retry_single(monkeypatch):
 
 
 def test_research_respects_nondefault_two_minute_embargo(monkeypatch):
-    db=patch_db(monkeypatch)
+    patch_db(monkeypatch)
     tr,va,sh=groups()
     model=fit(tr)
     _,metadata=lifecycle.store_shadow(SimpleNamespace(symbol='ETHUSDT'),model,tr,va,sh,
