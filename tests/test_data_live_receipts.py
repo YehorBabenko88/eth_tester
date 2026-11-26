@@ -5,7 +5,6 @@ Real disposable-PostgreSQL and live-source tests are kept separate.
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 from types import SimpleNamespace
 import json
 

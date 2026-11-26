@@ -13,8 +13,10 @@ class Conn:
     def __init__(self): self.queries=[]
     def execute(self,sql,args=None):
         self.queries.append(sql)
-        if "INSERT INTO trades" in sql:return Row({"trade_id":"tx"})
-        if "INSERT INTO book_events" in sql:return Row({"id":1,"recv_ts":datetime.now(timezone.utc)})
+        if "INSERT INTO trades" in sql:
+            return Row({"trade_id":"tx"})
+        if "INSERT INTO book_events" in sql:
+            return Row({"id":1,"recv_ts":datetime.now(timezone.utc)})
         return Row()
 
 def print_row(qty="1"):
@@ -67,7 +69,9 @@ def test_archive_cursor_is_bounded_and_future_excluded():
 def test_failed_archive_day_does_not_starve_later_day(monkeypatch):
     import asyncio
     async def scenario():
-        start=date(2026,1,1); processed=[]; advances=[]
+        start=date(2026,1,1)
+        processed=[]
+        advances=[]
         class Client:
             async def __aenter__(self):return self
             async def __aexit__(self,*args):pass
@@ -75,11 +79,13 @@ def test_failed_archive_day_does_not_starve_later_day(monkeypatch):
             def __enter__(self):return self
             def __exit__(self,*args):pass
             def execute(self,sql,args=None):
-                if "count(*)" in sql:return Row({"n":1})
+                if "count(*)" in sql:
+                    return Row({"n":1})
                 return Row({"cursor_ts":None})
         async def download(settings,day,client):
             processed.append(day)
-            if day==start:raise DataIntegrityError("corrupt gzip")
+            if day==start:
+                raise DataIntegrityError("corrupt gzip")
             return "complete"
         async def nothing(_):return None
         monkeypatch.setattr(archives,"archive_cycle_plan",lambda s:[("fresh",start),("fresh",start+timedelta(days=1))])
