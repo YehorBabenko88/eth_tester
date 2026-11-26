@@ -18,7 +18,8 @@ NOW = START + timedelta(minutes=1, seconds=10)
 def make_paper_live_row():
     """Synthetic B-row shape for interface logic only, NOT exchange proof."""
     end = START + timedelta(minutes=1)
-    ms = lambda stamp: int(stamp.timestamp() * 1000)
+    def ms(stamp):
+        return int(stamp.timestamp() * 1000)
     def proof(event, received, checked):
         return {
             "source_checksum": "f" * 64, "evidence_ref": "synthetic-sql-only",
@@ -127,7 +128,7 @@ class FakeConn:
             },
         }
 
-    def execute(self, statement, args):
+    def execute(self, statement, args=None):
         if "GROUP BY price" in statement:
             return Result(self.rows)
         if "date_trunc('minute',ts)" in statement:
