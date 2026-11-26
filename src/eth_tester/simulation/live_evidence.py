@@ -53,7 +53,7 @@ def bind_live_paper_reference(reason, *, bar_ts, decision_at):
     if (recorded_bar != bar or not end <= observed <= computed <= decision
             or decision > end + timedelta(seconds=90) or decision > expires):
         raise ValueError("Late, future or mismatched bounded-live evidence")
-    if any(k.startswith("ml_") for k in context):
+    if any(k.startswith("ml_") and k != "ml_eligible" for k in context):
         raise ValueError("Bounded-live paper evidence cannot carry ML binding or labels")
     original = {
         "paper_evidence_tier": _QUALITY,
@@ -64,8 +64,15 @@ def bind_live_paper_reference(reason, *, bar_ts, decision_at):
         "paper_only": True,
         "ml_eligible": False,
     }
+    # Runner pins this before calling open_paper, which binds it again under
+    # the paper transaction. A partial caller-supplied binding must NEVER be
+    # silently completed: only a complete, byte-for-byte value-equivalent
+    # prior binding (with the exact boolean False) may be repeated.
+    pinned_keys = set(original).intersection(context)
+    if pinned_keys and pinned_keys != set(original):
+        raise ValueError("Incomplete original live paper binding")
     for k, v in original.items():
-        if k in context and context[k] != v:
+        if k in context and (type(context[k]) is not type(v) or context[k] != v):
             raise ValueError("Conflicting paper-only immutable admission reason")
     context.update(original)
     return context

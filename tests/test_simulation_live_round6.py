@@ -58,6 +58,46 @@ def test_live_paper_binding_never_becomes_training_snapshot():
     assert not any(name.startswith("ml_") for name in original)
 
 
+def test_live_binding_is_strictly_idempotent_for_actual_runner_to_paper_path():
+    raw = d_reason()
+    once = bind_live_paper_reference(raw, bar_ts=BAR, decision_at=DECISION)
+    twice = bind_live_paper_reference(once, bar_ts=BAR, decision_at=DECISION)
+    assert twice == once
+    assert twice["ml_eligible"] is False
+    assert twice["paper_only"] is True
+    assert "ml_snapshot_key" not in twice and "ml_label" not in twice
+
+
+@pytest.mark.parametrize("change", [
+    {"ml_eligible": 0},
+    {"ml_eligible": True},
+    {"ml_eligible": None},
+    {"paper_only": 1},
+    {"paper_live_snapshot_key": "c" * 64},
+    {"paper_live_decision_ms": int(DECISION.timestamp() * 1000) - 1},
+    {"paper_live_bar_end_ms": int(END.timestamp() * 1000) + 1},
+    {"paper_evidence_tier": "historical_ml"},
+    {"ml_snapshot_key": KEY},
+    {"ml_label": {"future": True}},
+])
+def test_rebinding_never_accepts_tampered_or_ml_promoted_reason(change):
+    bound = bind_live_paper_reference(d_reason(), bar_ts=BAR, decision_at=DECISION)
+    with pytest.raises(ValueError):
+        bind_live_paper_reference({**bound, **change}, bar_ts=BAR,
+                                  decision_at=DECISION)
+
+
+def test_partial_paper_binding_cannot_be_completed_by_trusted_binder():
+    raw = d_reason()
+    for name, value in (
+        ("ml_eligible", False), ("paper_only", True),
+        ("paper_live_snapshot_key", KEY),
+    ):
+        with pytest.raises(ValueError, match="Incomplete"):
+            bind_live_paper_reference({**raw, name: value},
+                                      bar_ts=BAR, decision_at=DECISION)
+
+
 @pytest.mark.parametrize("mutation", [
     {"contract": "eth_feature_snapshot_v2"},
     {"quality": "complete"},
