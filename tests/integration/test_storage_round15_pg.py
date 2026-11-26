@@ -5,7 +5,6 @@ ETH_TEST_PG_DSN and never assert market completeness from synthetic receipts.
 """
 import os
 from datetime import date,datetime,timedelta,timezone
-from decimal import Decimal as D
 from uuid import uuid4
 import psycopg
 from psycopg import sql

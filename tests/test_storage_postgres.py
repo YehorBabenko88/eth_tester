@@ -19,6 +19,7 @@ from psycopg.conninfo import make_conninfo
 import pytest
 
 from eth_tester.database import init_database, connection
+from eth_tester.migrations import MIGRATIONS
 from eth_tester.storage import (
     backup_database, backup_sha256, deletion_manifest,
     drop_owned_database, restore_database, verify_backup,
@@ -95,7 +96,7 @@ def test_concurrent_database_init_is_idempotent(postgres_lab):
     with connection(postgres_lab) as conn:
         assert conn.execute(
             "SELECT count(*) AS n FROM eth_schema_migrations"
-        ).fetchone()["n"] == 8
+        ).fetchone()["n"] == len(MIGRATIONS)
 
 
 def test_copy_replay_and_conflict_rejection(postgres_lab):
@@ -621,7 +622,11 @@ def test_round4_post_horizon_label_ledger_rejects_hindsight(postgres_lab):
         )
         assert record_paper_ml_label(conn, **label_args) == trade_id
         assert record_paper_ml_label(conn, **label_args) == trade_id
-        with pytest.raises(ValueError, match="Conflicting"):
+        # The BEFORE INSERT trigger validates the independently recomputed
+        # OHLC outcome before PostgreSQL evaluates ON CONFLICT DO NOTHING.
+        # Our synthetic candles cross only the lower resistance barrier,
+        # so a conflicting breakout label must fail at the SQL guard.
+        with pytest.raises(psycopg.Error, match="Structural label outcome disagrees"):
             with conn.transaction():
                 record_paper_ml_label(
                     conn, **{**label_args, "outcome": "breakout"}
@@ -643,6 +648,10 @@ def test_round4_post_horizon_label_ledger_rejects_hindsight(postgres_lab):
         ).fetchone()
         assert saved["outcome"] == "bounce"
         assert saved["issued_at"] >= coverage["checked_at"]
+        assert conn.execute(
+            "SELECT count(*) AS n FROM paper_ml_labels WHERE paper_trade_id=%s",
+            (trade_id,),
+        ).fetchone()["n"] == 1
 
 
 def test_round4_label_rejects_open_paper_and_future_horizon(postgres_lab):
