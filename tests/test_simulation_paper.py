@@ -103,7 +103,7 @@ def test_open_uses_actual_event_timestamp_and_version(monkeypatch):
         i for i, (sql, _) in enumerate(calls) if 'INSERT INTO paper_trades' in sql
     )
     import json
-    budget = json.loads(insert[10])["paper_risk_budget"]
+    budget = json.loads(insert[9])["paper_risk_budget"]
     assert budget["risk_capital_usd"] == "10000"
     assert budget["quarantined_usd"] == "0"
     assert budget["closed_quarantined_count"] == 0
