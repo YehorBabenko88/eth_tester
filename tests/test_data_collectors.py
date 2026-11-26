@@ -21,6 +21,9 @@ class Result:
     def fetchone(self):
         return self.value
 
+    def fetchall(self):
+        return self.value if isinstance(self.value, list) else []
+
 
 class FakeConnection:
     def __init__(self):
@@ -30,6 +33,10 @@ class FakeConnection:
 
     def execute(self, sql, params=None):
         self.queries.append((sql, params))
+        if "SELECT clock_timestamp()" in sql:
+            return Result({"ts": datetime.now(UTC)})
+        if "SELECT count(*) AS n" in sql:
+            return Result({"n": 0})
         if "SELECT count(*) AS total FROM data_gaps" in sql:
             return Result({"total": self.missing})
         if "SELECT id FROM data_gaps" in sql:
@@ -215,10 +222,11 @@ def test_archive_conflict_fails_once_and_records_gap(monkeypatch):
     settings = SimpleNamespace(
         archive_start=datetime.now(UTC).date() - timedelta(days=1),
         symbol="ETHUSDT", category="linear", archive_downloads_per_second=1.0)
-    with pytest.raises(DataIntegrityError, match="Conflicting"):
-        asyncio.run(archives.backfill_archives(settings))
+    result = asyncio.run(archives.backfill_archives(settings))
+    assert result["status"] == "partial"
+    assert result["failed"] == 1
     assert calls == ["attempt"]
-    assert any("UPDATE ingestion_job" in q for q, _ in conn.queries)
+    assert any("INSERT INTO ingestion_job" in q for q, _ in conn.queries)
     assert any("INSERT INTO ingestion_coverage" in q for q, _ in conn.queries)
 
 

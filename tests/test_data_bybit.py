@@ -21,8 +21,12 @@ def test_shared_rate_budget_across_independent_instances(tmp_path):
 def test_corrupt_budget_fails_closed(tmp_path):
     path = tmp_path / "budget.json"
     path.write_text("NOT JSON")
-    with pytest.raises(ValueError):
-        SharedRateBudget("https://api.bybit.com", 1, path=path)._update()
+    # Damaged shared state must quarantine, never grant a free request.
+    budget = SharedRateBudget("https://api.bybit.com", 1, path=path)
+    delay = budget._update()
+    assert delay >= 60
+    assert budget._update() > 0
+    assert json.loads(path.read_text())["next"] > 0
 
 
 def test_http_403_is_not_retried(tmp_path):

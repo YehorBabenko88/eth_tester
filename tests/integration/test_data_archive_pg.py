@@ -41,6 +41,36 @@ def data_settings():
             admin.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(dbname)))
 
 
+def _create_archive_stage(conn):
+    """Stage synthetic archive prints with their original-shaped raw JSON.
+
+    The production COPY always provides raw. Synthetic SQL test inserts did
+    not, causing NOT NULL failures before the intended identity assertions.
+    Preserve the strict schema; derive JSON from each inserted fixture row.
+    """
+    conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+    conn.execute("""
+        CREATE FUNCTION pg_temp.stage_fixture_raw() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.raw IS NULL THEN
+                NEW.raw = jsonb_build_object(
+                    'timestamp', extract(epoch FROM NEW.ts)::text,
+                    'trdMatchID', NEW.trade_id,
+                    'symbol', NEW.symbol,
+                    'side', NEW.side,
+                    'price', NEW.price::text,
+                    'size', NEW.qty::text
+                );
+            END IF;
+            RETURN NEW;
+        END $$""")
+    conn.execute("""
+        CREATE TRIGGER stage_fixture_raw_before_insert
+        BEFORE INSERT ON eth_stage FOR EACH ROW
+        EXECUTE FUNCTION pg_temp.stage_fixture_raw()""")
+
+
 def _utc_ms():
     return int(datetime(2026, 1, 1, tzinfo=UTC).timestamp() * 1000)
 
@@ -90,7 +120,7 @@ def test_archive_stage_atomic_conflict_and_preservation(data_settings):
                      (when,))
     with pytest.raises((ValueError, psycopg.Error)):
         with connection(data_settings) as conn:
-            conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+            _create_archive_stage(conn)
             conn.execute("""INSERT INTO eth_stage
                 (symbol,ts,trade_id,price,qty,side,notional,source)
                 VALUES('ETHUSDT',%s,'archive-identity',100,2,'Buy',200,'archive')""",
@@ -105,7 +135,7 @@ def test_archive_stage_atomic_conflict_and_preservation(data_settings):
 def test_archive_stage_identical_replay_idempotent(data_settings):
     when = datetime(2026, 1, 1, tzinfo=UTC)
     with connection(data_settings) as conn:
-        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        _create_archive_stage(conn)
         for _ in range(2):
             conn.execute("""INSERT INTO eth_stage
                 (symbol,ts,trade_id,price,qty,side,notional,source)
@@ -209,7 +239,7 @@ def test_stage_volume_includes_identical_websocket_first_trade(data_settings):
         ingest_ws(conn, "ETHUSDT", {"topic": "publicTrade.ETHUSDT",
             "data": [{"i": "archive-ws-overlap", "T": when_ms, "p": "100",
                       "v": "0.2", "S": "Buy"}]})
-        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        _create_archive_stage(conn)
         for trade_id, qty in (("archive-ws-overlap", Decimal("0.2")),
                               ("archive-only-print", Decimal("0.3"))):
             conn.execute("""INSERT INTO eth_stage(
@@ -252,7 +282,7 @@ def test_archive_first_live_replay_marks_websocket_observation(data_settings):
     stamp = datetime(2026, 1, 4, 0, 3, tzinfo=UTC)
     when_ms = int(stamp.timestamp() * 1000)
     with connection(data_settings) as conn:
-        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        _create_archive_stage(conn)
         conn.execute("""INSERT INTO eth_stage(
             symbol,ts,trade_id,price,qty,side,notional,source)
             VALUES('ETHUSDT',%s,'archive-before-live',100,0.5,
@@ -276,7 +306,7 @@ def test_stage_same_sha_replay_is_immutable(data_settings):
             symbol,kind,tf,ts,open,high,low,close,volume,turnover,source)
             VALUES('ETHUSDT','trade','1',%s,100,100,100,100,1,100,'qa')""",
             (stamp,))
-        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        _create_archive_stage(conn)
         conn.execute("""INSERT INTO eth_stage(
             symbol,ts,trade_id,price,qty,side,notional,source)
             VALUES('ETHUSDT',%s,'stable-archive-print',100,1,
@@ -307,7 +337,7 @@ def test_archive_stage_conflict_does_not_publish_receipts(data_settings):
                    'websocket')""", (stamp,))
     with pytest.raises((ValueError, psycopg.Error)):
         with connection(data_settings) as conn:
-            conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+            _create_archive_stage(conn)
             conn.execute("""INSERT INTO eth_stage(
                 symbol,ts,trade_id,price,qty,side,notional,source)
                 VALUES('ETHUSDT',%s,'global-conflict',100,2,'Buy',200,
@@ -355,7 +385,7 @@ def test_sha_archive_membership_excludes_ws_only_not_ws_overlap(data_settings):
                 symbol,ts,trade_id,price,qty,side,notional,source)
                 VALUES('ETHUSDT',%s,%s,100,%s,'Buy',%s,'websocket')""",
                 (at, identity, qty, qty*100))
-        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        _create_archive_stage(conn)
         for identity, qty in (("ws-overlap", Decimal("0.2")),
                               ("archive-only", Decimal("0.3"))):
             conn.execute("""INSERT INTO eth_stage(
@@ -394,7 +424,7 @@ def test_archive_sha_pinned_recheck_after_official_candles(data_settings):
     at = datetime.combine(day, datetime.min.time(), UTC)
     sha = "7" * 64
     with connection(data_settings) as conn:
-        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        _create_archive_stage(conn)
         conn.execute("""INSERT INTO eth_stage(
             symbol,ts,trade_id,price,qty,side,notional,source)
             VALUES('ETHUSDT',%s,'late-candle-print',100,2,
@@ -613,7 +643,7 @@ def test_archive_recheck_late_official_candles_appends_never_rewrites(data_setti
     start = datetime.combine(day, datetime.min.time(), UTC)
     digest = "a" * 64
     with connection(data_settings) as conn:
-        conn.execute("CREATE TEMP TABLE eth_stage (LIKE trades) ON COMMIT DROP")
+        _create_archive_stage(conn)
         conn.execute("""INSERT INTO eth_stage(
             symbol,ts,trade_id,price,qty,side,notional,source)
             VALUES('ETHUSDT',%s,'source-tape-id',100,2,

@@ -47,6 +47,32 @@ class SharedRateBudget:
             fcntl.flock(file.fileno(), fcntl.LOCK_UN)
 
     def _update(self, cooldown=0):
+        # Serialize initialization itself: a second process must not see
+        # a newly created, still-empty budget as a corrupt old file.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        guard_path = self.path.with_name(self.path.name + ".lock")
+        if guard_path.is_symlink():
+            raise BybitError("Shared REST budget guard must not be a symlink")
+        flags = (os.O_CREAT | os.O_RDWR |
+                 getattr(os, "O_BINARY", 0) |
+                 getattr(os, "O_CLOEXEC", 0) |
+                 getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(guard_path, flags, 0o600)
+        with os.fdopen(fd, "r+b") as guard:
+            info = os.fstat(guard.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise BybitError("Shared REST budget guard must be a regular file")
+            if os.name != "nt":
+                if info.st_uid != os.geteuid():
+                    raise BybitError("Shared REST budget guard has a different owner")
+                os.fchmod(guard.fileno(), 0o600)
+            self._lock(guard)
+            try:
+                return self._update_under_guard(cooldown)
+            finally:
+                self._unlock(guard)
+
+    def _update_under_guard(self, cooldown=0):
         """Recover truncated shared budget under OS lock without rate-limit bypass.
 
         A terminated writer can leave malformed JSON. Instead of crashing every
