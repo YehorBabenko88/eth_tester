@@ -46,6 +46,10 @@ class FakeDb:
         if "FROM trades t" in sql:
             assert params[-1] == analytics.MAX_LIVE_FOOTPRINT_GROUPS + 1
             return Cursor(rows=self.grouped[:params[-1]])
+        # The archive query contains an EXISTS(SELECT 1 FROM aggregation_job);
+        # match the outer ingestion query first, not the nested SELECT.
+        if "FROM ingestion_job i" in sql:
+            return Cursor(one=self.archive)
         if "SELECT 1 FROM aggregation_job" in sql:
             return Cursor(one=None)
         if "SELECT ts,delta,volume,quality FROM features" in sql:
@@ -60,8 +64,6 @@ class FakeDb:
             return Cursor(one=None)
         if "FROM market_book_state" in sql:
             return Cursor(one=None)
-        if "FROM ingestion_job i" in sql:
-            return Cursor(one=self.archive)
         if sql.startswith("UPDATE features SET cvd"):
             self.updated = params
             self.mutations.append(sql)

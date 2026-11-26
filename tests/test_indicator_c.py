@@ -38,3 +38,34 @@ def test_state_json_replay_gives_equal_result():
     a, _ = next_indicators(state, bar(12, 10, 11), period=2)
     b, _ = next_indicators(replay, bar(12, 10, 11), period=2)
     assert a == b
+
+
+def test_post_warmup_json_restart_and_fourth_closed_candle():
+    import json
+
+    state = {}
+    for item in (bar(11, 9, 10), bar(12, 10, 11)):
+        state, _ = next_indicators(state, item, period=2)
+    assert state["initial_tr"] is None
+    restored = json.loads(json.dumps(state))
+    original_next, third = next_indicators(state, bar(15, 9, 14), period=2)
+    resumed_next, resumed_third = next_indicators(restored, bar(15, 9, 14),
+                                                 period=2)
+    assert third == resumed_third
+    assert original_next == resumed_next
+    assert third["atr"] == Decimal(4)
+    last_state, fourth = next_indicators(resumed_next, bar(16, 14, 15),
+                                         period=2)
+    assert fourth["atr"] == Decimal(3)
+    assert last_state["initial_tr"] is None
+    assert len(last_state["returns"]) == 2
+
+
+def test_missing_warmup_or_post_warmup_checkpoint_fails_closed():
+    state, _ = next_indicators({}, bar(11, 9, 10), period=2)
+    with pytest.raises(ValueError, match="Missing Wilder initial TR"):
+        next_indicators({**state, "initial_tr": None},
+                        bar(12, 10, 11), period=2)
+    state, _ = next_indicators(state, bar(12, 10, 11), period=2)
+    with pytest.raises(ValueError, match="Missing Wilder ATR checkpoint"):
+        next_indicators({**state, "atr": None}, bar(15, 9, 14), period=2)

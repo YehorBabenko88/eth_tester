@@ -25,10 +25,14 @@ def next_indicators(state, candle, *, period=14):
     prev = decimal(state["last_close"]) if state.get("last_close") is not None else None
     tr = max(h - low, abs(h - prev), abs(low - prev)) if prev is not None else h - low
     n = int(state.get("n", 0)) + 1
-    sum_tr = decimal(state.get("initial_tr", "0"))
+    # The warmup accumulator is intentionally removed once Wilder ATR exists.
+    # Never parse a stored None as Decimal on the first post-warmup candle.
+    sum_tr = None
     atr = decimal(state["atr"]) if state.get("atr") is not None else None
     if n <= period:
-        sum_tr += tr
+        if n > 1 and state.get("initial_tr") is None:
+            raise ValueError("Missing Wilder initial TR checkpoint")
+        sum_tr = decimal(state.get("initial_tr", "0")) + tr
         if n == period:
             atr = sum_tr / period
     else:
