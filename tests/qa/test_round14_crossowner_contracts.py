@@ -91,30 +91,36 @@ def test_missing_real_utc_observation_clock_not_replaced_by_backfill():
         assert result["ml_eligible"] is False
 
 
-def test_equal_volume_not_promoted_to_exchange_complete(monkeypatch):
-    """Complete archive job plus identical quantities is NOT trade-ID proof."""
+@pytest.mark.parametrize("stage_sha_present", [False, True])
+def test_equal_volume_not_promoted_to_exchange_complete(monkeypatch, stage_sha_present):
+    """Equal volume is parity only; missing original stage SHA stays partial."""
+    import json
+
     from eth_tester import analytics
     stamp = datetime(2026, 11, 24, 12, tzinfo=timezone.utc)
     updates = []
+    queries = []
 
     class Rows:
         def __init__(self, one=None, many=None):
             self.one = one
             self.many = many if many is not None else []
+
         def fetchone(self):
             return self.one
+
         def fetchall(self):
             return self.many
 
     class FakeConn:
         def execute(self, sql, args=None):
             query = " ".join(str(sql).split())
-            if query.startswith("SELECT ts,delta,volume FROM features"):
+            queries.append(query)
+            if query.startswith("SELECT ts,delta,volume,quality FROM features"):
                 return Rows(many=[{"ts": stamp, "delta": Decimal(0),
-                                   "volume": Decimal("0.001")}])
-            if "SELECT ts,cvd FROM features" in query:
-                return Rows()
-            if "SELECT 1 FROM features" in query:
+                                   "volume": Decimal("0.001"),
+                                   "quality": "partial_unverified"}])
+            if "SELECT ts,cvd FROM features" in query or "SELECT 1 FROM features" in query:
                 return Rows()
             if "FROM candles" in query:
                 return Rows(one={"volume": Decimal("0.001")})
@@ -122,9 +128,13 @@ def test_equal_volume_not_promoted_to_exchange_complete(monkeypatch):
                 return Rows()
             if "FROM market_book_state" in query:
                 return Rows()
-            if "FROM ingestion_job" in query:
-                return Rows(one={"state": "complete"})
-            if "UPDATE features SET" in query:
+            if "FROM ingestion_job i" in query:
+                assert "FROM archive_stage_receipts" in query
+                assert "FROM aggregation_job a" in query
+                return Rows(one={"state": "complete", "sha256": "a" * 64,
+                                 "stage_sha_present": stage_sha_present,
+                                 "rollup_sha_present": True})
+            if query.startswith("UPDATE features SET cvd="):
                 updates.append(args)
                 return Rows()
             raise AssertionError("Unexpected C QA query: " + query[:150])
@@ -135,13 +145,19 @@ def test_equal_volume_not_promoted_to_exchange_complete(monkeypatch):
 
     monkeypatch.setattr(analytics, "connection", fake_db)
     assert analytics.enrich_features(
-        SimpleNamespace(symbol="ETHUSDT"), tf="1", hours=1
+        SimpleNamespace(symbol="ETHUSDT", category="linear"), tf="1", hours=1
     ) == 1
     assert len(updates) == 1
-    assert updates[0][4] in (
-        "volume_parity_only_unverified", "archive_rollup_partial"
-    )
-
+    assert any("FROM ingestion_job i" in q for q in queries)
+    expected_quality = ("volume_parity_only_unverified"
+                        if stage_sha_present else "partial_unverified")
+    expected_check = ("parity_only_not_trade_id_completeness"
+                      if stage_sha_present else "archive_sha_membership_missing")
+    assert updates[0][4] == expected_quality
+    metadata = json.loads(updates[0][5])
+    assert metadata["volume_check"] == expected_check
+    assert metadata["volume_sha_membership_present"] is stage_sha_present
+    assert metadata["volume_exchange_complete"] is False
 
 def test_forged_verified_paper_net_cannot_override_missing_funding():
     from eth_tester.ml.extract import _require_complete_paper_economics

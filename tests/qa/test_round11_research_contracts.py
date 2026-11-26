@@ -26,7 +26,8 @@ def test_review_drawdown_excludes_later_trade_and_ignores_forged_ml(monkeypatch)
         "closed_at": closing, "exit_reason": "qa_only",
         "entry": Decimal("3000"), "net_pnl": Decimal("1"),
         "gross_pnl": Decimal("2"), "fee_paid": Decimal("0.5"),
-        "funding_paid": Decimal("0.5"), "entry_chart": None, "exit_chart": None,
+        "funding_paid": Decimal("0.5"), "funding_verified": False,
+        "entry_chart": None, "exit_chart": None,
         "reason": {"ml_eligible": True, "exchange_fill_proven": True},
     }
     stored = []
@@ -72,6 +73,9 @@ def test_review_drawdown_excludes_later_trade_and_ignores_forged_ml(monkeypatch)
     assert stored[0]["ml_eligible"] is False
     assert stored[0]["exchange_fill_proven"] is False
     assert stored[0]["trade_prints_exchange_complete"] is False
+    assert stored[0]["funding_verified"] is False
+    assert stored[0]["net_pnl_certified"] is False
+    assert stored[0]["net_pnl_quality"] == "provisional_paper_funding_completeness_unproven"
 
 
 def test_missing_mark_funding_never_becomes_verified():

@@ -39,7 +39,7 @@ jobs:
       - run: python -m compileall -q src tests
         if: always()
       - name: Parse Windows installer syntax
-        if: runner.os == 'Windows'
+        if: ${{ always() && runner.os == 'Windows' }}
         shell: pwsh
         run: |
           foreach ($path in @('install/install.ps1', 'install/uninstall.ps1')) {
@@ -94,6 +94,34 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -e ".[dev]"
+      - name: Pin trusted PostgreSQL client binaries for native backup tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ matrix.postgres }}"
+          case "$version" in 17|18) ;; *) echo "Unsupported PostgreSQL version" >&2; exit 1 ;; esac
+          bin="/usr/lib/postgresql/$version/bin"
+          if [[ ! -x "$bin/pg_dump" || ! -x "$bin/pg_restore" ]]; then
+            keydir="$(mktemp -d)"
+            trap 'rm -rf "$keydir"' EXIT
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+              https://www.postgresql.org/media/keys/ACCC4CF8.asc --output "$keydir/pgdg.asc"
+            fingerprint="$(gpg --show-keys --with-colons "$keydir/pgdg.asc" | awk -F: '$1=="fpr"{print $10; exit}')"
+            test "$fingerprint" = "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8"
+            sudo install -d -m 0755 /usr/share/postgresql-common/pgdg
+            sudo install -m 0644 "$keydir/pgdg.asc" /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+            . /etc/os-release
+            echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" | sudo tee /etc/apt/sources.list.d/eth-tester-pgdg.list > /dev/null
+            sudo apt-get update -qq
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "postgresql-client-$version"
+          fi
+          for executable in pg_dump pg_restore; do
+            test -f "$bin/$executable" && test -x "$bin/$executable"
+            test ! -L "$bin/$executable"
+            test "$(stat -c %u "$bin/$executable")" = 0
+            "$bin/$executable" --version | grep -F "PostgreSQL) $version."
+          done
+          echo "ETH_TESTER_PG_BIN_DIR=$bin" >> "$GITHUB_ENV"
       - name: Real PostgreSQL - Data, Storage, Analytics, Simulation and ML
         run: python -m pytest -q -ra tests/integration tests/test_storage_postgres.py tests/test_strategy_postgres.py tests/test_learning_postgres.py --junitxml=qa-postgres-${{ matrix.postgres }}.xml
       - uses: actions/upload-artifact@v4
