@@ -28,8 +28,10 @@ def test_precommit_policy_exact():
     lambda r:r.update(level="-1"),
 ])
 def test_uncommitted_bounded_live_and_tampered_policy_rejected(tamper):
-    reason=valid_reason();tamper(reason)
-    with pytest.raises(ValueError): _reason_policy(reason)
+    reason=valid_reason()
+    tamper(reason)
+    with pytest.raises(ValueError):
+        _reason_policy(reason)
 
 def _coverage_row(receipt,checked):
     start,end=60000,240000
@@ -55,7 +57,9 @@ def _coverage_row(receipt,checked):
 
 class FakeConn:
     def __init__(self,coverage, gap=None):
-        self.coverage=coverage;self.gap=gap;self.sql=[]
+        self.coverage=coverage
+        self.gap=gap
+        self.sql=[]
     def execute(self,statement,params):
         self.sql.append((statement,params))
         return SimpleNamespace(fetchall=lambda:self.coverage,fetchone=lambda:self.gap)
@@ -81,9 +85,11 @@ def test_witness_is_pinned_to_real_checked_receipt_and_no_gap():
     lambda r:r["evidence"].update(row_count=2),
 ])
 def test_incomplete_or_future_historical_proof_rejected(tamper):
-    proof=_coverage_row(240000,240000);tamper(proof)
+    proof=_coverage_row(240000,240000)
+    tamper(proof)
     conn=FakeConn([proof])
-    with pytest.raises(ValueError): _source_certificate(conn,symbol="ETHUSDT",
+    with pytest.raises(ValueError):
+        _source_certificate(conn,symbol="ETHUSDT",
         instrument="linear",decision_ms=60000,horizon_ms=180000,
         as_of_ms=300000)
 
@@ -104,5 +110,7 @@ def test_unresolved_gap_rejected():
 def test_persisted_shadow_watermark_is_verified():
     assert prior_eligible_count(None)==0
     assert prior_eligible_count({"validation":{"paper_only":True,"eligible_count":180}})==180
-    with pytest.raises(ValueError): prior_eligible_count({"validation":{"eligible_count":200}})
-    with pytest.raises(ValueError): prior_eligible_count({"validation":{"paper_only":True,"eligible_count":180.5}})
+    with pytest.raises(ValueError):
+        prior_eligible_count({"validation":{"eligible_count":200}})
+    with pytest.raises(ValueError):
+        prior_eligible_count({"validation":{"paper_only":True,"eligible_count":180.5}})

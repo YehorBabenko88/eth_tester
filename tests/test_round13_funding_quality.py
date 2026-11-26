@@ -3,7 +3,6 @@
 Disposable fake contracts only. No REST/WS, orders, or actual PostgreSQL.
 """
 from contextlib import contextmanager
-from copy import deepcopy
 from decimal import Decimal
 from types import ModuleType, SimpleNamespace
 import sys
@@ -123,7 +122,9 @@ def test_no_auto_approval_on_missing_economic_cohort(verified_structural_label,m
 
 def test_sql_requires_ordered_bounded_ledger_plus_funding_state(monkeypatch):
     class Response:
-        def __init__(self,rows=None,row=None):self.rows=rows or [];self.row=row
+        def __init__(self,rows=None,row=None):
+            self.rows=rows or []
+            self.row=row
         def fetchall(self):return self.rows
         def fetchone(self):return self.row
     class DB:
@@ -132,7 +133,8 @@ def test_sql_requires_ordered_bounded_ledger_plus_funding_state(monkeypatch):
         def connection(self,settings):yield self
         def execute(self,query,params=None):
             self.statements.append((query,params))
-            if 'to_regclass' in query:return Response(row={'installed':True})
+            if 'to_regclass' in query:
+                return Response(row={'installed':True})
             return Response()
     db=DB()
     monkeypatch.setattr(extract,'connection',db.connection)
@@ -172,7 +174,9 @@ def test_correlated_fee_read_sql_has_balanced_subquery_and_case():
     without_literals=re.sub(r"'(?:''|[^'])*'", "''", sql)
     depth=0
     for ch in without_literals:
-        if ch=='(':depth+=1
-        if ch==')':depth-=1
+        if ch=='(':
+            depth+=1
+        if ch==')':
+            depth-=1
         assert depth>=0
     assert depth==0
