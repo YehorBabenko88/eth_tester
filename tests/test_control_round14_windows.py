@@ -5,6 +5,80 @@ import pytest
 from eth_tester import windows_chart_handle as w
 
 
+
+def _set_process_user_owner_on_windows_test_fixture(path):
+    """Create a genuinely TokenUser-owned QA fixture; never touch runtime files.
+
+    Elevated Windows runners can create files owned by their default
+    TokenOwner (Administrators group), not their TokenUser SID. The runtime
+    chart opener deliberately requires the stricter exact TokenUser SID.
+    """
+    assert os.name == 'nt'
+    assert path.exists() and not path.is_symlink()
+    import ctypes
+    from ctypes import wintypes
+
+    security = ctypes.WinDLL('advapi32', use_last_error=True)
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    handle = wintypes.HANDLE
+    dword = wintypes.DWORD
+    pointer = ctypes.c_void_p
+    kernel.GetCurrentProcess.restype = handle
+    kernel.CloseHandle.argtypes = [handle]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [pointer]
+    kernel.LocalFree.restype = pointer
+    security.OpenProcessToken.argtypes = [handle, dword, ctypes.POINTER(handle)]
+    security.OpenProcessToken.restype = wintypes.BOOL
+    security.GetTokenInformation.argtypes = [
+        handle, ctypes.c_int, pointer, dword, ctypes.POINTER(dword)]
+    security.GetTokenInformation.restype = wintypes.BOOL
+    security.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR, dword, dword, pointer, pointer, pointer, pointer]
+    security.SetNamedSecurityInfoW.restype = dword
+    security.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR, dword, dword, ctypes.POINTER(pointer),
+        pointer, pointer, pointer, ctypes.POINTER(pointer)]
+    security.GetNamedSecurityInfoW.restype = dword
+    security.EqualSid.argtypes = [pointer, pointer]
+    security.EqualSid.restype = wintypes.BOOL
+
+    token = handle()
+    assert security.OpenProcessToken(kernel.GetCurrentProcess(), 0x8,
+                                     ctypes.byref(token)), (
+        f'OpenProcessToken failed: winerror={ctypes.get_last_error()}')
+    try:
+        required = dword()
+        security.GetTokenInformation(token, 1, None, 0, ctypes.byref(required))
+        assert ctypes.sizeof(pointer) <= required.value <= 65536, (
+            f'TokenUser length invalid: {required.value}')
+        token_data = ctypes.create_string_buffer(required.value)
+        assert security.GetTokenInformation(token, 1, token_data, required,
+                                            ctypes.byref(required)), (
+            f'GetTokenInformation failed: winerror={ctypes.get_last_error()}')
+        sid = pointer(ctypes.cast(
+            token_data, ctypes.POINTER(pointer)).contents.value)
+        assert sid.value, 'TokenUser SID was null'
+        rc = security.SetNamedSecurityInfoW(str(path), 1, 1, sid,
+                                            None, None, None)
+        assert rc == 0, f'SetNamedSecurityInfoW failed: status={rc}'
+        actual_owner = pointer()
+        descriptor = pointer()
+        rc = security.GetNamedSecurityInfoW(
+            str(path), 1, 1, ctypes.byref(actual_owner),
+            None, None, None, ctypes.byref(descriptor))
+        try:
+            assert rc == 0, f'GetNamedSecurityInfoW failed: status={rc}'
+            assert actual_owner.value, 'Temporary fixture owner SID was null'
+            assert security.EqualSid(actual_owner, sid), (
+                'Temporary fixture owner does not match TokenUser SID')
+        finally:
+            if descriptor.value:
+                kernel.LocalFree(descriptor)
+    finally:
+        kernel.CloseHandle(token)
+
+
 def test_windows_chart_lexical_drive_root_and_filename():
     drive, parts = w._chart_components(r'C:\TesterLab\runtime\charts', 'paper_trade_15_exit.png')
     assert drive == 'C:\\'
@@ -70,10 +144,12 @@ def test_native_windows_synthetic_temp_chart(tmp_path, monkeypatch):
     monkeypatch.setenv('ETH_TESTER_WINDOWS_CHART_NATIVE_QA_APPROVED','1')
     folder = tmp_path / 'owned_charts'
     folder.mkdir()
+    _set_process_user_owner_on_windows_test_fixture(folder)
     leaf='paper_trade_35_exit.png'
     png=folder/leaf
     data=b'\x89PNG\r\n\x1a\n' + b'synthetic-owner-only'
     png.write_bytes(data)
+    _set_process_user_owner_on_windows_test_fixture(png)
     with w.open_chart_windows_native(folder,leaf) as opened:
         assert opened.read() == data
     assert png.read_bytes() == data
@@ -84,6 +160,7 @@ def test_native_windows_reparse_leaf_refused(tmp_path, monkeypatch):
     monkeypatch.setenv('ETH_TESTER_WINDOWS_CHART_NATIVE_QA_APPROVED','1')
     folder=tmp_path/'charts'
     folder.mkdir()
+    _set_process_user_owner_on_windows_test_fixture(folder)
     foreign=tmp_path/'secret.png'
     foreign.write_bytes(b'\x89PNG\r\n\x1a\n' + b'foreign')
     alias=folder/'paper_trade_35_exit.png'
