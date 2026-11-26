@@ -17,7 +17,7 @@ import pytest
 
 from eth_tester.config import Settings
 from eth_tester.database import connection, init_database
-from eth_tester.paper import open_paper
+from eth_tester.paper import close_paper, open_paper
 from eth_tester.runner import engine_tick
 from eth_tester.simulation.live_evidence import bind_live_paper_reference
 from eth_tester.storage.live_evidence import (
@@ -272,7 +272,7 @@ def test_real_runner_to_open_paper_creates_one_provisional_pg_position(h19_pg):
         ).fetchone()["n"] == 0
 
     assert engine_tick(h19_pg) == "monitoring_position"
-    with pytest.raises(RuntimeError, match="One trade only"):
+    with pytest.raises(RuntimeError, match="existing durable paper position"):
         open_paper(
             h19_pg, "short", D("100"), D("102"), D("95"),
             {"strategy_version": Parameters().engine_identity(),
@@ -294,9 +294,32 @@ def test_tampered_proof_and_ml_binding_cannot_open_pg_position(h19_pg):
     reason = {**signal.reason, "orderflow": flow}
     now = datetime.now(UTC)
 
-    with pytest.raises(ValueError, match="(?i)ml|paper-only"):
+    # A partial forged binding is rejected rather than completed.
+    with pytest.raises(ValueError, match="Incomplete original live paper binding"):
         bind_live_paper_reference(
             {**reason, "ml_eligible": True},
+            bar_ts=last, decision_at=now,
+        )
+
+    # Rebinding an already valid original reason is strictly idempotent.
+    # Bool identity matters: integer 0 must NOT be admitted as False.
+    bound = bind_live_paper_reference(reason, bar_ts=last, decision_at=now)
+    assert bind_live_paper_reference(
+        bound, bar_ts=last, decision_at=now
+    )["ml_eligible"] is False
+    for invalid in (True, 0, "false"):
+        with pytest.raises(
+            ValueError, match="Conflicting paper-only immutable admission reason"
+        ):
+            bind_live_paper_reference(
+                {**bound, "ml_eligible": invalid},
+                bar_ts=last, decision_at=now,
+            )
+    with pytest.raises(
+        ValueError, match="Bounded-live paper evidence cannot carry ML"
+    ):
+        bind_live_paper_reference(
+            {**bound, "ml_label": "forged"},
             bar_ts=last, decision_at=now,
         )
 
@@ -308,7 +331,9 @@ def test_tampered_proof_and_ml_binding_cannot_open_pg_position(h19_pg):
         **signal.reason, "orderflow": damaged,
         "market_trade_ts": now.isoformat(),
     }
-    with pytest.raises(ValueError):
+    # Bad but well-formed SHA passes E binding and MUST fail B's real
+    # PostgreSQL FOR SHARE immutable-row recheck, not an earlier fake gate.
+    with pytest.raises(ValueError, match="Bounded live provenance/quality mismatch"):
         open_paper(
             h19_pg, signal.direction, D("101"), signal.stop, signal.take,
             tampered, observed_at=now,
@@ -320,3 +345,78 @@ def test_tampered_proof_and_ml_binding_cannot_open_pg_position(h19_pg):
         assert conn.execute(
             "SELECT count(*) AS n FROM paper_order_events"
         ).fetchone()["n"] == 0
+
+
+def test_pg_close_and_new_manual_qa_trade_never_replays_original_signal(h19_pg):
+    """Re-arm real PG ledger; second manual QA entry is NOT D/B-certified.
+
+    A subsequent autonomous D/B entry needs the next independently observed
+    closed minute. Never replay the first terminal runner decision.
+    """
+    last, original_key, _signal, _flow = _seed_genuine_db_witnesses(h19_pg)
+    first = engine_tick(h19_pg)
+    assert first.startswith("opened_"), first
+    first_id = int(first.removeprefix("opened_"))
+    assert close_paper(
+        h19_pg, D("101"), "manual_qa_unverified",
+        observed_at=datetime.now(UTC), expected_id=first_id,
+    ) == first_id
+
+    with connection(h19_pg) as conn:
+        closed = conn.execute(
+            "SELECT state,funding_verified,reason FROM paper_trades WHERE id=%s",
+            (first_id,),
+        ).fetchone()
+        assert closed["state"] == "closed"
+        assert closed["funding_verified"] is False
+        assert closed["reason"]["paper_live_snapshot_key"] == original_key
+        state = conn.execute(
+            "SELECT paper_trade_id,version FROM paper_position_state"
+        ).fetchone()
+        assert state["paper_trade_id"] is None and state["version"] == 2
+        events = conn.execute(
+            """SELECT action FROM paper_order_events
+               WHERE paper_trade_id=%s ORDER BY event_ts""", (first_id,)
+        ).fetchall()
+        assert [row["action"] for row in events] == ["entry", "exit"]
+
+    replay = engine_tick(h19_pg)
+    assert not replay.startswith("opened_"), replay
+    with connection(h19_pg) as conn:
+        assert conn.execute(
+            "SELECT count(*) AS n FROM paper_trades WHERE state='open'"
+        ).fetchone()["n"] == 0
+        assert conn.execute(
+            """SELECT count(*) AS n FROM strategy_signals
+               WHERE symbol='ETHUSDT' AND tf='1' AND bar_ts=%s
+                 AND decision='opened'""", (last,)
+        ).fetchone()["n"] == 1
+
+    # Only QA/manual ledger re-arming is tested for the second entry.
+    # It cannot certify market provenance, funding, executable PnL or ML.
+    next_id = open_paper(
+        h19_pg, "short", D("101"), D("105"), D("95"),
+        {"strategy_version": Parameters().engine_identity(),
+         "rules_version": Parameters().version,
+         **Parameters().identity(), "qa_only": True},
+        observed_at=datetime.now(UTC),
+    )
+    assert next_id != first_id
+    with connection(h19_pg) as conn:
+        trades = conn.execute(
+            "SELECT id,state,notional,reason FROM paper_trades ORDER BY id"
+        ).fetchall()
+        assert [(row["id"], row["state"], row["notional"]) for row in trades] == [
+            (first_id, "closed", D("1000")),
+            (next_id, "open", D("1000")),
+        ]
+        assert trades[1]["reason"].get("ml_eligible") is not True
+        assert trades[1]["reason"].get("paper_live_snapshot_key") is None
+        assert conn.execute(
+            "SELECT count(*) AS n FROM paper_order_events WHERE action='entry'"
+        ).fetchone()["n"] == 2
+        state = conn.execute(
+            "SELECT paper_trade_id,version FROM paper_position_state"
+        ).fetchone()
+        assert state["paper_trade_id"] == next_id
+        assert state["version"] == 3
