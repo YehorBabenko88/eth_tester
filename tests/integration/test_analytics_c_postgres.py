@@ -1,5 +1,5 @@
 """Actual PostgreSQL 17/18 test for causal levels and rollup corrections."""
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import os
 from uuid import uuid4
