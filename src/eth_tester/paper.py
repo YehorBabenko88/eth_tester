@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import nullcontext
 from decimal import Decimal
 from .simulation.execution import number, utc
+from .simulation.provisional_budget import provisional_budget
 from .simulation.operations import conservative_exit_proxy
 from .simulation.crossing import resolve_first_crossing
 from .simulation.live_evidence import (bind_live_paper_reference,
@@ -109,6 +110,8 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
     if ("paper_cost_policy" in context and
             context["paper_cost_policy"]!=cost_policy):
         raise ValueError("Caller attempted to override entry cost policy")
+    if "paper_risk_budget" in context:
+        raise ValueError("Caller cannot inject paper risk budget")
     context["paper_cost_policy"]=cost_policy
     context['execution_quality']='trade_print_proxy_no_executable_book_proof'
     strategy_version=context['strategy_version']
@@ -144,25 +147,43 @@ def open_paper(settings,direction,observed_price,stop,take,reason,observed_at=No
             raise RuntimeError("Paused")
         if conn.execute("SELECT 1 FROM paper_trades WHERE state='open'").fetchone():
             raise RuntimeError("One trade only")
-        # Closed paper net cash is provisional until independently attested
-        # funding schedule, fees and execution. Do not compound unverified
-        # profits/losses into the risk budget of future LIVE paper entries.
-        # Manual QA/backtest fixtures remain unverified and separate.
-        if live_candidate and conn.execute("""SELECT 1 FROM paper_trades
-              WHERE state='closed' AND funding_verified IS NOT TRUE
-              LIMIT 1""").fetchone():
-            raise RuntimeError("Unreconciled provisional paper equity; admission blocked")
-        account=conn.execute("SELECT equity FROM paper_account WHERE id=1 FOR UPDATE").fetchone()
+        # Reconstruct the experimental risk allocation from committed
+        # history under GLOBAL and the account row lock on EVERY admission.
+        # No mutable secondary wallet or post-crash reset is required.
+        account=conn.execute("""SELECT equity,initial_equity FROM paper_account
+            WHERE id=1 FOR UPDATE""").fetchone()
+        if not account:
+            raise RuntimeError("Missing paper account")
+        if live_candidate:
+            past=conn.execute("""SELECT notional,net_pnl,funding_verified
+                FROM paper_trades WHERE state='closed' ORDER BY id""").fetchall()
+            budget=provisional_budget(account["initial_equity"],
+                                      account["equity"],past,
+                                      settings.initial_notional_usd)
+            risk_capital=budget["risk_capital_usd"]
+            # This is a VIRTUAL non-releasable allocation, not verified
+            # economic capital, actual funding, or permission for ML.
+            context["paper_risk_budget"]={
+                k:str(v) if isinstance(v,Decimal) else v
+                for k,v in budget.items()
+            }
+        else:
+            # QA/manual fixtures are visibly unverified and can never
+            # increase risk via a positive provisional balance.
+            risk_capital=min(number(account["equity"]),
+                             number(account["initial_equity"]))
+            if risk_capital<=0:
+                raise RuntimeError("Paper equity exhausted")
         daily=conn.execute("""SELECT coalesce(sum(net_pnl),0) AS pnl FROM paper_trades
           WHERE state='closed' AND closed_at>=%s""",(event_at.replace(hour=0,minute=0,second=0,microsecond=0),)).fetchone()["pnl"]
-        if account and daily<0 and -daily>=account["equity"]*settings.max_daily_drawdown:
+        if daily<0 and -daily>=risk_capital*settings.max_daily_drawdown:
             raise RuntimeError("Daily drawdown limit reached")
         sign=Decimal(1) if direction=="long" else Decimal(-1)
         fill=price*(1+sign*settings.slippage_bps/Decimal(10000))
         qty=settings.initial_notional_usd/fill
         entry_fee=settings.initial_notional_usd*settings.taker_fee_rate
         exposure=abs(qty*(fill-stop))+entry_fee+qty*stop*settings.taker_fee_rate
-        if not account or exposure>account["equity"]*settings.risk_fraction:
+        if exposure>risk_capital*settings.risk_fraction:
             raise RuntimeError("Risk cap exceeded")
         row=conn.execute("""INSERT INTO paper_trades(symbol,state,direction,signal_ts,
           opened_at,entry,qty,notional,stop,take,reason,fee_paid,slippage_paid,strategy_version)
