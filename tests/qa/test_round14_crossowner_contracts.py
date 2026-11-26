@@ -116,7 +116,24 @@ def test_equal_volume_not_promoted_to_exchange_complete(monkeypatch, stage_sha_p
         def execute(self, sql, args=None):
             query = " ".join(str(sql).split())
             queries.append(query)
+            if query == "SET LOCAL transaction_timeout = '30000ms'":
+                assert args is None
+                return Rows()
+            if query == "SET LOCAL statement_timeout = '10000ms'":
+                assert args is None
+                return Rows()
+            if query == "SET LOCAL lock_timeout = '2000ms'":
+                assert args is None
+                return Rows()
+            if query == "SELECT clock_timestamp() AS ts":
+                assert args is None
+                return Rows(one={"ts": stamp + timedelta(minutes=1)})
             if query.startswith("SELECT ts,delta,volume,quality FROM features"):
+                assert ("WHERE symbol=%s AND tf=%s AND ts >= %s AND ts < %s "
+                        "ORDER BY ts LIMIT %s") in query
+                assert args == (
+                    "ETHUSDT", "1", stamp, stamp + timedelta(minutes=1), 1537
+                )
                 return Rows(many=[{"ts": stamp, "delta": Decimal(0),
                                    "volume": Decimal("0.001"),
                                    "quality": "partial_unverified"}])
@@ -148,6 +165,14 @@ def test_equal_volume_not_promoted_to_exchange_complete(monkeypatch, stage_sha_p
         SimpleNamespace(symbol="ETHUSDT", category="linear"), tf="1", hours=1
     ) == 1
     assert len(updates) == 1
+    assert queries[:5] == [
+        "SET LOCAL transaction_timeout = '30000ms'",
+        "SET LOCAL statement_timeout = '10000ms'",
+        "SET LOCAL lock_timeout = '2000ms'",
+        "SELECT clock_timestamp() AS ts",
+        next(q for q in queries if q.startswith(
+            "SELECT ts,delta,volume,quality FROM features")),
+    ]
     assert any("FROM ingestion_job i" in q for q in queries)
     expected_quality = ("volume_parity_only_unverified"
                         if stage_sha_present else "partial_unverified")
