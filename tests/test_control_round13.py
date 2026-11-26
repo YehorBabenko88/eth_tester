@@ -36,6 +36,12 @@ def prepared_chart(tmp_path, monkeypatch):
 
 def test_chart_reads_only_persisted_png_without_db_writes(prepared_chart):
     c = prepared_chart
+    if os.name == 'nt':
+        with pytest.raises(FileNotFoundError, match='not QA approved'):
+            v.existing_trade_chart(c.settings, 7, root=c.root)
+        assert c.calls == []
+        assert c.chart.read_bytes() == c.expected
+        return
     with v.existing_trade_chart(c.settings, 7, root=c.root) as f:
         assert f.read() == c.expected
         assert f.closed is False
@@ -45,6 +51,12 @@ def test_chart_reads_only_persisted_png_without_db_writes(prepared_chart):
 
 def test_parent_swap_AFTER_pinned_fd_keeps_original(prepared_chart, monkeypatch, tmp_path):
     c = prepared_chart
+    if os.name == 'nt':
+        with pytest.raises(FileNotFoundError, match='not QA approved'):
+            v.existing_trade_chart(c.settings, 7, root=c.root)
+        assert c.calls == []
+        assert c.chart.read_bytes() == c.expected
+        return
     foreign = tmp_path/'foreign'
     foreign.mkdir()
     (foreign/c.leaf).write_bytes(HEADER + b'ATTACKER-FILE')
@@ -67,6 +79,12 @@ def test_parent_swap_AFTER_pinned_fd_keeps_original(prepared_chart, monkeypatch,
 
 def test_parent_swap_BEFORE_handle_pin_fails_closed(prepared_chart, monkeypatch, tmp_path):
     c = prepared_chart
+    if os.name == 'nt':
+        with pytest.raises(FileNotFoundError, match='not QA approved'):
+            v.existing_trade_chart(c.settings, 7, root=c.root)
+        assert c.calls == []
+        assert c.chart.read_bytes() == c.expected
+        return
     foreign = tmp_path/'foreign'
     foreign.mkdir()
     (foreign/c.leaf).write_bytes(HEADER + b'ATTACKER-FILE')
@@ -92,8 +110,10 @@ def test_leaf_symlink_refused(prepared_chart,tmp_path):
     outsider=tmp_path/'private.png'
     outsider.write_bytes(HEADER+b'PRIVATE')
     c.chart.unlink()
-    try:c.chart.symlink_to(outsider)
-    except (OSError,NotImplementedError):pytest.skip('cannot create test symlinks')
+    try:
+        c.chart.symlink_to(outsider)
+    except (OSError, NotImplementedError):
+        pytest.skip('cannot create test symlinks')
     with pytest.raises((OSError, FileNotFoundError)):
         v.existing_trade_chart(c.settings,7,root=c.root)
 
@@ -101,8 +121,10 @@ def test_leaf_symlink_refused(prepared_chart,tmp_path):
 def test_symlink_ancestor_refused(prepared_chart,tmp_path):
     c=prepared_chart
     c.root.rename(tmp_path/'moved')
-    try:c.root.symlink_to(tmp_path/'moved',target_is_directory=True)
-    except (OSError,NotImplementedError):pytest.skip('cannot create symlink')
+    try:
+        c.root.symlink_to(tmp_path/'moved', target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip('cannot create symlink')
     with pytest.raises((OSError,FileNotFoundError)):
         v.existing_trade_chart(c.settings,7,root=c.root)
 
@@ -169,7 +191,7 @@ def test_invalid_trade_id_never_accesses_database(prepared_chart):
 
 
 def test_no_cleanup_or_mutable_chart_update_in_views():
-    code=Path(v.__file__).read_text()
+    code=Path(v.__file__).read_text(encoding='utf-8')
     assert 'UPDATE paper_trades' not in code
     assert 'DELETE FROM' not in code
     assert 'DROP TABLE' not in code

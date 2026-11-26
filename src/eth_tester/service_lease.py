@@ -19,10 +19,8 @@ def service_lease(path):
         raise RuntimeError("Unsafe supervisor lock file symlink")
     lockfile.touch(exist_ok=True)
     with lockfile.open("r+b") as stream:
-        if not stream.read(1):
-            stream.seek(0)
-            stream.write(b"0")
-            stream.flush()
+        # Do not read a byte protected by an existing Windows byte lock.
+        # A byte-range lock can extend beyond EOF; no PID text is required.
         stream.seek(0)
         if os.name == "nt":
             import msvcrt

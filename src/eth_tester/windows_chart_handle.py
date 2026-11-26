@@ -179,9 +179,12 @@ def open_chart_windows_native(root, leaf):
             finally:
                 kernel.CloseHandle(token)
 
-        root = kernel.CreateFileW(drive, FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
-                 FILE_SHARE_ALL, None, OPEN_EXISTING,
-                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, None)
+        # ctypes converts a HANDLE return value to Python int on Windows.
+        # Wrap it before .value checks and native-handle comparison.
+        root = HANDLE(kernel.CreateFileW(
+            drive, FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_ALL, None, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, None))
         if not root or root.value == INVALID_HANDLE_VALUE:
             raise FileNotFoundError('Cannot pin Windows chart drive root')
         try:

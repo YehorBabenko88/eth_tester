@@ -1,5 +1,6 @@
 """Isolated G checkpoint regression suite: paper only, no PG/Bybit/network."""
 import asyncio
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -68,12 +69,19 @@ def test_existing_chart_readonly_uses_persisted_filename_and_png_magic(tmp_path,
     def fake(_):
         yield database
     monkeypatch.setattr(view,'connection',fake)
-    with view.existing_trade_chart(SimpleNamespace(symbol='ETHUSDT'),7,root=root) as chart:
-        assert chart.read().endswith(b'PNG_ORIGINAL_CONTENT')
+    if os.name == 'nt':
+        # Gate-off must refuse both the native file and the database lookup.
+        with pytest.raises(FileNotFoundError, match='not QA approved'):
+            view.existing_trade_chart(SimpleNamespace(symbol='ETHUSDT'),7,root=root)
+        assert database.queries == []
+    else:
+        with view.existing_trade_chart(SimpleNamespace(symbol='ETHUSDT'),7,root=root) as chart:
+            assert chart.read().endswith(b'PNG_ORIGINAL_CONTENT')
     assert fname.read_bytes().endswith(b'PNG_ORIGINAL_CONTENT')
     assert fname.stat().st_mtime_ns==mtime
-    assert len(database.queries)==1 and database.queries[0][1]==(7,'ETHUSDT')
-    assert 'UPDATE ' not in database.queries[0][0]
+    if os.name != 'nt':
+        assert len(database.queries)==1 and database.queries[0][1]==(7,'ETHUSDT')
+        assert 'UPDATE ' not in database.queries[0][0]
 
 
 def test_forged_chart_database_path_is_rejected(tmp_path,monkeypatch):
@@ -95,8 +103,10 @@ def test_chart_symlink_file_is_rejected(tmp_path,monkeypatch):
     foreign=tmp_path/'foreign.png'
     foreign.write_bytes(b'\x89PNG\r\n\x1a\nSECRET')
     path=root/'paper_trade_7_entry.png'
-    try:path.symlink_to(foreign)
-    except (NotImplementedError,OSError):pytest.skip('symlink unsupported')
+    try:
+        path.symlink_to(foreign)
+    except (NotImplementedError, OSError):
+        pytest.skip('symlink unsupported')
     conn=FakeConn([{'id':7,'closed_at':None,'entry_chart':str(path),'exit_chart':None}])
     @contextmanager
     def connect(_):yield conn
@@ -117,8 +127,10 @@ def test_missing_chart_is_a_safe_failure(tmp_path,monkeypatch):
 
 
 def test_chart_bad_header_rejected(tmp_path,monkeypatch):
-    root=tmp_path/'charts';root.mkdir()
-    fname=root/'paper_trade_7_entry.png';fname.write_bytes(b'NOTPNG\x00\x00')
+    root=tmp_path/'charts'
+    root.mkdir()
+    fname=root/'paper_trade_7_entry.png'
+    fname.write_bytes(b'NOTPNG\x00\x00')
     conn=FakeConn([{'id':7,'closed_at':None,'entry_chart':str(fname),'exit_chart':None}])
     @contextmanager
     def connect(_):yield conn
@@ -155,7 +167,7 @@ def test_utf16_and_maintenance_retention_backward_compatibility():
     pages=view.pages('🚀'*5000,chunk_limit=3900,max_chunks=8)
     assert all(len(p.encode('utf-16-le'))//2<=3900 for p in pages)
     assert len(pages)>1
-    assert 'DELETE ' not in Path(view.__file__).read_text()
+    assert 'DELETE ' not in Path(view.__file__).read_text(encoding='utf-8')
 
 
 def test_cleanup_is_not_scheduled_even_with_old_override(monkeypatch, tmp_path):
