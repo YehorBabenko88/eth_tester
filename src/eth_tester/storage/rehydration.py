@@ -3,7 +3,7 @@
 A owns downloader/retries and calls this inside its staging transaction; B
 only validates immutable original identity, never mutates the source ledger.
 """
-from datetime import date, datetime
+from datetime import date
 import re
 
 _SHA = re.compile(r'[0-9a-f]{64}\Z')

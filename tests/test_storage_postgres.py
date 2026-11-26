@@ -58,7 +58,8 @@ def test_migrations_and_reinitialization_preserve_rows(postgres_lab):
             "0001_partitioned_archive.sql", "0002_quality_and_provenance.sql",
             "0003_retention_indexes.sql", "0004_trade_identity_guard.sql",
             "0005_paper_settlement_ledger.sql", "0006_paper_ml_labels.sql",
-            "0007_bounded_live_and_archive_bins.sql", "0008_provisional_cost_observations.sql"
+            "0007_bounded_live_and_archive_bins.sql", "0008_provisional_cost_observations.sql",
+            "0009_disambiguate_paper_label_candle.sql"
         ]
         conn.execute(
             """INSERT INTO funding(symbol,ts,rate) VALUES(%s,%s,%s)
@@ -381,7 +382,7 @@ def test_round2_read_only_schema_startup(postgres_lab):
 
     report = verify_existing_schema(postgres_lab)
     assert report["verified"] is True
-    assert report["schema_version"] == "0007_bounded_live_and_archive_bins.sql"
+    assert report["schema_version"] == "0009_disambiguate_paper_label_candle.sql"
 
 
 def _synthetic_verified_round4_snapshot(conn, *, tf="5"):

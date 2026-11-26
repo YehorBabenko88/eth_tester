@@ -55,11 +55,11 @@ def test_owned_temp_fail_closed_without_exact_marker(tmp_path):
     owned.mkdir()
     target = owned / ("eth-tester-stage-" + "a"*32 + ".part")
     target.write_text("partial")
-    with pytest.raises(RuntimeError, match="marker"):
+    with pytest.raises(RuntimeError, match="marker|atomic owner"):
         cleanup_owned_temp(owned)
     assert target.exists()
     (owned / ".eth-tester-owned-temp").write_text("foreign\n")
-    with pytest.raises(RuntimeError, match="marker"):
+    with pytest.raises(RuntimeError, match="marker|atomic owner"):
         cleanup_owned_temp(owned)
     assert target.exists()
 
@@ -83,6 +83,12 @@ def test_cleanup_only_old_marked_regular_files_never_symlinks_or_backups(tmp_pat
         link.symlink_to(external)
     except (OSError, NotImplementedError):
         link = None
+    if os.name != "posix":
+        with pytest.raises(RuntimeError, match="atomic owner"):
+            cleanup_owned_temp(owned, now=10000, older_than_seconds=3600)
+        assert old.exists() and recent.exists() and stranger.exists()
+        assert external.read_text() == "external-owned"
+        return
     report = cleanup_owned_temp(owned, now=10000, older_than_seconds=3600)
     assert report["deleted_owned_temp_files"] == 1
     assert report["raw_market_data_deleted"] == 0
@@ -98,6 +104,12 @@ def test_cleanup_bounded_batches_and_idempotent_replay(tmp_path):
         p = tmp_path / (f"eth-tester-stage-{i:032x}.part")
         p.write_text("staging")
         os.utime(p, (10, 10))
+    if os.name != "posix":
+        with pytest.raises(RuntimeError, match="atomic owner"):
+            cleanup_owned_temp(tmp_path, now=10000,
+                               older_than_seconds=3600, max_files=2)
+        assert sum(p.suffix == ".part" for p in tmp_path.iterdir()) == 4
+        return
     first = cleanup_owned_temp(tmp_path, now=10000,
                                older_than_seconds=3600, max_files=2)
     assert first["deleted_owned_temp_files"] == 2 and first["bounded"]

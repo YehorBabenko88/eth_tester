@@ -79,11 +79,11 @@ def cleanup_owned_temp(root, *, now=None, older_than_seconds=3600, max_files=100
     if (type(older_than_seconds) is not int or older_than_seconds < 60 or
             type(max_files) is not int or not 1 <= max_files <= 1000):
         raise ValueError('Bounded positive temp cleanup limits required')
-    if os.name != 'posix' or not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_DIRECTORY'):
-        raise RuntimeError('No verified atomic owner directory handle')
     instant = datetime.now(timezone.utc).timestamp() if now is None else now
     if isinstance(instant, bool) or not isinstance(instant, (int, float)):
         raise ValueError('Invalid cleanup time')
+    if os.name != 'posix' or not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_DIRECTORY'):
+        raise RuntimeError('No verified atomic owner directory handle')
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | getattr(os, 'O_CLOEXEC', 0)
     root_fd = os.open(root, flags)
     try:
@@ -91,8 +91,11 @@ def cleanup_owned_temp(root, *, now=None, older_than_seconds=3600, max_files=100
         if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid()
                 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
             raise RuntimeError('Owned temp directory permissions not secure')
-        marker_fd = os.open(_MARKER, os.O_RDONLY | os.O_NOFOLLOW |
-                            getattr(os, 'O_CLOEXEC', 0), dir_fd=root_fd)
+        try:
+            marker_fd = os.open(_MARKER, os.O_RDONLY | os.O_NOFOLLOW |
+                                getattr(os, 'O_CLOEXEC', 0), dir_fd=root_fd)
+        except FileNotFoundError as exc:
+            raise RuntimeError('Exact owned-temp marker required') from exc
         try:
             marker_st = os.fstat(marker_fd)
             marker_bytes = os.read(marker_fd, len(_MARKER_TEXT.encode()) + 1)

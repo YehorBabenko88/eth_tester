@@ -25,7 +25,7 @@ def test_drop_requires_explicit_backup_and_phrase():
 
 
 def test_migration_inventory():
-    assert MIGRATIONS == ("0001_partitioned_archive.sql", "0002_quality_and_provenance.sql", "0003_retention_indexes.sql", "0004_trade_identity_guard.sql", "0005_paper_settlement_ledger.sql", "0006_paper_ml_labels.sql", "0007_bounded_live_and_archive_bins.sql")
+    assert MIGRATIONS == ("0001_partitioned_archive.sql", "0002_quality_and_provenance.sql", "0003_retention_indexes.sql", "0004_trade_identity_guard.sql", "0005_paper_settlement_ledger.sql", "0006_paper_ml_labels.sql", "0007_bounded_live_and_archive_bins.sql", "0008_provisional_cost_observations.sql", "0009_disambiguate_paper_label_candle.sql")
 
 
 def test_disk_guard_threshold(tmp_path):
@@ -36,13 +36,17 @@ def test_disk_guard_threshold(tmp_path):
 
 
 def test_backup_must_exist(tmp_path):
-    with patch("eth_tester.storage.shutil.which", return_value=None):
-        with pytest.raises(RuntimeError):
+    # An unapproved pg_restore must fail closed, independent of PATH.
+    with patch("eth_tester.storage.secure_backup.trusted_tool",
+               side_effect=RuntimeError("Untrusted PostgreSQL executable")):
+        with pytest.raises(RuntimeError, match="Untrusted PostgreSQL executable"):
             verify_backup(Path(tmp_path) / "missing.dump")
 
 
 
 def test_missing_backup_with_available_restore_tool(tmp_path):
-    with patch("eth_tester.storage.shutil.which", return_value="/usr/bin/pg_restore"):
-        with pytest.raises(RuntimeError, match="backup file missing"):
+    # Tool approval alone never certifies a nonexistent backup.
+    with patch("eth_tester.storage.secure_backup.trusted_tool",
+               return_value="/trusted/native/pg_restore"):
+        with pytest.raises((FileNotFoundError, RuntimeError)):
             verify_backup(Path(tmp_path) / "missing.dump")

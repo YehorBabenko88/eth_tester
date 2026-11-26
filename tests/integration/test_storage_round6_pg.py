@@ -70,7 +70,7 @@ def test_round6_migration_owner_marker_and_quality_separation(source_lab):
         versions = conn.execute(
             "SELECT version FROM eth_schema_migrations ORDER BY version"
         ).fetchall()
-        assert versions[-1]["version"] == "0007_bounded_live_and_archive_bins.sql"
+        assert versions[-1]["version"] == "0009_disambiguate_paper_label_candle.sql"
         tables = (
             "archive_stage_receipts", "archive_source_price_bins",
             "archive_validation_receipts", "live_trade_receipts",
@@ -145,7 +145,7 @@ def test_round6_sha_stage_bins_exclude_ws_only_and_replay_fail_closed(source_lab
         assert persist_archive_stage_bins(
             conn, "ETHUSDT", archive_day, digest, 2,
         )["price_bins"] == 2
-        with pytest.raises(ValueError, match="conflict"):
+        with pytest.raises(ValueError, match="Conflicting immutable archive stage receipt"):
             with conn.transaction():
                 conn.execute(
                     "UPDATE eth_stage SET qty=qty+0.1 WHERE trade_id='R6-B'"
