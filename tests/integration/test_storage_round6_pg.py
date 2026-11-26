@@ -59,6 +59,57 @@ def source_lab():
                 ))
 
 
+
+@pytest.fixture
+def r8_source_lab():
+    """Own isolated PostgreSQL database for R8's immutable live receipts."""
+    administrative = os.getenv("ETH_TEST_PG_DSN")
+    if not administrative:
+        pytest.skip("ETH_TEST_PG_DSN required for disposable real PostgreSQL")
+    db_name = "eth_tester_storage_r8_" + uuid4().hex[:12]
+    dsn = make_conninfo(administrative, dbname=db_name)
+    settings = SimpleNamespace(
+        database_url=dsn, initial_equity_usd=Decimal("10000"),
+        symbol="ETHUSDT", category="linear",
+    )
+    admin_dsn = make_conninfo(administrative, dbname="postgres")
+    with psycopg.connect(admin_dsn, autocommit=True) as admin:
+        if admin.execute(
+            "SELECT 1 FROM pg_database WHERE datname=%s", (db_name,)
+        ).fetchone():
+            raise RuntimeError("Refusing to reuse an existing R8 QA database")
+    try:
+        init_database(settings)
+        yield settings
+    finally:
+        # Only drop the distinct, freshly generated R8-owned test database.
+        with psycopg.connect(admin_dsn, autocommit=True) as admin:
+            if admin.execute(
+                "SELECT 1 FROM pg_database WHERE datname=%s", (db_name,)
+            ).fetchone():
+                admin.execute(sql.SQL("DROP DATABASE {}").format(
+                    sql.Identifier(db_name)
+                ))
+
+
+def _r8_previous_closed_bar(anchor):
+    """Use one DB clock sample; [start, end) excludes the current minute."""
+    end = anchor.replace(second=0, microsecond=0)
+    return end - timedelta(minutes=1), end
+
+
+def test_round8_natural_minute_boundary_is_disjoint():
+    """Regression at both edges: no freshly witnessed trade enters old bar."""
+    for second, microsecond in ((0, 1), (0, 999999),
+                                (59, 1), (59, 999999)):
+        anchor = datetime(2026, 11, 26, 19, 47, second, microsecond,
+                          tzinfo=UTC)
+        start, end = _r8_previous_closed_bar(anchor)
+        in_bar = end - timedelta(milliseconds=100)
+        assert start <= in_bar < end <= anchor
+        assert anchor < end + timedelta(minutes=1)
+
+
 def _trade(ident, ts, *, source="archive", price="3000", qty="0.1"):
     p, q = Decimal(price), Decimal(qty)
     return ("ETHUSDT", ts, ident, p, q, "Buy", p*q, source,
@@ -354,7 +405,7 @@ def test_round6_direct_caller_flags_cannot_forge_paper_live_evidence(source_lab)
         ).fetchone()["n"] == 0
 
 
-def test_round8_issued_live_receipt_rejected_after_disconnect_or_l2_gap(source_lab):
+def test_round8_issued_live_receipt_rejected_after_disconnect_or_l2_gap(r8_source_lab):
     """Real disposable PG; synthetic receipts prove transaction contract ONLY.
 
     Start from B's actual publish API, not a directly hand-crafted evidence
@@ -363,15 +414,21 @@ def test_round8_issued_live_receipt_rejected_after_disconnect_or_l2_gap(source_l
     """
     import eth_tester.storage.live_evidence as evidence
 
-    now = datetime.now(UTC)
-    start = now.replace(second=0, microsecond=0)-timedelta(minutes=1)
-    end = start+timedelta(minutes=1)
     session = "r8-" + uuid4().hex[:14]
-    original_id, fresh_id = "R8-ORIGINAL-"+uuid4().hex[:12], "R8-LATEST-"+uuid4().hex[:12]
-    with connection(source_lab) as conn:
+    original_id = "R8-ORIGINAL-" + uuid4().hex[:12]
+    fresh_id = "R8-LATEST-" + uuid4().hex[:12]
+    with connection(r8_source_lab) as conn:
+        # One PostgreSQL clock anchor is used for both trade event times.
+        anchor = conn.execute(
+            "SELECT clock_timestamp() AS ts"
+        ).fetchone()["ts"]
+        start, end = _r8_previous_closed_bar(anchor)
+        original_at = end - timedelta(milliseconds=100)
+        fresh_at = anchor  # Within the current minute, OUTSIDE [start, end).
+        assert start <= original_at < end <= fresh_at
         for trade_id, event_at in (
-            (original_id, end-timedelta(milliseconds=100)),
-            (fresh_id, datetime.now(UTC)-timedelta(milliseconds=100)),
+            (original_id, original_at),
+            (fresh_id, fresh_at),
         ):
             conn.execute(
                 """INSERT INTO trades(symbol,ts,trade_id,price,qty,side,
@@ -417,7 +474,7 @@ def test_round8_issued_live_receipt_rejected_after_disconnect_or_l2_gap(source_l
         book_id = evidence.record_book_lineage(
             conn, "ETHUSDT", session, snapshot, delta["id"],
         )
-        oi_at = datetime.now(UTC)-timedelta(minutes=1)
+        oi_at = anchor - timedelta(minutes=1)
         conn.execute(
             """INSERT INTO open_interest(symbol,interval,ts,value)
                VALUES('ETHUSDT','5min',%s,1000)""", (oi_at,),
@@ -431,6 +488,52 @@ def test_round8_issued_live_receipt_rejected_after_disconnect_or_l2_gap(source_l
                       'connected',%s::jsonb)""",
             (json.dumps({"session_id": session}),),
         )
+        # Inspect the exact B publication window before calling the REAL issuer.
+        observed = conn.execute(
+            """SELECT count(*) AS n, count(DISTINCT session_id) AS sessions,
+                      min(session_id) AS only_session,
+                      coalesce(sum(qty),0) AS base,
+                      coalesce(sum(notional),0) AS quote,
+                      min(source_event_at) AS first_event,
+                      max(source_event_at) AS last_event,
+                      min(received_at) AS first_receipt,
+                      max(received_at) AS last_receipt
+               FROM live_trade_receipts
+               WHERE symbol='ETHUSDT'
+                 AND source_event_at >= %s AND source_event_at < %s""",
+            (start, end),
+        ).fetchone()
+        in_bar_ids = conn.execute(
+            """SELECT trade_id FROM live_trade_receipts
+               WHERE symbol='ETHUSDT'
+                 AND source_event_at >= %s AND source_event_at < %s
+               ORDER BY trade_id""",
+            (start, end),
+        ).fetchall()
+        extra = conn.execute(
+            """SELECT source_event_at, received_at
+               FROM live_trade_receipts
+               WHERE symbol='ETHUSDT' AND trade_id=%s""",
+            (fresh_id,),
+        ).fetchone()
+        db_now = conn.execute(
+            "SELECT clock_timestamp() AS ts"
+        ).fetchone()["ts"]
+        assert observed["n"] == 1, observed
+        assert observed["sessions"] == 1, observed
+        assert observed["only_session"] == session, observed
+        assert observed["base"] == Decimal("0.01"), observed
+        assert observed["quote"] == Decimal("30"), observed
+        assert [row["trade_id"] for row in in_bar_ids] == [original_id]
+        assert observed["first_event"] == original_at, observed
+        assert observed["last_event"] == original_at, observed
+        assert anchor <= observed["first_receipt"] <= db_now, observed
+        assert anchor <= observed["last_receipt"] <= db_now, observed
+        assert observed["last_receipt"] >= db_now - timedelta(seconds=20)
+        assert extra is not None
+        assert extra["source_event_at"] == fresh_at
+        assert end <= extra["source_event_at"] <= db_now
+        assert anchor <= extra["received_at"] <= db_now
         key = evidence.publish_bounded_paper_evidence(
             conn, "ETHUSDT", start, session, book_id, oi_id,
         )
