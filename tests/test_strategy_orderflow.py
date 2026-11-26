@@ -331,3 +331,89 @@ def test_oi_utc_grid_rejects_fractional_and_non_utc():
     tz = timezone(timedelta(hours=1))
     assert not _valid_oi([dict(rows[0], ts=rows[0]["ts"].astimezone(tz)),
                           rows[1]], cutoff)
+
+
+def test_next_closed_minute_requires_independent_original_b_evidence():
+    """New D confirmation uses a fresh bar and distinct B identity, never N replay."""
+    from copy import deepcopy
+
+    def check_bar(conn, ts, at):
+        settings = SimpleNamespace(
+            symbol="ETHUSDT", taker_fee_rate=D("0.00055"), slippage_bps=D(2)
+        )
+        bar = {"ts": ts, "open": D(101), "high": D(103),
+               "low": D(100), "close": D(102), "volume": D(50)}
+        signal = Signal(
+            "long", D(100), D(100), D(110),
+            {"strategy": "breakout", "strategy_version": strategy_identity()},
+        )
+        return confirm_rejection(conn, settings, signal, bar, observed_at=at)
+
+    minute = timedelta(minutes=1)
+    old = FakeConn()
+    prior_ok, prior = evaluate(old)
+    assert prior_ok, prior
+    assert prior["immutable_live_evidence"]["snapshot_key"] == "e" * 64
+    assert prior["ml_eligible"] is False
+
+    later = FakeConn()
+    later.baseline_ticks = [
+        {**row, "ts": row["ts"] + minute} for row in later.baseline_ticks
+    ]
+    later.baseline_candles = [
+        {**row, "ts": row["ts"] + minute} for row in later.baseline_candles
+    ]
+    later.book["updated_at"] += minute
+    later.recent["ts"] += minute
+    later.live_row = deepcopy(old.live_row)
+    later.live_row["snapshot_key"] = "f" * 64
+    later.live_row["source_checksum"] = "c" * 64
+    later.live_row["bar_ts"] += minute
+    for stamp in ("observed_at", "computed_at", "expires_at"):
+        later.live_row[stamp] += minute
+    for record in later.live_row["evidence"]["source_proofs"].values():
+        for key in ("source_event_ms", "source_receipt_ms",
+                    "source_checked_at_ms"):
+            record[key] += 60_000
+    later.live_row["evidence"]["source_receipt_ms"] += 60_000
+    later.live_row["evidence"]["source_checked_at_ms"] += 60_000
+
+    new_bar, new_time = START + minute, NOW + minute
+    # Closed-bar clock is mandatory: the new signal cannot be admitted early.
+    early_ok, early = check_bar(later, new_bar, NOW)
+    assert early_ok is False and early["reason"] == "stale_or_open_bar"
+
+    accepted, second = check_bar(later, new_bar, new_time)
+    assert accepted, second
+    second_proof = second["immutable_live_evidence"]
+    assert second_proof["bar_ts"] == new_bar.isoformat()
+    assert second_proof["snapshot_key"] == "f" * 64
+    assert second_proof["source_checksum"] == "c" * 64
+    assert (second_proof["snapshot_key"] !=
+            prior["immutable_live_evidence"]["snapshot_key"])
+    assert second["paper_only"] is True and second["ml_eligible"] is False
+    assert "immutable_feature_snapshot" not in second
+
+    # Old proof must never be passed off as the next closed-bar receipt.
+    later.live_row = deepcopy(old.live_row)
+    missing_ok, missing = check_bar(later, new_bar, new_time)
+    assert missing_ok is False
+    assert missing["reason"] == "pending_bounded_live_evidence"
+    assert missing["retryable"] is True
+    assert missing["ml_eligible"] is False
+
+    # A separate fresh row is insufficient if it was published in the future.
+    later.live_row = deepcopy(old.live_row)
+    later.live_row["snapshot_key"] = "f" * 64
+    later.live_row["bar_ts"] = new_bar
+    later.live_row["observed_at"] = new_time + timedelta(seconds=1)
+    later.live_row["computed_at"] = new_time + timedelta(seconds=1)
+    later.live_row["expires_at"] = new_bar + timedelta(minutes=2, seconds=30)
+    future_ok, future = check_bar(later, new_bar, new_time)
+    assert future_ok is False
+    assert future["reason"] == "pending_bounded_live_evidence"
+
+    # The earlier signal may not be resurrected after its immutable deadline.
+    after_old_deadline = START + timedelta(minutes=2, seconds=31)
+    expired_ok, expired = evaluate(old, now=after_old_deadline)
+    assert expired_ok is False and expired["reason"] == "stale_or_open_bar"
