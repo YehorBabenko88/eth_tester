@@ -155,9 +155,13 @@ def test_real_runner_and_paper_insert_atomic_paper_ledger(disposable_e19_pg,
         assert len(signals) == 1 and signals[0]["decision"] == "opened"
         assert signals[0]["reason"]["paper_trade_id"] == trade_id
         fills = conn.execute(
-            "SELECT action FROM paper_order_events ORDER BY id"
+            "SELECT action,event_key,paper_trade_id FROM paper_order_events "
+            "WHERE paper_trade_id=%s ORDER BY event_ts,event_key",
+            (trade_id,),
         ).fetchall()
         assert len(fills) == 1 and fills[0]["action"] == "entry"
+        assert fills[0]["paper_trade_id"] == trade_id
+        assert fills[0]["event_key"]
         assert conn.execute(
             "SELECT paper_trade_id FROM paper_position_state "
             "WHERE singleton=true"
