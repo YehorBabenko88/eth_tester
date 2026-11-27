@@ -383,6 +383,9 @@ def engine_tick(settings):
         identifier=close_paper(settings,recent["price"],reason,funding,recent["ts"],
                                trade["id"],funding_evidence=funding_evidence,
                                require_live_crossing=True)
+        # An independently settling worker may have closed the observed trade.
+        if identifier is None:
+            return "paper_close_conflict"
         if identifier:
             try:
                 from .charts import render_trade
@@ -453,6 +456,14 @@ async def run_engine(settings):
                     (state[:250],json.dumps({"paper_only":True,
                      "open_position_risk":exposed,
                      "automatic_fake_exit":False})))
+                # Separate observability only. This is not a settlement or push.
+                if state=="paper_close_conflict" and state!=previous:
+                    conn.execute("""INSERT INTO bot_events(severity,event,data)
+                      VALUES('warning','paper_close_conflict',%s::jsonb)""",
+                      (json.dumps({"status":state,"symbol":settings.symbol,
+                                   "paper_only":True,"open_position_risk":exposed,
+                                   "close_committed_by_this_tick":False,
+                                   "financial_results_certified":False}),))
                 if (state!=previous and state in (
                         "waiting_live_feed_open_position",
                         "blocked_unresolved_tick_gap",
